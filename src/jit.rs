@@ -789,94 +789,71 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 ebpf::JSLE_IMM   => self.emit_conditional_branch_imm(0x8e, false, insn.imm, dst, target_pc),
                 ebpf::JSLE_REG   => self.emit_conditional_branch_reg(0x8e, false, src, dst, target_pc),
                 ebpf::CALL_IMM => {
-                    // Check for special u128_mul intrinsic
-                    if insn.imm == ebpf::U128_MUL_IMM {
-                        // u128_mul: multiply r1:r2 by r3:r4, store result in r1:r2
-                        // r1 = high 64 bits of first operand
-                        // r2 = low 64 bits of first operand
-                        // r3 = high 64 bits of second operand
-                        // r4 = low 64 bits of second operand
-                        // Result: r1:r2 contains 128-bit result
-                        // r0 = 0 on success, non-zero on overflow
-
-                        // REGISTER_MAP[0] = RAX (r0)
-                        // REGISTER_MAP[1] = RSI (r1)
-                        // REGISTER_MAP[2] = RDX (r2)
-                        // REGISTER_MAP[3] = RCX (r3)
-                        // REGISTER_MAP[4] = R8  (r4)
+                    // Check for u128_mul intrinsic (static syscall with src=0)
+                    if insn.src == 0 && insn.imm == ebpf::U128_MUL_IMM {
+                        // u128_mul: multiply two u128 values via memory
+                        // r1 = pointer to 48-byte buffer: [a: u128, b: u128, result: u128]
+                        // Reads a and b from [r1] and [r1+16], computes a*b, writes to [r1+32]
+                        // Returns: r0 = 0 (success)
 
                         let r0 = REGISTER_MAP[0]; // RAX
-                        let r1 = REGISTER_MAP[1]; // RSI (high_a)
-                        let r2 = REGISTER_MAP[2]; // RDX (low_a) - NOTE: RDX is clobbered by MUL!
-                        let r3 = REGISTER_MAP[3]; // RCX (high_b)
-                        let r4 = REGISTER_MAP[4]; // R8  (low_b)
+                        let r1 = REGISTER_MAP[1]; // RSI (params_ptr)
 
-                        // Scratch registers
-                        let scratch1 = REGISTER_SCRATCH; // R11 - will hold result_high
-                        let scratch2 = REGISTER_INSTRUCTION_METER; // R10 - will hold result_low
-                        let overflow_flag = RBX; // R9 - will accumulate overflow status
+                        // Scratch registers for computation
+                        let scratch1 = REGISTER_SCRATCH; // R11
+                        let scratch2 = REGISTER_INSTRUCTION_METER; // R10
+                        let temp1 = REGISTER_MAP[2]; // RDX
+                        let temp2 = REGISTER_MAP[3]; // RCX
 
-                        // Save input values since MUL clobbers RAX and RDX
-                        // r1 (RSI), r3 (RCX), r4 (R8) are safe from MUL
-                        // r2 (RDX) will be clobbered, save it
-                        self.emit_ins(X86Instruction::push(r2, None)); // Save r2 (RDX/low_a) to stack
+                        // Load a_lo from [r1+0]
+                        self.emit_ins(X86Instruction::load(OperandSize::S64, r1, RAX, X86IndirectAccess::Offset(0)));
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, RAX, scratch1)); // scratch1 = a_lo
 
-                        // Initialize overflow flag to 0
-                        self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x31, overflow_flag, overflow_flag, None)); // xor overflow_flag, overflow_flag
+                        // Load a_hi from [r1+8]
+                        self.emit_ins(X86Instruction::load(OperandSize::S64, r1, RAX, X86IndirectAccess::Offset(8)));
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, RAX, temp1)); // temp1 (RDX) = a_hi
 
-                        // Step 1: Compute r2 * r4 (low_a * low_b) -> RDX:RAX
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r2, RAX));  // RAX = r2 (low_a)
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r4, 0, None)); // mul r4 -> RDX:RAX = low_a * low_b
+                        // Load b_lo from [r1+16]
+                        self.emit_ins(X86Instruction::load(OperandSize::S64, r1, RAX, X86IndirectAccess::Offset(16)));
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, RAX, temp2)); // temp2 (RCX) = b_lo
 
-                        // Save results: RAX = result_low, RDX = partial result_high
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, RAX, scratch2)); // scratch2 = low 64 bits of result
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, RDX, scratch1)); // scratch1 = high part from (low_a * low_b)
+                        // Load b_hi from [r1+24]
+                        self.emit_ins(X86Instruction::load(OperandSize::S64, r1, scratch2, X86IndirectAccess::Offset(24)));
+                        // scratch2 = b_hi
 
-                        // Restore r2 from stack
-                        self.emit_ins(X86Instruction::pop(r2)); // r2 = low_a
+                        // Now we have: scratch1=a_lo, temp1=a_hi, temp2=b_lo, scratch2=b_hi
+                        // Compute: result = (a_hi << 64 | a_lo) * (b_hi << 64 | b_lo)
+                        // Formula: result = (a_lo * b_lo) + ((a_hi * b_lo + a_lo * b_hi) << 64)
 
-                        // Step 2: Compute r1 * r4 (high_a * low_b)
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r1, RAX));  // RAX = r1 (high_a)
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r4, 0, None)); // mul r4 -> RDX:RAX = high_a * low_b
+                        // Step 1: a_lo * b_lo -> RDX:RAX
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, scratch1, RAX)); // RAX = a_lo
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, temp2, 0, None)); // mul temp2 (b_lo)
+                        // RAX = result_lo, RDX = partial result_hi
+                        self.emit_ins(X86Instruction::push(RAX, None)); // Save result_lo
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, RDX, RAX)); // RAX = partial result_hi
 
-                        // Check overflow: if RDX != 0, overflow occurred
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RDX, overflow_flag, None)); // or overflow_flag, RDX
+                        // Step 2: a_hi * b_lo
+                        self.emit_ins(X86Instruction::push(r1, None)); // Save r1 (params_ptr)
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x0f, temp2, temp1, Some(0xaf))); // imul temp1, temp2 (a_hi * b_lo)
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, temp1, RAX, None)); // RAX += (a_hi * b_lo)
 
-                        // Add RAX (low part of high_a * low_b) to scratch1
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, RAX, scratch1, None)); // scratch1 += RAX
-                        // Capture carry flag using adc: add 0 with carry to overflow_flag
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 2, overflow_flag, 0, None)); // adc overflow_flag, 0
+                        // Step 3: a_lo * b_hi
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x0f, scratch2, scratch1, Some(0xaf))); // imul scratch1, scratch2 (a_lo * b_hi)
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, scratch1, RAX, None)); // RAX += (a_lo * b_hi)
 
-                        // Step 3: Compute r2 * r3 (low_a * high_b)
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r2, RAX));  // RAX = r2 (low_a)
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r3, 0, None)); // mul r3 -> RDX:RAX = low_a * high_b
+                        // RAX now contains result_hi
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, RAX, scratch1)); // scratch1 = result_hi
+                        self.emit_ins(X86Instruction::pop(r1)); // Restore params_ptr
+                        self.emit_ins(X86Instruction::pop(RAX)); // RAX = result_lo
 
-                        // Check overflow: if RDX != 0, overflow occurred
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RDX, overflow_flag, None)); // or overflow_flag, RDX
+                        // Store result_lo to [r1+32]
+                        self.emit_ins(X86Instruction::store(OperandSize::S64, RAX, r1, X86IndirectAccess::Offset(32)));
 
-                        // Add RAX (low part of low_a * high_b) to scratch1
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, RAX, scratch1, None)); // scratch1 += RAX
-                        // Capture carry flag using adc: add 0 with carry to overflow_flag
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 2, overflow_flag, 0, None)); // adc overflow_flag, 0
+                        // Store result_hi to [r1+40]
+                        self.emit_ins(X86Instruction::store(OperandSize::S64, scratch1, r1, X86IndirectAccess::Offset(40)));
 
-                        // Step 4: Check r1 * r3 (high_a * high_b) - must be 0 for no overflow
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r1, RAX));  // RAX = r1 (high_a)
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r3, 0, None)); // mul r3 -> RDX:RAX = high_a * high_b
-
-                        // If either RAX or RDX is non-zero, we have overflow
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RAX, overflow_flag, None)); // or overflow_flag, RAX
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RDX, overflow_flag, None)); // or overflow_flag, RDX
-
-                        // Store final result
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, scratch2, r2)); // r2 = low 64 bits of result
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, scratch1, r1)); // r1 = high 64 bits of result
-
-                        // Set r0 based on overflow
-                        // If overflow_flag != 0, set r0 = 1 (error), else r0 = 0
-                        self.emit_ins(X86Instruction::test(OperandSize::S64, overflow_flag, overflow_flag, None)); // test overflow_flag
-                        self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x31, r0, r0, None)); // xor r0, r0 -> r0 = 0
-                        // Use setne (set if not equal/not zero) to set AL (low byte of r0) to 1 if overflow occurred
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S8, 0x0f, 0x95, r0, 0, Some(0x40))); // setne al
+                        // Set r0 = 0 (success)
+                        self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x31, r0, r0, None)); // xor r0, r0
                     } else {
                         // For JIT, external functions MUST be registered at compile time.
                         let key = self

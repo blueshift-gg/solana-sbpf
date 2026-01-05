@@ -520,40 +520,42 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             // Do not delegate the check to the verifier, since self.registered functions can be
             // changed after the program has been verified.
             ebpf::CALL_IMM => {
-                // Check for u128_mul_checked intrinsic
-                if insn.imm == ebpf::U128_MUL_IMM {
-                    // u128_mul_checked: multiply (r1:r2) by (r3:r4), store result in r1:r2
-                    // r1 = high 64 bits of first operand (a_hi)
-                    // r2 = low 64 bits of first operand (a_lo)
-                    // r3 = high 64 bits of second operand (b_hi)
-                    // r4 = low 64 bits of second operand (b_lo)
-                    // Result: r1:r2 contains 128-bit result, r0 = 0 on success, 1 on overflow
+                // Check for u128_mul intrinsic
+                if insn.src == 0 && insn.imm == ebpf::U128_MUL_IMM {
+                    // u128_mul: multiply two u128 values
+                    // r1 = pointer to 48-byte buffer: [a: u128, b: u128, result: u128]
+                    // Reads a and b from [r1] and [r1+16], computes a*b, writes to [r1+32]
+                    // Returns: r0 = 0 on success
 
-                    let a_hi = self.reg[1] as u128;
-                    let a_lo = self.reg[2] as u128;
-                    let b_hi = self.reg[3] as u128;
-                    let b_lo = self.reg[4] as u128;
+                    let params_ptr = self.reg[1];
 
-                    // Construct 128-bit values
-                    let a = (a_hi << 64) | a_lo;
-                    let b = (b_hi << 64) | b_lo;
+                    // Read a as two u64s (little-endian: lo at +0, hi at +8)
+                    let a_ptr_lo = params_ptr;
+                    let a_ptr_hi = params_ptr + 8;
+                    let a_lo = translate_memory_access!(self, load, a_ptr_lo, u64);
+                    let a_hi = translate_memory_access!(self, load, a_ptr_hi, u64);
+                    let a = ((a_hi as u128) << 64) | (a_lo as u128);
 
-                    // Perform multiplication with overflow check
-                    match a.checked_mul(b) {
-                        Some(result) => {
-                            // Success: store result and set r0 = 0
-                            self.reg[1] = (result >> 64) as u64;  // high 64 bits
-                            self.reg[2] = result as u64;          // low 64 bits
-                            self.reg[0] = 0;                      // success
-                        },
-                        None => {
-                            // Overflow: perform wrapping multiplication and set r0 = 1
-                            let result = a.wrapping_mul(b);
-                            self.reg[1] = (result >> 64) as u64;  // high 64 bits
-                            self.reg[2] = result as u64;          // low 64 bits
-                            self.reg[0] = 1;                      // overflow
-                        },
-                    }
+                    // Read b as two u64s (little-endian: lo at +16, hi at +24)
+                    let b_ptr_lo = params_ptr + 16;
+                    let b_ptr_hi = params_ptr + 24;
+                    let b_lo = translate_memory_access!(self, load, b_ptr_lo, u64);
+                    let b_hi = translate_memory_access!(self, load, b_ptr_hi, u64);
+                    let b = ((b_hi as u128) << 64) | (b_lo as u128);
+
+                    // Compute result
+                    let result = a.wrapping_mul(b);
+
+                    // Write result as two u64s (little-endian: lo at +32, hi at +40)
+                    let result_ptr_lo = params_ptr + 32;
+                    let result_ptr_hi = params_ptr + 40;
+                    let result_lo = result as u64;
+                    let result_hi = (result >> 64) as u64;
+                    translate_memory_access!(self, store, result_lo, result_ptr_lo, u64);
+                    translate_memory_access!(self, store, result_hi, result_ptr_hi, u64);
+
+                    // Success
+                    self.reg[0] = 0;
                 } else {
                     let key = self
                         .executable
