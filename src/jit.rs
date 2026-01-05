@@ -789,27 +789,117 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 ebpf::JSLE_IMM   => self.emit_conditional_branch_imm(0x8e, false, insn.imm, dst, target_pc),
                 ebpf::JSLE_REG   => self.emit_conditional_branch_reg(0x8e, false, src, dst, target_pc),
                 ebpf::CALL_IMM => {
-                    // For JIT, external functions MUST be registered at compile time.
-                    let key = self
-                        .executable
-                        .get_sbpf_version()
-                        .calculate_call_imm_target_pc(self.pc, insn.imm);
-                    if self.executable.get_sbpf_version().static_syscalls() {
-                        // BPF to BPF call
-                        self.emit_internal_call(Value::Constant64(key as i64, true));
-                    } else if let Some((_, function)) =
-                            self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
-                        // SBPFv0 syscall
-                        self.emit_syscall_dispatch(function);
-                    } else if let Some((_function_name, target_pc)) =
-                            self.executable
-                                .get_function_registry()
-                                .lookup_by_key(key) {
-                        // BPF to BPF call
-                        self.emit_internal_call(Value::Constant64(target_pc as i64, true));
+                    // Check for special u128_mul intrinsic
+                    if insn.imm == ebpf::U128_MUL_IMM {
+                        // u128_mul: multiply r1:r2 by r3:r4, store result in r1:r2
+                        // r1 = high 64 bits of first operand
+                        // r2 = low 64 bits of first operand
+                        // r3 = high 64 bits of second operand
+                        // r4 = low 64 bits of second operand
+                        // Result: r1:r2 contains 128-bit result
+                        // r0 = 0 on success, non-zero on overflow
+
+                        // REGISTER_MAP[0] = RAX (r0)
+                        // REGISTER_MAP[1] = RSI (r1)
+                        // REGISTER_MAP[2] = RDX (r2)
+                        // REGISTER_MAP[3] = RCX (r3)
+                        // REGISTER_MAP[4] = R8  (r4)
+
+                        let r0 = REGISTER_MAP[0]; // RAX
+                        let r1 = REGISTER_MAP[1]; // RSI (high_a)
+                        let r2 = REGISTER_MAP[2]; // RDX (low_a) - NOTE: RDX is clobbered by MUL!
+                        let r3 = REGISTER_MAP[3]; // RCX (high_b)
+                        let r4 = REGISTER_MAP[4]; // R8  (low_b)
+
+                        // Scratch registers
+                        let scratch1 = REGISTER_SCRATCH; // R11 - will hold result_high
+                        let scratch2 = REGISTER_INSTRUCTION_METER; // R10 - will hold result_low
+                        let overflow_flag = RBX; // R9 - will accumulate overflow status
+
+                        // Save input values since MUL clobbers RAX and RDX
+                        // r1 (RSI), r3 (RCX), r4 (R8) are safe from MUL
+                        // r2 (RDX) will be clobbered, save it
+                        self.emit_ins(X86Instruction::push(r2, None)); // Save r2 (RDX/low_a) to stack
+
+                        // Initialize overflow flag to 0
+                        self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x31, overflow_flag, overflow_flag, None)); // xor overflow_flag, overflow_flag
+
+                        // Step 1: Compute r2 * r4 (low_a * low_b) -> RDX:RAX
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r2, RAX));  // RAX = r2 (low_a)
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r4, 0, None)); // mul r4 -> RDX:RAX = low_a * low_b
+
+                        // Save results: RAX = result_low, RDX = partial result_high
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, RAX, scratch2)); // scratch2 = low 64 bits of result
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, RDX, scratch1)); // scratch1 = high part from (low_a * low_b)
+
+                        // Restore r2 from stack
+                        self.emit_ins(X86Instruction::pop(r2)); // r2 = low_a
+
+                        // Step 2: Compute r1 * r4 (high_a * low_b)
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r1, RAX));  // RAX = r1 (high_a)
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r4, 0, None)); // mul r4 -> RDX:RAX = high_a * low_b
+
+                        // Check overflow: if RDX != 0, overflow occurred
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RDX, overflow_flag, None)); // or overflow_flag, RDX
+
+                        // Add RAX (low part of high_a * low_b) to scratch1
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, RAX, scratch1, None)); // scratch1 += RAX
+                        // Capture carry flag using adc: add 0 with carry to overflow_flag
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 2, overflow_flag, 0, None)); // adc overflow_flag, 0
+
+                        // Step 3: Compute r2 * r3 (low_a * high_b)
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r2, RAX));  // RAX = r2 (low_a)
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r3, 0, None)); // mul r3 -> RDX:RAX = low_a * high_b
+
+                        // Check overflow: if RDX != 0, overflow occurred
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RDX, overflow_flag, None)); // or overflow_flag, RDX
+
+                        // Add RAX (low part of low_a * high_b) to scratch1
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, RAX, scratch1, None)); // scratch1 += RAX
+                        // Capture carry flag using adc: add 0 with carry to overflow_flag
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 2, overflow_flag, 0, None)); // adc overflow_flag, 0
+
+                        // Step 4: Check r1 * r3 (high_a * high_b) - must be 0 for no overflow
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r1, RAX));  // RAX = r1 (high_a)
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r3, 0, None)); // mul r3 -> RDX:RAX = high_a * high_b
+
+                        // If either RAX or RDX is non-zero, we have overflow
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RAX, overflow_flag, None)); // or overflow_flag, RAX
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RDX, overflow_flag, None)); // or overflow_flag, RDX
+
+                        // Store final result
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, scratch2, r2)); // r2 = low 64 bits of result
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, scratch1, r1)); // r1 = high 64 bits of result
+
+                        // Set r0 based on overflow
+                        // If overflow_flag != 0, set r0 = 1 (error), else r0 = 0
+                        self.emit_ins(X86Instruction::test(OperandSize::S64, overflow_flag, overflow_flag, None)); // test overflow_flag
+                        self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x31, r0, r0, None)); // xor r0, r0 -> r0 = 0
+                        // Use setne (set if not equal/not zero) to set AL (low byte of r0) to 1 if overflow occurred
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S8, 0x0f, 0x95, r0, 0, Some(0x40))); // setne al
                     } else {
-                        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
-                        self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_CALL_UNSUPPORTED_INSTRUCTION, 5)));
+                        // For JIT, external functions MUST be registered at compile time.
+                        let key = self
+                            .executable
+                            .get_sbpf_version()
+                            .calculate_call_imm_target_pc(self.pc, insn.imm);
+                        if self.executable.get_sbpf_version().static_syscalls() {
+                            // BPF to BPF call
+                            self.emit_internal_call(Value::Constant64(key as i64, true));
+                        } else if let Some((_, function)) =
+                                self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
+                            // SBPFv0 syscall
+                            self.emit_syscall_dispatch(function);
+                        } else if let Some((_function_name, target_pc)) =
+                                self.executable
+                                    .get_function_registry()
+                                    .lookup_by_key(key) {
+                            // BPF to BPF call
+                            self.emit_internal_call(Value::Constant64(target_pc as i64, true));
+                        } else {
+                            self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
+                            self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_CALL_UNSUPPORTED_INSTRUCTION, 5)));
+                        }
                     }
                 },
                 ebpf::SYSCALL if self.executable.get_sbpf_version().static_syscalls() => {

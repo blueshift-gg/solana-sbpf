@@ -486,6 +486,13 @@ pub const RETURN: u8 = BPF_JMP | BPF_X | BPF_EXIT;
 /// BPF opcode: `syscall` /// `syscall imm`. /// Valid only since SBPFv3
 pub const SYSCALL: u8 = BPF_JMP | BPF_SYSCALL;
 
+/// Syscall Intrinsics
+/// This is a special class of call instructions that are treated as intrinsics by the JIT compiler instead of actually invoking syscalls.
+
+/// u128 multiplication: multiply r1:r2 by r3:r4, store result in r1:r2
+/// On overflow, sets r0 to error code; on success, sets r0 to 0
+pub const U128_MUL_IMM: i64 = 0x2B1AFAFF;
+
 // Used in JIT
 /// Mask to extract the operation class from an operation code.
 pub const BPF_CLS_MASK: u8 = 0x07;

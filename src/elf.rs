@@ -900,7 +900,11 @@ impl<C: ContextObject> Executable<C> {
             .ok_or(ElfError::ValueOutOfBounds)?;
         for i in 0..instruction_count {
             let insn = ebpf::get_insn(text_bytes, i);
-            if insn.opc == ebpf::CALL_IMM && insn.imm != -1 {
+            // Only validate relative jumps for regular function calls (src == 1)
+            // Skip validation for:
+            // - Static syscalls (src == 0)
+            // - Dynamic syscalls (imm == -1)
+            if insn.opc == ebpf::CALL_IMM && insn.src == 1 && insn.imm != -1 {
                 let target_pc = (i as isize)
                     .saturating_add(1)
                     .saturating_add(insn.imm as isize);

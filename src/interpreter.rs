@@ -520,33 +520,69 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             // Do not delegate the check to the verifier, since self.registered functions can be
             // changed after the program has been verified.
             ebpf::CALL_IMM => {
-                let key = self
-                    .executable
-                    .get_sbpf_version()
-                    .calculate_call_imm_target_pc(self.reg[11] as usize, insn.imm);
-                if self.executable.get_sbpf_version().static_syscalls() {
-                    // make BPF to BPF call
-                    if !self.push_frame(config) {
-                        return false;
+                // Check for u128_mul_checked intrinsic
+                if insn.imm == ebpf::U128_MUL_IMM {
+                    // u128_mul_checked: multiply (r1:r2) by (r3:r4), store result in r1:r2
+                    // r1 = high 64 bits of first operand (a_hi)
+                    // r2 = low 64 bits of first operand (a_lo)
+                    // r3 = high 64 bits of second operand (b_hi)
+                    // r4 = low 64 bits of second operand (b_lo)
+                    // Result: r1:r2 contains 128-bit result, r0 = 0 on success, 1 on overflow
+
+                    let a_hi = self.reg[1] as u128;
+                    let a_lo = self.reg[2] as u128;
+                    let b_hi = self.reg[3] as u128;
+                    let b_lo = self.reg[4] as u128;
+
+                    // Construct 128-bit values
+                    let a = (a_hi << 64) | a_lo;
+                    let b = (b_hi << 64) | b_lo;
+
+                    // Perform multiplication with overflow check
+                    match a.checked_mul(b) {
+                        Some(result) => {
+                            // Success: store result and set r0 = 0
+                            self.reg[1] = (result >> 64) as u64;  // high 64 bits
+                            self.reg[2] = result as u64;          // low 64 bits
+                            self.reg[0] = 0;                      // success
+                        },
+                        None => {
+                            // Overflow: perform wrapping multiplication and set r0 = 1
+                            let result = a.wrapping_mul(b);
+                            self.reg[1] = (result >> 64) as u64;  // high 64 bits
+                            self.reg[2] = result as u64;          // low 64 bits
+                            self.reg[0] = 1;                      // overflow
+                        },
                     }
-                    check_pc!(self, next_pc, key as u64);
-                } else if let Some((_, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
-                    // SBPFv0 syscall
-                    self.reg[0] = match self.dispatch_syscall(function) {
-                        ProgramResult::Ok(value) => *value,
-                        ProgramResult::Err(_err) => return false,
-                    };
-                } else if let Some((_, target_pc)) =
-                    self.executable
-                    .get_function_registry()
-                    .lookup_by_key(key) {
-                    // make BPF to BPF call
-                    if !self.push_frame(config) {
-                        return false;
-                    }
-                    check_pc!(self, next_pc, target_pc as u64);
                 } else {
-                    throw_error!(self, EbpfError::UnsupportedInstruction);
+                    let key = self
+                        .executable
+                        .get_sbpf_version()
+                        .calculate_call_imm_target_pc(self.reg[11] as usize, insn.imm);
+                    if self.executable.get_sbpf_version().static_syscalls() {
+                        // make BPF to BPF call
+                        if !self.push_frame(config) {
+                            return false;
+                        }
+                        check_pc!(self, next_pc, key as u64);
+                    } else if let Some((_, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
+                        // SBPFv0 syscall
+                        self.reg[0] = match self.dispatch_syscall(function) {
+                            ProgramResult::Ok(value) => *value,
+                            ProgramResult::Err(_err) => return false,
+                        };
+                    } else if let Some((_, target_pc)) =
+                        self.executable
+                        .get_function_registry()
+                        .lookup_by_key(key) {
+                        // make BPF to BPF call
+                        if !self.push_frame(config) {
+                            return false;
+                        }
+                        check_pc!(self, next_pc, target_pc as u64);
+                    } else {
+                        throw_error!(self, EbpfError::UnsupportedInstruction);
+                    }
                 }
             }
             ebpf::SYSCALL if self.executable.get_sbpf_version().static_syscalls() => {
