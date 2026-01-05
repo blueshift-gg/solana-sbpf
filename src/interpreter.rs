@@ -544,39 +544,51 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             },
 
             ebpf::CALL_IMM => {
-                let mut resolved = false;
-                // External syscall
-                if !self.executable.get_sbpf_version().static_syscalls() || insn.src == 0 {
-                    if let Some((_, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
-                        self.reg[0] = match self.dispatch_syscall(function) {
-                            ProgramResult::Ok(value) => *value,
-                            ProgramResult::Err(_err) => return false,
-                        };
-                        resolved = true;
+                if insn.src == 0 && insn.imm == ebpf::SOL_MULTI3_IMM {
+                    let result_ptr_lo = self.reg[1];
+                    let result_ptr_hi = result_ptr_lo + core::mem::size_of::<u64>() as u64;
+                    let a = self.reg[2] as u128 | (self.reg[3] as u128) << 64;
+                    let b = self.reg[4] as u128 | (self.reg[5] as u128) << 64;
+                    let result = a.wrapping_mul(b);
+                    let result_lo = result as u64;
+                    let result_hi = (result >> 64) as u64;
+                    translate_memory_access!(self, store, result_lo as u64, result_ptr_lo, u64);
+                    translate_memory_access!(self, store, result_hi as u64, result_ptr_hi, u64);
+                } else {
+                    let mut resolved = false;
+                    // External syscall
+                    if !self.executable.get_sbpf_version().static_syscalls() || insn.src == 0 {
+                        if let Some((_, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
+                            self.reg[0] = match self.dispatch_syscall(function) {
+                                ProgramResult::Ok(value) => *value,
+                                ProgramResult::Err(_err) => return false,
+                            };
+                            resolved = true;
+                        }
                     }
-                }
-                // Internal call
-                if self.executable.get_sbpf_version().static_syscalls() {
-                    let target_pc = (next_pc as i64).saturating_add(insn.imm);
-                    if ebpf::is_pc_in_program(self.program, target_pc as usize) && insn.src == 1 {
+                    // Internal call
+                    if self.executable.get_sbpf_version().static_syscalls() {
+                        let target_pc = (next_pc as i64).saturating_add(insn.imm);
+                        if ebpf::is_pc_in_program(self.program, target_pc as usize) && insn.src == 1 {
+                            if !self.push_frame(config) {
+                                return false;
+                            }
+                            next_pc = target_pc as u64;
+                            resolved = true;
+                        }
+                    } else if let Some((_, target_pc)) =
+                        self.executable
+                        .get_function_registry()
+                        .lookup_by_key(insn.imm as u32) {
                         if !self.push_frame(config) {
                             return false;
                         }
-                        next_pc = target_pc as u64;
+                        check_pc!(self, next_pc, target_pc as u64);
                         resolved = true;
                     }
-                } else if let Some((_, target_pc)) =
-                    self.executable
-                    .get_function_registry()
-                    .lookup_by_key(insn.imm as u32) {
-                    if !self.push_frame(config) {
-                        return false;
+                    if !resolved {
+                        throw_error!(self, EbpfError::UnsupportedInstruction);
                     }
-                    check_pc!(self, next_pc, target_pc as u64);
-                    resolved = true;
-                }
-                if !resolved {
-                    throw_error!(self, EbpfError::UnsupportedInstruction);
                 }
             }
             ebpf::EXIT       => {

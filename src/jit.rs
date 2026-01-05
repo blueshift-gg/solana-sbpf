@@ -807,35 +807,96 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 ebpf::JSLE64_IMM   => self.emit_conditional_branch_imm(OperandSize::S64, 0x8e, false, insn.imm, dst, target_pc),
                 ebpf::JSLE64_REG   => self.emit_conditional_branch_reg(OperandSize::S64, 0x8e, false, src, dst, target_pc),
                 ebpf::CALL_IMM     => {
-                    let mut resolved = false;
-                    // External syscall
-                    if !self.executable.get_sbpf_version().static_syscalls() || insn.src == 0 {
-                        if let Some((_, function)) =
-                                self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
-                            self.emit_validate_and_profile_instruction_count(Some(0));
-                            self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, function as usize as i64));
-                            self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(ANCHOR_EXTERNAL_FUNCTION_CALL, 5)));
-                            self.emit_undo_profile_instruction_count(0);
-                            resolved = true;
+                    // Check for sol_multi3 intrinsic (static syscall with src=0)
+                    if insn.src == 0 && insn.imm == ebpf::SOL_MULTI3_IMM {
+                        // SOL_MULTI3: wrapping u128 multiplication
+                        // Reads operands from registers:
+                        //   a = r2 (low 64 bits) | r3 (high 64 bits)
+                        //   b = r4 (low 64 bits) | r5 (high 64 bits)
+                        //   result pointer = r1
+                        // Computes a * b (wrapping), writes 128-bit result to [r1] and [r1+8]
+
+                        let r0 = REGISTER_MAP[0];  // RAX - used for multiply result low
+                        let r1 = REGISTER_MAP[1];  // RSI - result pointer
+                        let r2 = REGISTER_MAP[2];  // RDX - a_lo (WARNING: also used for multiply result high)
+                        let r3 = REGISTER_MAP[3];  // RCX - a_hi
+                        let r4 = REGISTER_MAP[4];  // R8  - b_lo
+                        let r5 = REGISTER_MAP[5];  // R9  - b_hi
+                        let temp = REGISTER_SCRATCH; // R11 - temp register
+
+                        // Wrapping u128 multiplication algorithm:
+                        // result[0..64]   = (a_lo * b_lo).lo
+                        // result[64..128] = (a_lo * b_lo).hi + a_lo * b_hi + a_hi * b_lo
+                        // (higher order terms are discarded in wrapping multiplication)
+
+                        // Save a_lo in temp since r2 (RDX) will be clobbered by MUL
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r2, temp)); // temp = a_lo
+
+                        // Product 1: a_lo * b_lo -> RDX:RAX
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, temp, r0)); // RAX = a_lo
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r4, 0, None)); // MUL r4: RDX:RAX = a_lo * b_lo
+
+                        // Save result_lo (RAX) and result_hi (RDX) temporarily
+                        self.emit_ins(X86Instruction::push(r0, None));  // Stack: [result_lo]
+                        self.emit_ins(X86Instruction::push(r2, None));  // Stack: [result_hi, result_lo] (r2 is RDX)
+
+                        // Product 2: a_hi * b_lo -> RAX (we only need low 64 bits)
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r3, r0)); // RAX = a_hi (r3)
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r4, 0, None)); // MUL r4: RDX:RAX = a_hi * b_lo
+
+                        // Add to result_hi on stack
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, r0, RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // [RSP] += RAX
+
+                        // Product 3: a_lo * b_hi -> RAX (we only need low 64 bits)
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, temp, r0)); // RAX = a_lo (from temp)
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r5, 0, None)); // MUL r5: RDX:RAX = a_lo * b_hi
+
+                        // Add to result_hi on stack
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, r0, RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // [RSP] += RAX
+
+                        // Store result_lo at [r1] (still on stack at [RSP+8])
+                        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, r0, X86IndirectAccess::OffsetIndexShift(8, RSP, 0))); // r0 = result_lo
+                        self.emit_address_translation(None, Value::RegisterPlusConstant64(r1, 0, true), 8, Some(Value::Register(r0)));
+
+                        // Store result_hi at [r1+8] (still on stack at [RSP])
+                        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, r0, X86IndirectAccess::OffsetIndexShift(0, RSP, 0))); // r0 = result_hi
+                        self.emit_address_translation(None, Value::RegisterPlusConstant64(r1, 8, true), 8, Some(Value::Register(r0)));
+
+                        // Clean up stack
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 16, None)); // ADD RSP, 16
+
+                        self.emit_ins(X86Instruction::load_immediate(r0, 0)); // return 0
+                    } else {
+                        let mut resolved = false;
+                        // External syscall
+                        if !self.executable.get_sbpf_version().static_syscalls() || insn.src == 0 {
+                            if let Some((_, function)) =
+                                    self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
+                                self.emit_validate_and_profile_instruction_count(Some(0));
+                                self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, function as usize as i64));
+                                self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(ANCHOR_EXTERNAL_FUNCTION_CALL, 5)));
+                                self.emit_undo_profile_instruction_count(0);
+                                resolved = true;
+                            }
                         }
-                    }
-                    // Internal call
-                    if self.executable.get_sbpf_version().static_syscalls() {
-                        let target_pc = (self.pc as i64).saturating_add(insn.imm).saturating_add(1);
-                        if ebpf::is_pc_in_program(self.program, target_pc as usize) && insn.src == 1 {
+                        // Internal call
+                        if self.executable.get_sbpf_version().static_syscalls() {
+                            let target_pc = (self.pc as i64).saturating_add(insn.imm).saturating_add(1);
+                            if ebpf::is_pc_in_program(self.program, target_pc as usize) && insn.src == 1 {
+                                self.emit_internal_call(Value::Constant64(target_pc as i64, true));
+                                resolved = true;
+                            }
+                        } else if let Some((_function_name, target_pc)) =
+                            self.executable
+                                .get_function_registry()
+                                .lookup_by_key(insn.imm as u32) {
                             self.emit_internal_call(Value::Constant64(target_pc as i64, true));
                             resolved = true;
                         }
-                    } else if let Some((_function_name, target_pc)) =
-                        self.executable
-                            .get_function_registry()
-                            .lookup_by_key(insn.imm as u32) {
-                        self.emit_internal_call(Value::Constant64(target_pc as i64, true));
-                        resolved = true;
-                    }
-                    if !resolved {
-                        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
-                        self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_CALL_UNSUPPORTED_INSTRUCTION, 5)));
+                        if !resolved {
+                            self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
+                            self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_CALL_UNSUPPORTED_INSTRUCTION, 5)));
+                        }
                     }
                 },
                 ebpf::CALL_REG  => {

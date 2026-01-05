@@ -526,6 +526,12 @@ pub const CALL_REG: u8 = BPF_JMP64 | BPF_X | BPF_CALL;
 /// BPF opcode: `exit` /// `return r0`.
 pub const EXIT: u8 = BPF_JMP64 | BPF_EXIT;
 
+/// Syscall Intrinsics
+/// This is a special class of call instructions that are treated as intrinsics by the JIT compiler instead of actually invoking syscalls.
+
+/// u128 multiplication: multiply r2:r3 by r4:r5, store result in r1
+pub const SOL_MULTI3_IMM: i64 = i32::from_be_bytes([0xDB, 0x0F, 0x6D, 0x13]) as i64; //i32::from_le_bytes([0xDB, 0x0F, 0x6D, 0x13]) as i64; //-619746029
+
 // Used in JIT
 /// Mask to extract the operation class from an operation code.
 pub const BPF_CLS_MASK: u8 = 0x07;

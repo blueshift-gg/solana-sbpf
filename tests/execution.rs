@@ -3881,3 +3881,105 @@ fn test_symbol_relocation() {
         ProgramResult::Ok(0),
     );
 }
+
+#[test]
+fn test_u128_mul_checked_no_overflow() {
+    let config = Config {
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        ..Config::default()
+    };
+    // Test u128_mul_checked: 2^64 * 2 = 2^65 (no overflow in 128 bits)
+    // r1:r2 = 0x0000_0000_0000_0001 : 0x0000_0000_0000_0000  (2^64)
+    // r3:r4 = 0x0000_0000_0000_0000 : 0x0000_0000_0000_0002  (2)
+    // Expected result: r1:r2 = 0x0000_0000_0000_0002 : 0x0000_0000_0000_0000 (2^65), r0 = 0
+    test_interpreter_and_jit_asm!(
+        "
+        mov r1, 0x1
+        mov r2, 0x0
+        mov r3, 0x0
+        mov r4, 0x2
+        call 0x2B1AFAFF
+        mov r0, r1
+        exit",
+        config,
+        [],
+        TestContextObject::new(7),
+        ProgramResult::Ok(0x2), // r1 should be 0x2 (high 64 bits of 2^65)
+    );
+}
+
+#[test]
+fn test_u128_mul_checked_simple() {
+    let config = Config {
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        ..Config::default()
+    };
+    // Test u128_mul_checked: 0xFFFF_FFFF_FFFF_FFFF * 2 = 0x0000_0000_0000_0001_FFFF_FFFF_FFFF_FFFE
+    // r1:r2 = 0x0000_0000_0000_0000 : 0xFFFF_FFFF_FFFF_FFFF  (u64::MAX)
+    // r3:r4 = 0x0000_0000_0000_0000 : 0x0000_0000_0000_0002  (2)
+    // Expected: r1:r2 = 0x0000_0000_0000_0001 : 0xFFFF_FFFF_FFFF_FFFE, r0 = 0
+    test_interpreter_and_jit_asm!(
+        "
+        mov r1, 0x0
+        mov r2, -1
+        mov r3, 0x0
+        mov r4, 0x2
+        call 0x2B1AFAFF
+        exit",
+        config,
+        [],
+        TestContextObject::new(6),
+        ProgramResult::Ok(0x0), // r0 should be 0 (no overflow)
+    );
+}
+
+#[test]
+fn test_u128_mul_checked_overflow() {
+    let config = Config {
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        ..Config::default()
+    };
+    // Test u128_mul_checked with overflow
+    // r1:r2 = 0xFFFF_FFFF_FFFF_FFFF : 0xFFFF_FFFF_FFFF_FFFF  (u128::MAX)
+    // r3:r4 = 0x0000_0000_0000_0000 : 0x0000_0000_0000_0002  (2)
+    // This will overflow 128 bits, so r0 should be 1
+    test_interpreter_and_jit_asm!(
+        "
+        mov r1, -1
+        mov r2, -1
+        mov r3, 0x0
+        mov r4, 0x2
+        call 0x2B1AFAFF
+        exit",
+        config,
+        [],
+        TestContextObject::new(6),
+        ProgramResult::Ok(0x1), // r0 should be 1 (overflow)
+    );
+}
+
+#[test]
+fn test_u128_mul_checked_zero() {
+    let config = Config {
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        ..Config::default()
+    };
+    // Test u128_mul_checked: multiply by zero
+    // r1:r2 = 0xFFFF_FFFF_FFFF_FFFF : 0xFFFF_FFFF_FFFF_FFFF  (u128::MAX)
+    // r3:r4 = 0x0000_0000_0000_0000 : 0x0000_0000_0000_0000  (0)
+    // Expected: r1:r2 = 0x0000_0000_0000_0000 : 0x0000_0000_0000_0000, r0 = 0
+    test_interpreter_and_jit_asm!(
+        "
+        mov r1, -1
+        mov r2, -1
+        mov r3, 0x0
+        mov r4, 0x0
+        call 0x2B1AFAFF
+        mov r0, r2
+        exit",
+        config,
+        [],
+        TestContextObject::new(7),
+        ProgramResult::Ok(0x0), // r2 should be 0 (low 64 bits of result)
+    );
+}
