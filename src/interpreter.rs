@@ -522,39 +522,66 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             ebpf::CALL_IMM => {
                 // Check for u128_mul intrinsic
                 if insn.src == 0 && insn.imm == ebpf::U128_MUL_IMM {
-                    // u128_mul: multiply two u128 values
-                    // r1 = pointer to 48-byte buffer: [a: u128, b: u128, result: u128]
-                    // Reads a and b from [r1] and [r1+16], computes a*b, writes to [r1+32]
-                    // Returns: r0 = 0 on success
+                    // u128_mul: multiply two u128 values producing 256-bit result
+                    // r1 = pointer to 64-byte buffer: [a: u128, b: u128, result_lo: u128, result_hi: u128]
+                    // Reads a and b from [r1] and [r1+16], computes a*b as 256-bit result
+                    // Writes result_lo to [r1+32] and result_hi to [r1+48]
+                    // Returns: r0 = 0
 
                     let params_ptr = self.reg[1];
 
                     // Read a as two u64s (little-endian: lo at +0, hi at +8)
                     let a_ptr_lo = params_ptr;
                     let a_ptr_hi = params_ptr + 8;
-                    let a_lo = translate_memory_access!(self, load, a_ptr_lo, u64);
-                    let a_hi = translate_memory_access!(self, load, a_ptr_hi, u64);
-                    let a = ((a_hi as u128) << 64) | (a_lo as u128);
+                    let a_lo = translate_memory_access!(self, load, a_ptr_lo, u64) as u128;
+                    let a_hi = translate_memory_access!(self, load, a_ptr_hi, u64) as u128;
+                    let a = (a_hi << 64) | a_lo;
 
                     // Read b as two u64s (little-endian: lo at +16, hi at +24)
                     let b_ptr_lo = params_ptr + 16;
                     let b_ptr_hi = params_ptr + 24;
-                    let b_lo = translate_memory_access!(self, load, b_ptr_lo, u64);
-                    let b_hi = translate_memory_access!(self, load, b_ptr_hi, u64);
-                    let b = ((b_hi as u128) << 64) | (b_lo as u128);
+                    let b_lo = translate_memory_access!(self, load, b_ptr_lo, u64) as u128;
+                    let b_hi = translate_memory_access!(self, load, b_ptr_hi, u64) as u128;
+                    let b = (b_hi << 64) | b_lo;
 
-                    // Compute result
-                    let result = a.wrapping_mul(b);
+                    // Compute 256-bit result: (a * b) using widening multiplication
+                    // Split into 64-bit parts for full precision
+                    let a_lo_64 = a as u64 as u128;
+                    let a_hi_64 = (a >> 64) as u64 as u128;
+                    let b_lo_64 = b as u64 as u128;
+                    let b_hi_64 = (b >> 64) as u64 as u128;
 
-                    // Write result as two u64s (little-endian: lo at +32, hi at +40)
-                    let result_ptr_lo = params_ptr + 32;
-                    let result_ptr_hi = params_ptr + 40;
-                    let result_lo = result as u64;
-                    let result_hi = (result >> 64) as u64;
-                    translate_memory_access!(self, store, result_lo, result_ptr_lo, u64);
-                    translate_memory_access!(self, store, result_hi, result_ptr_hi, u64);
+                    // Compute partial products
+                    let p0 = a_lo_64 * b_lo_64;  // contributes to result_lo
+                    let p1 = a_hi_64 * b_lo_64;  // contributes to result_lo.hi and result_hi.lo
+                    let p2 = a_lo_64 * b_hi_64;  // contributes to result_lo.hi and result_hi.lo
+                    let p3 = a_hi_64 * b_hi_64;  // contributes to result_hi
 
-                    // Success
+                    // Combine partial products with proper carry propagation
+                    let middle = p1.wrapping_add(p2);
+                    let middle_carry = if middle < p1 { 1u128 } else { 0u128 };
+
+                    let result_lo = p0.wrapping_add(middle << 64);
+                    let result_lo_carry = if result_lo < p0 { 1u128 } else { 0u128 };
+
+                    let result_hi = p3
+                        .wrapping_add(middle >> 64)
+                        .wrapping_add(result_lo_carry)
+                        .wrapping_add(middle_carry << 64);
+
+                    // Write result_lo as two u64s (little-endian: lo at +32, hi at +40)
+                    let result_lo_ptr_lo = params_ptr + 32;
+                    let result_lo_ptr_hi = params_ptr + 40;
+                    translate_memory_access!(self, store, result_lo as u64, result_lo_ptr_lo, u64);
+                    translate_memory_access!(self, store, (result_lo >> 64) as u64, result_lo_ptr_hi, u64);
+
+                    // Write result_hi as two u64s (little-endian: lo at +48, hi at +56)
+                    let result_hi_ptr_lo = params_ptr + 48;
+                    let result_hi_ptr_hi = params_ptr + 56;
+                    translate_memory_access!(self, store, result_hi as u64, result_hi_ptr_lo, u64);
+                    translate_memory_access!(self, store, (result_hi >> 64) as u64, result_hi_ptr_hi, u64);
+
+                    // Return 0
                     self.reg[0] = 0;
                 } else {
                     let key = self
