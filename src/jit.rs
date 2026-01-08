@@ -789,111 +789,63 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 ebpf::JSLE_IMM   => self.emit_conditional_branch_imm(0x8e, false, insn.imm, dst, target_pc),
                 ebpf::JSLE_REG   => self.emit_conditional_branch_reg(0x8e, false, src, dst, target_pc),
                 ebpf::CALL_IMM => {
-                    // Check for u128_mul intrinsic (static syscall with src=0)
-                    if insn.src == 0 && insn.imm == ebpf::U128_MUL_IMM {
-                        // u128_mul: multiply two u128 values via memory
-                        // r1 = pointer to params: [a: u128, b: u128, result: u128, overflow: bool]
-                        // Reads a and b from [r1] and [r1+16], computes a*b, writes to [r1+32]
-                        // Writes overflow flag to [r1+48]
-                        // Returns: r0 = overflow status (0 if no overflow, 1 if overflow)
+                    // Check for sol_multi3 intrinsic (static syscall with src=0)
+                    if insn.src == 0 && insn.imm == ebpf::SOL_MULTI3_IMM {
+                        // SOL_MULTI3: wrapping u128 multiplication
+                        // Reads operands from registers:
+                        //   a = r2 (low 64 bits) | r3 (high 64 bits)
+                        //   b = r4 (low 64 bits) | r5 (high 64 bits)
+                        //   result pointer = r1
+                        // Computes a * b (wrapping), writes 128-bit result to [r1] and [r1+8]
 
-                        // u128 multiplication using 64-bit operations:
-                        // a = a_hi:a_lo (at r1+8:r1+0)
-                        // b = b_hi:b_lo (at r1+24:r1+16)
-                        // result_lo = (a_lo * b_lo).lo
-                        // result_hi = (a_lo * b_lo).hi + a_lo * b_hi + a_hi * b_lo
-                        // overflow = (a_lo * b_hi).hi != 0 OR (a_hi * b_lo).hi != 0 OR carry from result_hi OR (a_hi != 0 AND b_hi != 0)
+                        let r0 = REGISTER_MAP[0];  // RAX - used for multiply result low
+                        let r1 = REGISTER_MAP[1];  // RSI - result pointer
+                        let r2 = REGISTER_MAP[2];  // RDX - a_lo (WARNING: also used for multiply result high)
+                        let r3 = REGISTER_MAP[3];  // RCX - a_hi
+                        let r4 = REGISTER_MAP[4];  // R8  - b_lo
+                        let r5 = REGISTER_MAP[5];  // R9  - b_hi
+                        let temp = REGISTER_SCRATCH; // R11 - temp register
 
-                        let r0 = REGISTER_MAP[0]; // RAX - used for multiply
-                        let r1 = REGISTER_MAP[1]; // RSI - pointer to params
-                        let rdx = RDX; // RDX - receives high 64 bits of mul
-                        let temp = REGISTER_SCRATCH; // R11 - temp for loads
+                        // Wrapping u128 multiplication algorithm:
+                        // result[0..64]   = (a_lo * b_lo).lo
+                        // result[64..128] = (a_lo * b_lo).hi + a_lo * b_hi + a_hi * b_lo
+                        // (higher order terms are discarded in wrapping multiplication)
 
-                        // Full 256-bit u128 multiplication
-                        // Memory layout:
-                        //   [0-7]:    a_lo (u64)
-                        //   [8-15]:   a_hi (u64)
-                        //   [16-23]:  b_lo (u64)
-                        //   [24-31]:  b_hi (u64)
-                        //   [32-39]:  result_lo.lo (u64)
-                        //   [40-47]:  result_lo.hi (u64)
-                        //   [48-55]:  result_hi.lo (u64)
-                        //   [56-63]:  result_hi.hi (u64)
-                        //
-                        // Compute: (a_hi:a_lo) * (b_hi:b_lo) = 256-bit result
-                        //
-                        // Using standard multiplication expansion:
-                        // result[0..64]   = a_lo * b_lo
-                        // result[64..128] += a_hi * b_lo + a_lo * b_hi
-                        // result[128..192] += a_hi * b_hi
-                        //
-                        // Implementation: compute all 4 products and accumulate with carries
+                        // Save a_lo in temp since r2 (RDX) will be clobbered by MUL
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r2, temp)); // temp = a_lo
 
-                        // Product 1: a_lo * b_lo -> result[0..128]
-                        self.emit_address_translation(Some(r0), Value::RegisterPlusConstant64(r1, 0, true), 8, None);
-                        self.emit_address_translation(Some(temp), Value::RegisterPlusConstant64(r1, 16, true), 8, None);
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, temp, 0, None)); // MUL: RDX:RAX = a_lo * b_lo
+                        // Product 1: a_lo * b_lo -> RDX:RAX
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, temp, r0)); // RAX = a_lo
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r4, 0, None)); // MUL r4: RDX:RAX = a_lo * b_lo
 
-                        // Store result_lo.lo
-                        self.emit_address_translation(None, Value::RegisterPlusConstant64(r1, 32, true), 8, Some(Value::Register(r0)));
+                        // Save result_lo (RAX) and result_hi (RDX) temporarily
+                        self.emit_ins(X86Instruction::push(r0, None));  // Stack: [result_lo]
+                        self.emit_ins(X86Instruction::push(r2, None));  // Stack: [result_hi, result_lo] (r2 is RDX)
 
-                        // Save result_lo.hi (from RDX) on stack
-                        self.emit_ins(X86Instruction::push(rdx, None)); // Stack: [result_lo.hi]
+                        // Product 2: a_hi * b_lo -> RAX (we only need low 64 bits)
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r3, r0)); // RAX = a_hi (r3)
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r4, 0, None)); // MUL r4: RDX:RAX = a_hi * b_lo
 
-                        // Product 2: a_hi * b_lo -> result[64..192]
-                        self.emit_address_translation(Some(r0), Value::RegisterPlusConstant64(r1, 8, true), 8, None);
-                        self.emit_address_translation(Some(temp), Value::RegisterPlusConstant64(r1, 16, true), 8, None);
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, temp, 0, None)); // MUL: RDX:RAX = a_hi * b_lo
+                        // Add to result_hi on stack
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, r0, RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // [RSP] += RAX
 
-                        // Add low 64 bits to result_lo.hi on stack
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, r0, RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // result_lo.hi += RAX
+                        // Product 3: a_lo * b_hi -> RAX (we only need low 64 bits)
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, temp, r0)); // RAX = a_lo (from temp)
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r5, 0, None)); // MUL r5: RDX:RAX = a_lo * b_hi
 
-                        // Save high 64 bits as result_hi.lo (with carry from previous add)
-                        self.emit_ins(X86Instruction::load_immediate(r0, 0));
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x11, r0, rdx, None)); // RDX = RDX + 0 + CF (ADC)
-                        self.emit_ins(X86Instruction::push(rdx, None)); // Stack: [result_hi.lo, result_lo.hi]
+                        // Add to result_hi on stack
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, r0, RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // [RSP] += RAX
 
-                        // Product 3: a_lo * b_hi -> result[64..192]
-                        self.emit_address_translation(Some(r0), Value::RegisterPlusConstant64(r1, 0, true), 8, None);
-                        self.emit_address_translation(Some(temp), Value::RegisterPlusConstant64(r1, 24, true), 8, None);
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, temp, 0, None)); // MUL: RDX:RAX = a_lo * b_hi
+                        // Store result_lo at [r1] (still on stack at [RSP+8])
+                        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, r0, X86IndirectAccess::OffsetIndexShift(8, RSP, 0))); // r0 = result_lo
+                        self.emit_address_translation(None, Value::RegisterPlusConstant64(r1, 0, true), 8, Some(Value::Register(r0)));
 
-                        // Add low 64 bits to result_lo.hi at [RSP+8]
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, r0, RSP, Some(X86IndirectAccess::OffsetIndexShift(8, RSP, 0)))); // result_lo.hi += RAX
+                        // Store result_hi at [r1+8] (still on stack at [RSP])
+                        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, r0, X86IndirectAccess::OffsetIndexShift(0, RSP, 0))); // r0 = result_hi
+                        self.emit_address_translation(None, Value::RegisterPlusConstant64(r1, 8, true), 8, Some(Value::Register(r0)));
 
-                        // Add high 64 bits (+ carry) to result_hi.lo at [RSP]
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x11, rdx, RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // result_hi.lo += RDX + CF (ADC)
-
-                        // Save carry from result_hi.lo addition for later
-                        self.emit_ins(X86Instruction::load_immediate(temp, 0));
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x11, temp, temp, None)); // temp = 0 + CF
-                        self.emit_ins(X86Instruction::push(temp, None)); // Stack: [carry, result_hi.lo, result_lo.hi]
-
-                        // Store result_lo.hi
-                        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, r0, X86IndirectAccess::OffsetIndexShift(16, RSP, 0)));
-                        self.emit_address_translation(None, Value::RegisterPlusConstant64(r1, 40, true), 8, Some(Value::Register(r0)));
-
-                        // Product 4: a_hi * b_hi -> result[128..256]
-                        self.emit_address_translation(Some(r0), Value::RegisterPlusConstant64(r1, 8, true), 8, None);
-                        self.emit_address_translation(Some(temp), Value::RegisterPlusConstant64(r1, 24, true), 8, None);
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, temp, 0, None)); // MUL: RDX:RAX = a_hi * b_hi
-
-                        // Add carry from Product 3
-                        self.emit_ins(X86Instruction::pop(temp)); // temp = carry
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, temp, r0, None)); // RAX += carry
-
-                        // Add result_hi.lo from stack
-                        self.emit_ins(X86Instruction::pop(temp)); // temp = result_hi.lo
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, temp, r0, None)); // RAX += result_hi.lo
-
-                        // Store result_hi.hi (what we computed in RAX is actually the high limb)
-                        self.emit_address_translation(None, Value::RegisterPlusConstant64(r1, 56, true), 8, Some(Value::Register(r0)));
-
-                        // Store result_hi.lo (RDX from a_hi*b_hi is the low limb)
-                        self.emit_address_translation(None, Value::RegisterPlusConstant64(r1, 48, true), 8, Some(Value::Register(rdx)));
-
-                        // Clean up stack (pop result_lo.hi)
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 8, None)); // ADD RSP, 8
+                        // Clean up stack
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 16, None)); // ADD RSP, 16
 
                         self.emit_ins(X86Instruction::load_immediate(r0, 0)); // return 0
                     } else {
