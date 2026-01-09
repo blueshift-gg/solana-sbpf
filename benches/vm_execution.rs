@@ -258,3 +258,68 @@ fn bench_jit_vs_interpreter_call_depth_dynamic(bencher: &mut Bencher) {
         &mut [],
     );
 }
+
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+#[bench]
+fn bench_mul_expand(bencher: &mut Bencher) {
+    let mut file = File::open("/tmp/u128_mul_llvm_expansion_10k.so").unwrap();
+    let mut elf = Vec::new();
+    file.read_to_end(&mut elf).unwrap();
+    let mut executable =
+        Executable::<TestContextObject>::from_elf(&elf, Arc::new(BuiltinProgram::new_mock()))
+            .unwrap();
+    executable.verify::<RequisiteVerifier>().unwrap();
+    executable.jit_compile().unwrap();
+    let mut context_object = TestContextObject::default();
+    let mut input = vec![];
+    input.extend(10u128.to_le_bytes());
+    input.extend(20u128.to_le_bytes());
+    let mem_region = MemoryRegion::new_writable(&mut input, ebpf::MM_INPUT_START);
+    create_vm!(
+        vm,
+        &executable,
+        &mut context_object,
+        stack,
+        heap,
+        vec![mem_region],
+        None
+    );
+    bencher.iter(|| {
+        vm.context_object_pointer.remaining = 1_000_000;
+        vm.execute_program(&executable, false).1.unwrap();
+    });
+}
+
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+#[bench]
+fn bench_mul_intrinsics(bencher: &mut Bencher) {
+    let mut file = File::open("/tmp/u128_mul_llvm_libcall_10k(1).so").unwrap();
+    let mut elf = Vec::new();
+    file.read_to_end(&mut elf).unwrap();
+    let mut executable =
+        Executable::<TestContextObject>::from_elf(&elf, Arc::new(BuiltinProgram::new_mock()))
+            .unwrap();
+    executable.verify::<RequisiteVerifier>().unwrap();
+    executable.jit_compile().unwrap();
+    let mut context_object = TestContextObject::default();
+    let mut input = vec![];
+    input.resize(16, 0);
+    input.extend(10u128.to_le_bytes());
+    input.extend(20u128.to_le_bytes());
+    let mem_region = MemoryRegion::new_writable(&mut input, ebpf::MM_INPUT_START);
+    create_vm!(
+        vm,
+        &executable,
+        &mut context_object,
+        stack,
+        heap,
+        vec![mem_region],
+        None
+    );
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    bencher.iter(|| {
+        vm.context_object_pointer.remaining = 1_000_000;
+        vm.execute_program(&executable, false).1.unwrap()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(700));
+}
