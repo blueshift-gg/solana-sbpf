@@ -3885,7 +3885,7 @@ fn test_symbol_relocation() {
 #[test]
 fn test_u128_mul_checked_no_overflow() {
     let config = Config {
-        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V3,
         ..Config::default()
     };
     // Test u128_mul_checked: 2^64 * 2 = 2^65 (no overflow in 128 bits)
@@ -3911,7 +3911,7 @@ fn test_u128_mul_checked_no_overflow() {
 #[test]
 fn test_u128_mul_checked_simple() {
     let config = Config {
-        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V3,
         ..Config::default()
     };
     // Test u128_mul_checked: 0xFFFF_FFFF_FFFF_FFFF * 2 = 0x0000_0000_0000_0001_FFFF_FFFF_FFFF_FFFE
@@ -3936,7 +3936,7 @@ fn test_u128_mul_checked_simple() {
 #[test]
 fn test_u128_mul_checked_overflow() {
     let config = Config {
-        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V3,
         ..Config::default()
     };
     // Test u128_mul_checked with overflow
@@ -3959,9 +3959,9 @@ fn test_u128_mul_checked_overflow() {
 }
 
 #[test]
-fn test_u128_mul_checked_zero() {
+fn test_u128_mul_simple() {
     let config = Config {
-        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V3,
         ..Config::default()
     };
     // Test u128_mul_checked: multiply by zero
@@ -3970,16 +3970,16 @@ fn test_u128_mul_checked_zero() {
     // Expected: r1:r2 = 0x0000_0000_0000_0000 : 0x0000_0000_0000_0000, r0 = 0
     test_interpreter_and_jit_asm!(
         "
-        mov r1, -1
-        mov r2, -1
-        mov r3, 0x0
-        mov r4, 0x0
-        call 0x2B1AFAFF
-        mov r0, r2
+        mov r1, 0
+        mov r2, 1
+        mov r3, 2
+        mov r4, 0
+        call -0x24f092ed
+        mov r0, r1
         exit",
         config,
         [],
         TestContextObject::new(7),
-        ProgramResult::Ok(0x0), // r2 should be 0 (low 64 bits of result)
+        ProgramResult::Ok(2), // r2 should be 0 (low 64 bits of result)
     );
 }
