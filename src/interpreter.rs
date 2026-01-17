@@ -544,16 +544,15 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             },
 
             ebpf::CALL_IMM => {
-                if insn.src == 0 && insn.imm == ebpf::SOL_MULTI3_IMM {
-                    let result_ptr_lo = self.reg[1];
-                    let result_ptr_hi = result_ptr_lo + core::mem::size_of::<u64>() as u64;
-                    let a = self.reg[2] as u128 | (self.reg[3] as u128) << 64;
-                    let b = self.reg[4] as u128 | (self.reg[5] as u128) << 64;
+                if insn.imm == ebpf::SOL_MULTI3_IMM {
+                    let a = self.reg[1] as u128 | (self.reg[2] as u128) << 64;
+                    let b = self.reg[3] as u128 | (self.reg[4] as u128) << 64;
                     let result = a.wrapping_mul(b);
                     let result_lo = result as u64;
                     let result_hi = (result >> 64) as u64;
-                    translate_memory_access!(self, store, result_lo as u64, result_ptr_lo, u64);
-                    translate_memory_access!(self, store, result_hi as u64, result_ptr_hi, u64);
+                    dbg!("MULTI3: {:#x} * {:#x} = {:#x}{:#x}", a, b, result_hi, result_lo);
+                    self.reg[0] = result_lo;
+                    self.reg[1] = result_hi;
                 } else {
                     let mut resolved = false;
                     // External syscall

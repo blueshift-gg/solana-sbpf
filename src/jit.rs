@@ -807,21 +807,20 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 ebpf::JSLE64_IMM   => self.emit_conditional_branch_imm(OperandSize::S64, 0x8e, false, insn.imm, dst, target_pc),
                 ebpf::JSLE64_REG   => self.emit_conditional_branch_reg(OperandSize::S64, 0x8e, false, src, dst, target_pc),
                 ebpf::CALL_IMM     => {
-                    // Check for sol_multi3 intrinsic (static syscall with src=0)
-                    if insn.src == 0 && insn.imm == ebpf::SOL_MULTI3_IMM {
+                    // Check for sol_multi3 intrinsic (static syscall with
+                    // src=0)
+                    if insn.imm == ebpf::SOL_MULTI3_IMM {
                         // SOL_MULTI3: wrapping u128 multiplication
                         // Reads operands from registers:
-                        //   a = r2 (low 64 bits) | r3 (high 64 bits)
-                        //   b = r4 (low 64 bits) | r5 (high 64 bits)
-                        //   result pointer = r1
-                        // Computes a * b (wrapping), writes 128-bit result to [r1] and [r1+8]
+                        //   a = r1 (low 64 bits) | r2 (high 64 bits)
+                        //   b = r3 (low 64 bits) | r4 (high 64 bits)
+                        // Computes a * b (wrapping), returns 128-bit result in r0 (low) and r1 (high)
 
                         let r0 = REGISTER_MAP[0];  // RAX - used for multiply result low
-                        let r1 = REGISTER_MAP[1];  // RSI - result pointer
-                        let r2 = REGISTER_MAP[2];  // RDX - a_lo (WARNING: also used for multiply result high)
-                        let r3 = REGISTER_MAP[3];  // RCX - a_hi
-                        let r4 = REGISTER_MAP[4];  // R8  - b_lo
-                        let r5 = REGISTER_MAP[5];  // R9  - b_hi
+                        let r1 = REGISTER_MAP[1];  // RSI - a_lo/result high
+                        let r2 = REGISTER_MAP[2];  // RDX - a_hi (WARNING: also used for multiply result high)
+                        let r3 = REGISTER_MAP[3];  // RCX - b_lo
+                        let r4 = REGISTER_MAP[4];  // R8  - b_hi
                         let temp = REGISTER_SCRATCH; // R11 - temp register
 
                         // Wrapping u128 multiplication algorithm:
@@ -829,43 +828,28 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                         // result[64..128] = (a_lo * b_lo).hi + a_lo * b_hi + a_hi * b_lo
                         // (higher order terms are discarded in wrapping multiplication)
 
-                        // Save a_lo in temp since r2 (RDX) will be clobbered by MUL
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r2, temp)); // temp = a_lo
+                        // Save a_hi on the stack since r2 (RDX) will be clobbered by MUL
+                        self.emit_ins(X86Instruction::push(r2, None)); // Stack: [saved_a_hi]
 
                         // Product 1: a_lo * b_lo -> RDX:RAX
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, temp, r0)); // RAX = a_lo
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r4, 0, None)); // MUL r4: RDX:RAX = a_lo * b_lo
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r1, r0)); // RAX = a_lo
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r3, 0, None)); // MUL r3: RDX:RAX = a_lo * b_lo
 
-                        // Save result_lo (RAX) and result_hi (RDX) temporarily
-                        self.emit_ins(X86Instruction::push(r0, None));  // Stack: [result_lo]
-                        self.emit_ins(X86Instruction::push(r2, None));  // Stack: [result_hi, result_lo] (r2 is RDX)
+                        // Product 2: a_hi * b_lo (low 64 bits)
+                        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, temp, X86IndirectAccess::OffsetIndexShift(0, RSP, 0))); // temp = a_hi
+                        self.emit_ins(X86Instruction::alu_escaped(OperandSize::S64, 1, 0xaf, temp, r3, None)); // temp *= b_lo
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, temp, r2, None)); // RDX += temp
 
-                        // Product 2: a_hi * b_lo -> RAX (we only need low 64 bits)
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r3, r0)); // RAX = a_hi (r3)
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r4, 0, None)); // MUL r4: RDX:RAX = a_hi * b_lo
+                        // Product 3: a_lo * b_hi (low 64 bits)
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r1, temp)); // temp = a_lo
+                        self.emit_ins(X86Instruction::alu_escaped(OperandSize::S64, 1, 0xaf, temp, r4, None)); // temp *= b_hi
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, temp, r2, None)); // RDX += temp
 
-                        // Add to result_hi on stack
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, r0, RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // [RSP] += RAX
-
-                        // Product 3: a_lo * b_hi -> RAX (we only need low 64 bits)
-                        self.emit_ins(X86Instruction::mov(OperandSize::S64, temp, r0)); // RAX = a_lo (from temp)
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 4, r5, 0, None)); // MUL r5: RDX:RAX = a_lo * b_hi
-
-                        // Add to result_hi on stack
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, r0, RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // [RSP] += RAX
-
-                        // Store result_lo at [r1] (still on stack at [RSP+8])
-                        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, r0, X86IndirectAccess::OffsetIndexShift(8, RSP, 0))); // r0 = result_lo
-                        self.emit_address_translation(None, Value::RegisterPlusConstant64(r1, 0, true), 8, Some(Value::Register(r0)));
-
-                        // Store result_hi at [r1+8] (still on stack at [RSP])
-                        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, r0, X86IndirectAccess::OffsetIndexShift(0, RSP, 0))); // r0 = result_hi
-                        self.emit_address_translation(None, Value::RegisterPlusConstant64(r1, 8, true), 8, Some(Value::Register(r0)));
+                        // Move result_hi into r1
+                        self.emit_ins(X86Instruction::mov(OperandSize::S64, r2, r1)); // r1 = result_hi
 
                         // Clean up stack
-                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 16, None)); // ADD RSP, 16
-
-                        self.emit_ins(X86Instruction::load_immediate(r0, 0)); // return 0
+                        self.emit_ins(X86Instruction::pop(r2)); // restore a_hi
                     } else {
                         let mut resolved = false;
                         // External syscall
