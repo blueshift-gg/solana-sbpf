@@ -262,7 +262,7 @@ fn bench_jit_vs_interpreter_call_depth_dynamic(bencher: &mut Bencher) {
 #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
 #[bench]
 fn bench_mul_expand(bencher: &mut Bencher) {
-    let mut file = File::open("/tmp/u128_mul_llvm_expansion_10k.so").unwrap();
+    let mut file = File::open("tests/elfs/mul_expand.so").unwrap();
     let mut elf = Vec::new();
     file.read_to_end(&mut elf).unwrap();
     let mut executable =
@@ -293,7 +293,7 @@ fn bench_mul_expand(bencher: &mut Bencher) {
 #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
 #[bench]
 fn bench_mul_intrinsics(bencher: &mut Bencher) {
-    let mut file = File::open("/tmp/u128_mul_llvm_libcall_10k(1).so").unwrap();
+    let mut file = File::open("tests/elfs/mul_intrinsics.so").unwrap();
     let mut elf = Vec::new();
     file.read_to_end(&mut elf).unwrap();
     let mut executable =
