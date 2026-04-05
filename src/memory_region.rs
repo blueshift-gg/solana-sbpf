@@ -590,6 +590,7 @@ impl MemoryMapping {
                 ebpf::MM_STACK_START => "stack",
                 ebpf::MM_HEAP_START => "heap",
                 ebpf::MM_INPUT_START => "input",
+                ebpf::MM_STATIC_SYSVAR_START => "static_sysvar",
                 _ => "unknown",
             };
             ProgramResult::Err(EbpfError::AccessViolation(
@@ -1408,5 +1409,120 @@ mod test {
         .unwrap();
 
         assert!(matches!(mapping.ty, MemoryMappingType::Aligned(_)));
+    }
+
+    #[test]
+    fn test_static_sysvar_load() {
+        let config = Config {
+            aligned_memory_mapping: true,
+            ..Config::default()
+        };
+        let sysvar_data: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+        let sysvar_vm_addr = ebpf::MM_STATIC_SYSVAR_START | 0x12345678;
+
+        let mut m = MemoryMapping::new(
+            vec![
+                MemoryRegion::new_readonly(&[0; 8], ebpf::MM_REGION_SIZE),
+                MemoryRegion::new_readonly(&sysvar_data, sysvar_vm_addr),
+            ],
+            &config,
+            SBPFVersion::V4,
+        )
+        .unwrap();
+
+        // Load u8 from start of sysvar
+        assert_eq!(m.load::<u8>(sysvar_vm_addr).unwrap(), 0xAA);
+        // Load u16 from start
+        assert_eq!(m.load::<u16>(sysvar_vm_addr).unwrap(), 0xBBAA);
+        // Load u32 from start
+        assert_eq!(m.load::<u32>(sysvar_vm_addr).unwrap(), 0xDDCCBBAA);
+        // Load u64 from start (full 8 bytes)
+        assert_eq!(
+            m.load::<u64>(sysvar_vm_addr).unwrap(),
+            0x44332211DDCCBBAA
+        );
+        // Load u8 at offset 4
+        assert_eq!(m.load::<u8>(sysvar_vm_addr + 4).unwrap(), 0x11);
+        // Load u32 at offset 4
+        assert_eq!(m.load::<u32>(sysvar_vm_addr + 4).unwrap(), 0x44332211);
+    }
+
+    #[test]
+    fn test_static_sysvar_out_of_bounds() {
+        let config = Config {
+            aligned_memory_mapping: true,
+            ..Config::default()
+        };
+        let sysvar_data: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let sysvar_vm_addr = ebpf::MM_STATIC_SYSVAR_START | 0xABCD;
+
+        let mut m = MemoryMapping::new(
+            vec![
+                MemoryRegion::new_readonly(&[0; 8], ebpf::MM_REGION_SIZE),
+                MemoryRegion::new_readonly(&sysvar_data, sysvar_vm_addr),
+            ],
+            &config,
+            SBPFVersion::V4,
+        )
+        .unwrap();
+
+        // Reading beyond the sysvar length should fail
+        assert_error!(m.load::<u64>(sysvar_vm_addr), "AccessViolation");
+        // Reading one byte past the end should fail
+        assert_error!(m.load::<u8>(sysvar_vm_addr + 4), "AccessViolation");
+        // Reading at an address not covered by any sysvar should fail
+        assert_error!(
+            m.load::<u8>(ebpf::MM_STATIC_SYSVAR_START | 0x9999),
+            "AccessViolation"
+        );
+    }
+
+    #[test]
+    fn test_static_sysvar_store_denied() {
+        let config = Config {
+            aligned_memory_mapping: true,
+            ..Config::default()
+        };
+        let sysvar_data: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let sysvar_vm_addr = ebpf::MM_STATIC_SYSVAR_START | 0x1234;
+
+        let mut m = MemoryMapping::new(
+            vec![
+                MemoryRegion::new_readonly(&[0; 8], ebpf::MM_REGION_SIZE),
+                MemoryRegion::new_readonly(&sysvar_data, sysvar_vm_addr),
+            ],
+            &config,
+            SBPFVersion::V4,
+        )
+        .unwrap();
+
+        // Stores to static sysvar addresses must be denied
+        assert_error!(m.store(0xFFu8, sysvar_vm_addr), "AccessViolation");
+    }
+
+    #[test]
+    fn test_static_sysvar_multiple_entries() {
+        let config = Config {
+            aligned_memory_mapping: true,
+            ..Config::default()
+        };
+        let clock_data: Vec<u8> = vec![1, 2, 3, 4];
+        let rent_data: Vec<u8> = vec![5, 6, 7, 8];
+        let clock_addr = ebpf::MM_STATIC_SYSVAR_START | 0x1111;
+        let rent_addr = ebpf::MM_STATIC_SYSVAR_START | 0x2222;
+
+        let mut m = MemoryMapping::new(
+            vec![
+                MemoryRegion::new_readonly(&[0; 8], ebpf::MM_REGION_SIZE),
+                MemoryRegion::new_readonly(&clock_data, clock_addr),
+                MemoryRegion::new_readonly(&rent_data, rent_addr),
+            ],
+            &config,
+            SBPFVersion::V4,
+        )
+        .unwrap();
+
+        assert_eq!(m.load::<u32>(clock_addr).unwrap(), 0x04030201);
+        assert_eq!(m.load::<u32>(rent_addr).unwrap(), 0x08070605);
     }
 }

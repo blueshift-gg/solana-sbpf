@@ -49,6 +49,8 @@ pub const MM_STACK_START: u64 = MM_REGION_SIZE * 2;
 pub const MM_HEAP_START: u64 = MM_REGION_SIZE * 3;
 /// Virtual address of the input region
 pub const MM_INPUT_START: u64 = MM_REGION_SIZE * 4;
+/// Virtual address of the static sysvar region
+pub const MM_STATIC_SYSVAR_START: u64 = MM_REGION_SIZE * 5;
 
 // eBPF op codes.
 // See also https://www.kernel.org/doc/Documentation/networking/filter.txt
