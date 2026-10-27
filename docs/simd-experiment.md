@@ -58,6 +58,42 @@ four more ops were added:
 - **Single-state kernel:** needs `vshufd` (diagonalization) and `vpermd`/`vblendd` (in-register
   message permutation).
 
+## Intrinsic call form (SIMD-0645 style, no new opcode)
+
+The same 13 operations are also available without extending the ISA, as static syscalls in the
+style of `sol_multi3` (SIMD-0645). This is `VecMode::Call` in the assembler and
+`src/simd/intrinsics.rs`.
+
+```text
+mov64 r5, <packed operands>       ; compile time constant
+call  sol_vadd32x8                ; CALL_IMM, src = 0, imm = murmur32("sol_vadd32x8")
+```
+
+* **Encoding:** one static call identifier per operation (`sol_vload256`, `sol_vstore256`,
+  `sol_vadd32x8`, `sol_vxor256`, `sol_vand256`, `sol_vor256`, `sol_vror32x8`, `sol_vshufd`,
+  `sol_vtranspose8`, `sol_vbcast32`, `sol_vmov256`, `sol_vpermd`, `sol_vblendd`). `dst`, `src` and
+  `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF.
+* **Operands:** `r5` carries the packed operands (bits 0–5 `vd`, 6–11 `va`, 12–17 `vb` or a 16 bit
+  offset for loads/stores, 18–25 an 8 bit immediate, 28–30 the scalar register). The packed value
+  always fits a `mov64 imm32`. The scalar operand (address or broadcast value) is any of `r1..=r4`,
+  selected by the packed field.
+* **Results:** the operation writes `r0 = 0` and leaves every other register unchanged. It costs the
+  1 CU of the `CALL_IMM`, so with the `mov64 r5` each vector op costs 2 CUs.
+* **Execution:** every engine runs the operation through the same reference semantics.
+  - The interpreter (and any engine without the lowering) dispatches the syscall normally.
+  - The JIT's `codegen` hook checks a block local constant tracker. If `r5` holds a valid constant
+    at the call, it emits exactly the AVX2 code of the opcode form, including register caching,
+    plus `mov eax, 0`.
+  - Otherwise, for example when `r5` was loaded from memory or set before a jump target, it emits
+    a regular syscall to the reference implementation. Results and CUs are identical either way.
+* **Compatibility:** a runtime that doesn't know the identifiers rejects the program at deployment
+  (`LocalVerifier`, `InvalidSyscall`), and an unregistered call fails with
+  `UnsupportedInstruction`. Nothing is ever misinterpreted.
+* **Programs:** a compiler can emit these like any other syscall, e.g.
+  `sol_vadd32x8(ops(V0, V0, V1))`, where `ops` is a const fn. No inline assembly is needed.
+  Because r1–r5 are caller-saved across calls, compilers reload `r5` right before each call, which
+  keeps the operands visible to the constant tracker.
+
 ## Vector memory region
 
 * `MM_VECTOR_START = 0x6 << 32`. `0x5 << 32` stays reserved for the static-sysvars proposal.
@@ -204,7 +240,8 @@ All variants match `blake3::hash` byte for byte at every test size, from 0 bytes
 | file | content |
 |---|---|
 | `src/simd/mod.rs` | encoding, decoding, reference semantics, operand translation, `VectorMemory` |
-| `src/simd_jit.rs` | AVX2 lowering, register cache, statistics (child module of `jit`) |
+| `src/simd_jit.rs` | AVX2 lowering, register cache, intrinsic constant tracking, statistics (child module of `jit`) |
+| `src/simd/intrinsics.rs` | static call (SIMD-0645 style) form: identifiers, operand packing, builtins |
 | `src/x86.rs` | `VexInstruction` encoder |
 | `src/simd/asm.rs` | macro assembler for the generated programs |
 | `src/simd/blake3_program.rs` | BLAKE3 hash / compression / microbench program generators |

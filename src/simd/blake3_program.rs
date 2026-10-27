@@ -511,8 +511,8 @@ impl Gen {
         a.ldxdw(0, 8, A_NBLOCKS);
         a.jlt(5, 0, top);
         if simd {
-            a.ldxdw(5, 8, A_OUT);
-            a.vstore(5, 0, S_CV);
+            a.ldxdw(4, 8, A_OUT);
+            a.vstore(4, 0, S_CV);
         }
         a.exit();
     }
@@ -531,8 +531,8 @@ impl Gen {
             a.vmov(S_CV, S_IV);
             a.mov64(6, 8);
             a.call(self.compress1);
-            a.ldxdw(5, 6, A_OUT);
-            a.vstore(5, 0, S_CV);
+            a.ldxdw(4, 6, A_OUT);
+            a.vstore(4, 0, S_CV);
         } else {
             a.mov64(5, 8);
             a.add64_imm(5, HEAP_IV as i64);
@@ -702,12 +702,14 @@ impl Gen {
         a.stxdw(8, A_NBLOCKS, 3);
         a.stxdw(8, A_PARENT, 5);
         for (i, word) in IV.iter().enumerate() {
-            a.mov32_imm(0, *word as i32 as i64);
-            a.vbcast(S_CV8 + i as u8, 0);
+            a.mov32_imm(3, *word as i32 as i64);
+            a.vbcast(S_CV8 + i as u8, 3);
         }
         a.vbcast(S_CTR_LO, 4);
         let is_parent = a.new_label();
-        a.jne_imm(5, 0, is_parent);
+        // r0 and r5 don't survive vector intrinsic calls, reload the argument
+        a.ldxdw(0, 8, A_PARENT);
+        a.jne_imm(0, 0, is_parent);
         a.vadd(S_CTR_LO, S_CTR_LO, S_LANE);
         a.bind(is_parent);
         a.rsh64_imm(4, 32);
@@ -751,13 +753,13 @@ impl Gen {
             a.vmov(S_STATE + i, S_CV8 + i);
         }
         for i in 0..4u8 {
-            a.mov32_imm(0, IV[i as usize] as i32 as i64);
-            a.vbcast(S_STATE + 8 + i, 0);
+            a.mov32_imm(3, IV[i as usize] as i32 as i64);
+            a.vbcast(S_STATE + 8 + i, 3);
         }
         a.vmov(S_STATE + 12, S_CTR_LO);
         a.vmov(S_STATE + 13, S_CTR_HI);
-        a.mov64_imm(0, BLOCK_LEN as i64);
-        a.vbcast(S_STATE + 14, 0);
+        a.mov64_imm(3, BLOCK_LEN as i64);
+        a.vbcast(S_STATE + 14, 3);
         a.vbcast(S_STATE + 15, 4);
         // Seven rounds, the four G functions of each half round interleaved like the official AVX2
         // implementation

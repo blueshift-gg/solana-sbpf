@@ -47,6 +47,8 @@ pub struct SimdJitStats {
     pub flush_stores: usize,
     /// Runtime operand translations (calls into the memory mapping)
     pub translations: usize,
+    /// Intrinsic calls whose operands weren't known at compile time (regular syscall)
+    pub intrinsic_slow_paths: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -77,7 +79,14 @@ pub struct SimdJitState {
     clock: u64,
     pinned: [bool; CACHE_REGS],
     r11: R11,
-    previous_was_vector: bool,
+    /// The previous instruction left R11 intact
+    previous_keeps_r11: bool,
+    /// Static call identifiers of the vector intrinsics, indexed by sub-operation
+    intrinsic_hashes: [u32; simd::SUBOP_COUNT as usize],
+    /// Block local constant tracking of the guest registers (for the intrinsic operands)
+    known: [Option<u64>; 11],
+    /// The previously compiled instruction, its effect on `known` is applied lazily
+    previous: Option<ebpf::Insn>,
     pub(super) stats: SimdJitStats,
 }
 
@@ -94,7 +103,10 @@ impl SimdJitState {
             clock: 0,
             pinned: [false; CACHE_REGS],
             r11: R11::Unknown,
-            previous_was_vector: false,
+            previous_keeps_r11: false,
+            intrinsic_hashes: [0; simd::SUBOP_COUNT as usize],
+            known: [None; 11],
+            previous: None,
             stats: SimdJitStats::default(),
         }
     }
@@ -114,6 +126,7 @@ impl SimdJitState {
         let mut jump_targets = vec![false; len + 1];
         let mut vector_instructions = 0;
         let mut has_callx = false;
+        let intrinsic_hashes = simd::intrinsics::hashes();
         let mut pc = 0;
         while pc < len {
             let insn = ebpf::get_insn_unchecked(program, pc);
@@ -121,6 +134,9 @@ impl SimdJitState {
             match insn.opc {
                 ebpf::VOP => vector_instructions += 1,
                 ebpf::CALL_REG => has_callx = true,
+                ebpf::CALL_IMM if insn.src == 0 && intrinsic_hashes.contains(&(insn.imm as u32)) => {
+                    vector_instructions += 1;
+                }
                 ebpf::CALL_IMM => {
                     if sbpf_version.static_syscalls() && insn.src == 1 {
                         let target = pc as i64 + insn.imm + 1;
@@ -168,6 +184,7 @@ impl SimdJitState {
         state.static_flow = !has_callx;
         state.cached = state.static_flow && config.simd_jit_strategy == SimdJitStrategy::RegisterCached;
         state.jump_targets = jump_targets;
+        state.intrinsic_hashes = intrinsic_hashes;
         Ok((state, vector_instructions))
     }
 }
@@ -253,7 +270,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             return;
         }
         let is_target = self.simd.jump_targets.get(self.pc).copied().unwrap_or(true);
-        if !self.simd.previous_was_vector {
+        if let Some(previous) = self.simd.previous.take() {
+            self.simd_track_constants(&previous);
+        }
+        if !self.simd.previous_keeps_r11 {
             // The previous scalar instruction may have used R11
             self.simd.r11 = R11::Unknown;
         }
@@ -261,10 +281,70 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             // Fall-through into a block start, jumps arrive with an empty cache
             self.simd_flush(true);
             self.simd.r11 = R11::Unknown;
+            self.simd.known = [None; 11];
         }
-        self.simd.previous_was_vector = insn.opc == ebpf::VOP;
-        if insn.opc != ebpf::VOP && !is_pure_alu(insn.opc) {
+        let vector = insn.opc == ebpf::VOP || self.simd_is_intrinsic(insn);
+        // `mov64 dst, imm32` only writes `dst`, even when the immediate is sanitized
+        self.simd.previous_keeps_r11 = vector || insn.opc == ebpf::MOV64_IMM;
+        if !vector && !is_pure_alu(insn.opc) {
             self.simd_flush(true);
+        }
+        self.simd.previous = Some(insn.clone());
+    }
+
+    fn simd_is_intrinsic(&self, insn: &ebpf::Insn) -> bool {
+        insn.opc == ebpf::CALL_IMM
+            && insn.src == 0
+            && self.simd.intrinsic_hashes.contains(&(insn.imm as u32))
+    }
+
+    /// Applies the effect of an instruction on the known register constants
+    fn simd_track_constants(&mut self, insn: &ebpf::Insn) {
+        let class = insn.opc & ebpf::BPF_CLS_MASK;
+        let dst = insn.dst as usize;
+        match insn.opc {
+            ebpf::MOV64_IMM if dst < 11 => self.simd.known[dst] = Some(insn.imm as u64),
+            ebpf::MOV64_REG if dst < 11 => {
+                self.simd.known[dst] = self.simd.known.get(insn.src as usize).copied().flatten()
+            }
+            ebpf::CALL_IMM if self.simd_is_intrinsic(insn) => self.simd.known[0] = Some(0),
+            // Syscalls write r0, internal calls may change anything
+            ebpf::CALL_IMM | ebpf::CALL_REG => self.simd.known = [None; 11],
+            ebpf::EXIT | ebpf::VOP => {}
+            _ if class == ebpf::BPF_JMP64 || class == ebpf::BPF_JMP32 => {}
+            _ => {
+                // Conservatively treat everything else as writing dst (stores only read it)
+                if dst < 11 {
+                    self.simd.known[dst] = None;
+                }
+            }
+        }
+    }
+
+    /// Codegen of a vector intrinsic call (SIMD-0645 style): inline AVX2 if the packed operands
+    /// in r5 are a known valid constant, otherwise a regular syscall to `slow_path`
+    pub(crate) fn emit_simd_intrinsic(&mut self, subop: u8, slow_path: BuiltinFunction<C>) {
+        let op = if self.simd.enabled {
+            self.simd.known[simd::intrinsics::OPERAND_REG as usize]
+                .and_then(|packed| simd::intrinsics::unpack(subop, packed))
+        } else {
+            None
+        };
+        if let Some(op) = op {
+            if self.emit_simd_instruction(&op.encode()).is_ok() {
+                // The intrinsic returns 0 in r0
+                self.emit_ins(X86Instruction::load_immediate(REGISTER_MAP[0], 0));
+                return;
+            }
+        }
+        if self.simd.enabled {
+            // Host calls clobber all YMM registers and access the vector region in memory
+            self.simd_flush(true);
+            self.simd.stats.intrinsic_slow_paths += 1;
+        }
+        self.emit_external_call(slow_path);
+        if self.simd.enabled {
+            self.simd.r11 = R11::Unknown;
         }
     }
 

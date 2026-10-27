@@ -48,7 +48,7 @@ fn blake3_interpreter_all_kernels() {
             let data = test_data(len, seed);
             let expected = *blake3::hash(&data).as_bytes();
             for kernel in [Kernel::Scalar, Kernel::Simd1, Kernel::Simd8] {
-                for mode in [VecMode::Slot, VecMode::Memory(9)] {
+                for mode in [VecMode::Slot, VecMode::Memory(9), VecMode::Call] {
                     if kernel == Kernel::Scalar && mode != VecMode::Slot {
                         continue;
                     }
@@ -67,7 +67,7 @@ fn blake3_jit_matches_interpreter() {
         let data = test_data(len, 3);
         let expected = *blake3::hash(&data).as_bytes();
         for kernel in [Kernel::Scalar, Kernel::Simd1, Kernel::Simd8] {
-            for mode in [VecMode::Slot, VecMode::Memory(9)] {
+            for mode in [VecMode::Slot, VecMode::Memory(9), VecMode::Call] {
                 if kernel == Kernel::Scalar && mode != VecMode::Slot {
                     continue;
                 }
@@ -186,9 +186,13 @@ fn vector_ops_jit_matches_interpreter() {
     for seed in 0..4 {
         let input = random_input(seed);
         for (name, body) in op_cases() {
-            for mode in [VecMode::Slot, VecMode::Memory(9)] {
+            let (slot_result, _) = run_op(&op_program(VecMode::Slot, &*body), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+            for mode in [VecMode::Slot, VecMode::Memory(9), VecMode::Call] {
                 let program = op_program(mode, &*body);
                 let (expected, cus) = run_op(&program, &input, Engine::Interpreter, SimdJitStrategy::Direct);
+                if mode == VecMode::Call {
+                    assert_eq!(expected, slot_result, "{name} call form differs from opcode form");
+                }
                 for strategy in [SimdJitStrategy::Direct, SimdJitStrategy::RegisterCached] {
                     let (out, jit_cus) = run_op(&program, &input, Engine::Jit, strategy);
                     assert_eq!(out, expected, "{name} {mode:?} {strategy:?} seed={seed}");
@@ -502,6 +506,8 @@ fn blake3_one_mebibyte() {
         configs.push((Kernel::Simd8, VecMode::Slot, Engine::Jit, SimdJitStrategy::Direct));
         configs.push((Kernel::Simd8, VecMode::Slot, Engine::Jit, SimdJitStrategy::RegisterCached));
         configs.push((Kernel::Simd1, VecMode::Slot, Engine::Jit, SimdJitStrategy::RegisterCached));
+        configs.push((Kernel::Simd8, VecMode::Call, Engine::Jit, SimdJitStrategy::RegisterCached));
+        configs.push((Kernel::Simd8, VecMode::Call, Engine::Interpreter, SimdJitStrategy::Direct));
     }
     for (kernel, mode, engine, strategy) in configs {
         let (digest, _) = hash_with(kernel, mode, engine, strategy, &data);
@@ -521,6 +527,8 @@ fn dump_jit_code() {
         ("memory_mode", VecMode::Memory(9), SimdJitStrategy::Direct),
         ("slot_direct", VecMode::Slot, SimdJitStrategy::Direct),
         ("slot_cached", VecMode::Slot, SimdJitStrategy::RegisterCached),
+        ("call_direct", VecMode::Call, SimdJitStrategy::Direct),
+        ("call_cached", VecMode::Call, SimdJitStrategy::RegisterCached),
     ] {
         let program = blake3_program::microbench_program(repeat, mode);
         let mut cfg = config(strategy);
@@ -529,10 +537,151 @@ fn dump_jit_code() {
         runner.jit_compile().unwrap();
         let compiled = runner.executable.get_compiled_program().unwrap();
         let pcs = compiled.pc_section();
-        // pc 8 = loop head, then 4 * repeat vector ops, sub64, jne
-        let start = (pcs[8] & i32::MAX as u32) as usize;
-        let end = (pcs[8 + 4 * repeat + 2] & i32::MAX as u32) as usize;
+        // lddw + 5 vloads + ldxdw, then the loop: 4 * repeat vector ops, sub64, jne.
+        // A vector op is one instruction, or two in the call form (mov64 r5 + call)
+        let per_op = if mode == VecMode::Call { 2 } else { 1 };
+        let head = 2 + 5 * per_op + 1;
+        let start = (pcs[head] & i32::MAX as u32) as usize;
+        let end = (pcs[head + 4 * repeat * per_op + 2] & i32::MAX as u32) as usize;
         std::fs::write(format!("{}/{}.bin", dir, name), &compiled.text_section()[start..end]).unwrap();
         std::fs::write(format!("{}/{}.stats", dir, name), format!("{:?}\n", compiled.simd_stats)).unwrap();
     }
+}
+
+
+// Vector operations as static calls (SIMD-0645 style intrinsics)
+
+use solana_sbpf::simd::intrinsics;
+
+/// The call form compiles to the same vector code as the opcode form, with no slow paths
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn intrinsic_calls_lower_to_inline_avx2() {
+    for kernel in [Kernel::Simd1, Kernel::Simd8] {
+        for strategy in [SimdJitStrategy::Direct, SimdJitStrategy::RegisterCached] {
+            let stats = |mode| {
+                let program = blake3_program::hash_program(kernel, mode);
+                let runner = Runner::new(&program, &blake3_program::build_input(&[]), HEAP_SIZE, config(strategy)).unwrap();
+                runner.jit_compile().unwrap();
+                runner.executable.get_compiled_program().unwrap().simd_stats
+            };
+            let (opcode, call) = (stats(VecMode::Slot), stats(VecMode::Call));
+            assert_eq!(call.intrinsic_slow_paths, 0, "{kernel:?} {strategy:?} {call:?}");
+            assert_eq!(call.vector_instructions, opcode.vector_instructions);
+            // Same lowering; the extra `mov64 r5` instructions only shift a few meter checkpoints,
+            // which write back dirty slots
+            let close = |a: usize, b: usize| a.abs_diff(b) * 50 <= b.max(1);
+            assert!(close(call.vector_loads, opcode.vector_loads), "{kernel:?} {strategy:?} {call:?} {opcode:?}");
+            assert!(close(call.vector_stores, opcode.vector_stores), "{kernel:?} {strategy:?} {call:?} {opcode:?}");
+            assert!(call.spills.abs_diff(opcode.spills) * 20 <= opcode.spills.max(1), "{call:?} {opcode:?}");
+        }
+    }
+}
+
+/// Operands which aren't a compile time constant take the syscall slow path with identical results
+#[test]
+fn intrinsic_dynamic_operands_slow_path() {
+    let input = random_input(21);
+    let mut packed_input = input.clone();
+    let packed = intrinsics::pack(&solana_sbpf::simd::VecInsn {
+        subop: solana_sbpf::simd::VADD32,
+        vd: 0,
+        va: 1,
+        vb: 2,
+        memory_mode: false,
+        base_reg: 0,
+        src: 0,
+        off: 0,
+    });
+    packed_input.extend_from_slice(&packed.to_le_bytes());
+    let mut a = Asm::new(VecMode::Call);
+    for i in 0..4u8 {
+        a.vload(i, 1, 32 * i as i16);
+    }
+    // r5 loaded from memory
+    a.ldxdw(5, 1, input.len() as i16);
+    a.raw(ebpf::CALL_IMM, 0, 0, 0, intrinsics::hash(solana_sbpf::simd::VADD32) as i32 as i64);
+    // r5 constant, but set before a block boundary
+    a.mov64_imm(5, packed as i64);
+    let join = a.new_label();
+    a.ja(join);
+    a.bind(join);
+    a.raw(ebpf::CALL_IMM, 0, 0, 0, intrinsics::hash(solana_sbpf::simd::VXOR) as i32 as i64);
+    // Fast path again, mixing with the slow path results
+    a.vadd(3, 0, 3);
+    a.lddw(2, ebpf::MM_HEAP_START);
+    for i in 0..4u8 {
+        a.vstore(2, 32 * i as i16, i);
+    }
+    a.mov64(0, 5);
+    a.exit();
+    let program = a.finish();
+    let (result, heap, _, _) = run_all(&program, &packed_input);
+    // r5 still holds the operands of the last call (the intrinsics leave it unchanged)
+    let last = intrinsics::pack(&solana_sbpf::simd::VecInsn { subop: solana_sbpf::simd::VSTORE, vd: 0, va: 3, vb: 0, memory_mode: false, base_reg: 0, src: 2, off: 96 });
+    assert_eq!(result, format!("Ok({})", last));
+    let lanes = |i: usize, buf: &[u8]| -> Vec<u32> { buf[32 * i..32 * i + 32].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect() };
+    let (v1, v2, v3) = (lanes(1, &input), lanes(2, &input), lanes(3, &input));
+    // vadd(v0, v1, v2) then vxor(v0, v1, v2) with the same packed operands: v0 = v1 ^ v2
+    let expected0: Vec<u32> = (0..8).map(|i| v1[i] ^ v2[i]).collect();
+    assert_eq!(lanes(0, &heap), expected0);
+    let expected3: Vec<u32> = (0..8).map(|i| expected0[i].wrapping_add(v3[i])).collect();
+    assert_eq!(lanes(3, &heap), expected3);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let runner = Runner::new(&program, &packed_input, 0x2000, config(SimdJitStrategy::RegisterCached)).unwrap();
+        runner.jit_compile().unwrap();
+        let stats = runner.executable.get_compiled_program().unwrap().simd_stats;
+        assert_eq!(stats.intrinsic_slow_paths, 2, "{stats:?}");
+    }
+}
+
+/// Malformed packed operands fail identically on every engine
+#[test]
+fn intrinsic_malformed_operands() {
+    let input = random_input(22);
+    for (subop, packed) in [
+        (solana_sbpf::simd::VADD32, -1i64),                   // high bits set
+        (solana_sbpf::simd::VADD32, 1 << 26),                 // reserved bit
+        (solana_sbpf::simd::VLOAD, 0),                        // vload needs a scalar register in r1..=r4
+        (solana_sbpf::simd::VBCAST32, 5 << 28),               // r5 isn't a valid scalar register
+        (solana_sbpf::simd::VROR32, 40 << 18),                // rotation out of range
+        (solana_sbpf::simd::VTRANSPOSE8, 60),                 // transpose runs past slot 63
+    ] {
+        let mut a = Asm::new(VecMode::Call);
+        a.mov64_imm(5, packed);
+        a.raw(ebpf::CALL_IMM, 0, 0, 0, intrinsics::hash(subop) as i32 as i64);
+        a.exit();
+        let (result, ..) = run_all(&a.finish(), &input);
+        assert!(result.contains("UnsupportedInstruction"), "{subop} {packed:#x}: {result}");
+    }
+}
+
+/// A runtime which doesn't know the intrinsics rejects the program at deployment (unknown static
+/// syscall), it is never misinterpreted
+#[test]
+fn intrinsics_unknown_to_runtime_fail_verification() {
+    use solana_sbpf::{
+        elf::Executable,
+        program::{BuiltinProgram, FunctionRegistry, SBPFVersion},
+        simd::harness::HarnessContext,
+        verifier::{LocalVerifier, VerifierError},
+    };
+    let mut a = Asm::new(VecMode::Call);
+    a.vadd(0, 1, 2);
+    a.exit();
+    let program = a.finish();
+    let verify = |register: bool| {
+        let mut loader = BuiltinProgram::new_loader(config(SimdJitStrategy::Direct));
+        if register {
+            intrinsics::register(&mut loader).unwrap();
+        }
+        Executable::<HarnessContext>::from_text_bytes(&program, std::sync::Arc::new(loader), SBPFVersion::V4, FunctionRegistry::default())
+            .unwrap()
+            .verify::<LocalVerifier>()
+    };
+    let hash = intrinsics::hash(solana_sbpf::simd::VADD32);
+    let result = verify(false);
+    assert!(matches!(result, Err(EbpfError::VerifierError(VerifierError::InvalidSyscall(h))) if h == hash), "{:?}", result);
+    assert!(verify(true).is_ok());
 }

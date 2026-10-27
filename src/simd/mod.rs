@@ -29,6 +29,7 @@
 pub mod asm;
 pub mod blake3_program;
 pub mod harness;
+pub mod intrinsics;
 
 use crate::{
     ebpf,

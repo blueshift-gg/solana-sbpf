@@ -98,7 +98,9 @@ impl Runner {
         heap_size: usize,
         config: Config,
     ) -> Result<Self, EbpfError> {
-        let loader = Arc::new(BuiltinProgram::new_loader(config));
+        let mut loader = BuiltinProgram::new_loader(config);
+        super::intrinsics::register(&mut loader).map_err(|_| EbpfError::UnsupportedInstruction)?;
+        let loader = Arc::new(loader);
         let executable = Executable::from_text_bytes(
             program,
             loader,

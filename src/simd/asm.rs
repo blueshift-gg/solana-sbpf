@@ -12,6 +12,9 @@ pub enum VecMode {
     Slot,
     /// Ordinary VM memory pointed to by the given register
     Memory(u8),
+    /// Dedicated vector region, every operation is a static call (`mov64 r5, operands` +
+    /// `call sol_<op>`), see [super::intrinsics]. Clobbers r0 and r5.
+    Call,
 }
 
 /// Branch target
@@ -149,9 +152,22 @@ impl Asm {
     }
 
     fn vop(&mut self, subop: u8, vd: u8, va: u8, vb: u8, src: u8, off: i16) {
+        if self.mode == VecMode::Call {
+            let op = VecInsn { subop, vd, va, vb, memory_mode: false, base_reg: 0, src, off };
+            let packed = super::intrinsics::pack(&op);
+            assert_eq!(
+                super::intrinsics::unpack(subop, packed).map(|op| op.encode()),
+                Some(op.encode()),
+                "operands not encodable as an intrinsic call (scalar register must be r1..=r4)"
+            );
+            self.mov64_imm(super::intrinsics::OPERAND_REG, packed as i64);
+            self.raw(ebpf::CALL_IMM, 0, 0, 0, super::intrinsics::hash(subop) as i32 as i64);
+            return;
+        }
         let (memory_mode, base_reg) = match self.mode {
             VecMode::Slot => (false, 0),
             VecMode::Memory(reg) => (true, reg),
+            VecMode::Call => unreachable!(),
         };
         let insn = VecInsn {
             subop,

@@ -48,6 +48,7 @@ use Kernel::*;
 use SimdJitStrategy::*;
 const MEM: VecMode = VecMode::Memory(9);
 const SLOT: VecMode = VecMode::Slot;
+const CALL: VecMode = VecMode::Call;
 
 const VARIANTS: &[Variant] = &[
     v("A_scalar_jit", "A: scalar sBPF, JIT", Scalar, SLOT, Jit, Direct),
@@ -60,6 +61,11 @@ const VARIANTS: &[Variant] = &[
     v("C1_simd1_mem_jit", "SIMD 1-state, ordinary memory, JIT", Simd1, MEM, Jit, Direct),
     v("D1_simd1_slot_direct", "SIMD 1-state, vector region, JIT uncached", Simd1, SLOT, Jit, Direct),
     v("E1_simd1_slot_cached", "SIMD 1-state, vector region, JIT reg-cached", Simd1, SLOT, Jit, RegisterCached),
+    v("G_simd8_call_cached", "G: SIMD 8-way, intrinsic calls, JIT reg-cached", Simd8, CALL, Jit, RegisterCached),
+    v("G1_simd1_call_cached", "SIMD 1-state, intrinsic calls, JIT reg-cached", Simd1, CALL, Jit, RegisterCached),
+    v("H_simd8_call_direct", "H: SIMD 8-way, intrinsic calls, JIT uncached", Simd8, CALL, Jit, Direct),
+    v("H1_simd1_call_direct", "SIMD 1-state, intrinsic calls, JIT uncached", Simd1, CALL, Jit, Direct),
+    v("I_simd8_call_interp", "SIMD 8-way, intrinsic calls, interpreter", Simd8, CALL, Interpreter, Direct),
 ];
 
 const SIZES: &[usize] = &[64, 1024, 2048, 4096, 8192, 16384, 65536, 1 << 20];
@@ -147,7 +153,7 @@ fn stats_json(runner: &Runner) -> String {
     if let Some(compiled) = runner.executable.get_compiled_program() {
         let s = compiled.simd_stats;
         return format!(
-            r#"{{"code_bytes":{},"native_instructions":{},"vector_instructions":{},"vector_loads":{},"vector_stores":{},"memory_operands":{},"spills":{},"reloads":{},"cache_hits":{},"evictions":{},"flush_stores":{},"translations":{}}}"#,
+            r#"{{"code_bytes":{},"native_instructions":{},"vector_instructions":{},"vector_loads":{},"vector_stores":{},"memory_operands":{},"spills":{},"reloads":{},"cache_hits":{},"evictions":{},"flush_stores":{},"translations":{},"intrinsic_slow_paths":{}}}"#,
             compiled.machine_code_length(),
             s.native_instructions,
             s.vector_instructions,
@@ -159,7 +165,8 @@ fn stats_json(runner: &Runner) -> String {
             s.cache_hits,
             s.evictions,
             s.flush_stores,
-            s.translations
+            s.translations,
+            s.intrinsic_slow_paths
         );
     }
     let _ = runner;
@@ -254,6 +261,10 @@ fn main() {
         (Simd8, SLOT, Jit, Direct, "D_simd8_slot_direct", "SIMD 8-way, region, JIT uncached", 8),
         (Simd1, SLOT, Jit, RegisterCached, "E1_simd1_slot_cached", "SIMD 1-state, region, JIT cached", 1),
         (Simd8, SLOT, Jit, RegisterCached, "E_simd8_slot_cached", "SIMD 8-way, region, JIT cached", 8),
+        (Simd1, CALL, Jit, RegisterCached, "G1_simd1_call_cached", "SIMD 1-state, intrinsic calls, JIT cached", 1),
+        (Simd8, CALL, Jit, RegisterCached, "G_simd8_call_cached", "SIMD 8-way, intrinsic calls, JIT cached", 8),
+        (Simd1, CALL, Jit, Direct, "H1_simd1_call_direct", "SIMD 1-state, intrinsic calls, JIT uncached", 1),
+        (Simd8, CALL, Jit, Direct, "H_simd8_call_direct", "SIMD 8-way, intrinsic calls, JIT uncached", 8),
     ] {
         let full_id = format!("compress/{id}");
         if !selected(&full_id) {
@@ -294,7 +305,10 @@ fn main() {
             hasher.update(std::hint::black_box(&block));
             std::hint::black_box(hasher.finalize());
         });
-        let _ = write!(out, r#",{{"id":"F_native","label":"native blake3, 64 byte hash","ns_per_compression":{:.2},"cus_per_compression":null,"mad_ns":{:.2},"stats":null}}"#, m.median_ns, m.mad_ns);
+        if !first {
+            out.push(',');
+        }
+        let _ = write!(out, r#"{{"id":"F_native","label":"native blake3, 64 byte hash","ns_per_compression":{:.2},"cus_per_compression":null,"mad_ns":{:.2},"stats":null}}"#, m.median_ns, m.mad_ns);
     }
     out.push_str(r#"],"microbench":["#);
 
@@ -307,6 +321,8 @@ fn main() {
             (MEM, Jit, Direct, "C_mem"),
             (SLOT, Jit, Direct, "D_direct"),
             (SLOT, Jit, RegisterCached, "E_cached"),
+            (CALL, Jit, Direct, "H_call_direct"),
+            (CALL, Jit, RegisterCached, "G_call_cached"),
         ] {
             let full_id = format!("micro/{repeat}/{id}");
             if !selected(&full_id) || (engine == Jit && !jit_available()) {
