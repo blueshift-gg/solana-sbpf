@@ -313,6 +313,8 @@ pub fn disassemble_instruction<C: ContextObject>(
         },
         ebpf::CALL_REG   => { name = "callx"; desc = format!("{} r{}", name, if sbpf_version.callx_uses_src_reg() { insn.src } else if sbpf_version.callx_uses_dst_reg() { insn.dst } else { insn.imm as u8 }); },
         ebpf::EXIT       => { name = "exit"; desc = name.to_string(); },
+        #[cfg(feature = "simd-experiment")]
+        ebpf::VOP        => { desc = crate::simd::disassemble(insn); },
 
         _                => { name = "unknown"; desc = format!("{} opcode={:#x}", name, insn.opc); },
     };

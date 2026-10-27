@@ -75,6 +75,10 @@ pub enum EbpfError {
     /// Syscall error
     #[error("Syscall error: {0}")]
     SyscallError(Box<dyn Error>),
+    /// The host CPU does not support AVX2, required by the experimental SIMD JIT
+    #[cfg(feature = "simd-experiment")]
+    #[error("host CPU lacks AVX2 which the experimental SIMD JIT requires")]
+    SimdHostUnsupported,
 }
 
 impl EbpfError {

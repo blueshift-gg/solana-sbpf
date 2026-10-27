@@ -855,3 +855,162 @@ impl X86Instruction {
         }
     }
 }
+
+/// Register or memory operand of a VEX encoded instruction
+#[cfg(feature = "simd-experiment")]
+#[derive(Copy, Clone)]
+pub enum VexRm {
+    /// Register (YMM / XMM / GPR depending on the instruction)
+    Reg(u8),
+    /// `[base + displacement]`
+    Mem(X86Register, i32),
+    /// `[rip + (target - end_of_instruction)]`
+    Rip(*const u8),
+}
+
+/// VEX encoded (AVX / AVX2) instruction
+#[cfg(feature = "simd-experiment")]
+#[derive(Copy, Clone)]
+pub struct VexInstruction {
+    /// Implied mandatory prefix: 0 = none, 1 = 66, 2 = F3, 3 = F2
+    pub pp: u8,
+    /// Opcode map: 1 = 0F, 2 = 0F38, 3 = 0F3A
+    pub map: u8,
+    /// VEX.W
+    pub w: bool,
+    /// VEX.L (256 bit)
+    pub l: bool,
+    /// Opcode byte
+    pub opcode: u8,
+    /// ModRM.reg (register number or opcode extension)
+    pub reg: u8,
+    /// Additional source register (VEX.vvvv), 0 if unused
+    pub vvvv: u8,
+    /// ModRM.rm operand
+    pub rm: VexRm,
+    /// Optional trailing 8 bit immediate
+    pub imm: Option<u8>,
+}
+
+#[cfg(feature = "simd-experiment")]
+impl VexInstruction {
+    const fn ymm(pp: u8, map: u8, opcode: u8, reg: u8, vvvv: u8, rm: VexRm, imm: Option<u8>) -> Self {
+        Self { pp, map, w: false, l: true, opcode, reg, vvvv, rm, imm }
+    }
+
+    /// vmovdqu ymm, m256
+    pub const fn load(dst: u8, base: X86Register, disp: i32) -> Self {
+        Self::ymm(2, 1, 0x6f, dst, 0, VexRm::Mem(base, disp), None)
+    }
+    /// vmovdqu m256, ymm
+    pub const fn store(src: u8, base: X86Register, disp: i32) -> Self {
+        Self::ymm(2, 1, 0x7f, src, 0, VexRm::Mem(base, disp), None)
+    }
+    /// vmovdqa ymm, ymm
+    pub const fn mov(dst: u8, src: u8) -> Self {
+        Self::ymm(1, 1, 0x6f, dst, 0, VexRm::Reg(src), None)
+    }
+    /// Three operand packed integer op: vpaddd (0xfe), vpxor (0xef), vpand (0xdb), vpor (0xeb),
+    /// vpunpckldq (0x62), vpunpckhdq (0x6a), vpunpcklqdq (0x6c), vpunpckhqdq (0x6d)
+    pub const fn alu(opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
+        Self::ymm(1, 1, opcode, dst, src1, src2, None)
+    }
+    /// vpsrld ymm, ymm, imm8
+    pub const fn psrld(dst: u8, src: u8, imm: u8) -> Self {
+        Self::ymm(1, 1, 0x72, 2, dst, VexRm::Reg(src), Some(imm))
+    }
+    /// vpslld ymm, ymm, imm8
+    pub const fn pslld(dst: u8, src: u8, imm: u8) -> Self {
+        Self::ymm(1, 1, 0x72, 6, dst, VexRm::Reg(src), Some(imm))
+    }
+    /// vpshufb ymm, ymm, ymm/m256
+    pub const fn pshufb(dst: u8, src: u8, mask: VexRm) -> Self {
+        Self::ymm(1, 2, 0x00, dst, src, mask, None)
+    }
+    /// vpshufd ymm, ymm/m256, imm8
+    pub const fn pshufd(dst: u8, src: VexRm, imm: u8) -> Self {
+        Self::ymm(1, 1, 0x70, dst, 0, src, Some(imm))
+    }
+    /// vpermd ymm, ymm(indices), ymm/m256(data)
+    pub const fn permd(dst: u8, indices: u8, data: VexRm) -> Self {
+        Self::ymm(1, 2, 0x36, dst, indices, data, None)
+    }
+    /// vpblendd ymm, ymm, ymm/m256, imm8
+    pub const fn pblendd(dst: u8, src1: u8, src2: VexRm, imm: u8) -> Self {
+        Self::ymm(1, 3, 0x02, dst, src1, src2, Some(imm))
+    }
+    /// vperm2i128 ymm, ymm, ymm/m256, imm8
+    pub const fn perm2i128(dst: u8, src1: u8, src2: VexRm, imm: u8) -> Self {
+        Self::ymm(1, 3, 0x46, dst, src1, src2, Some(imm))
+    }
+    /// vmovd xmm, r32
+    pub const fn movd_from_gpr(dst: u8, src: X86Register) -> Self {
+        Self { pp: 1, map: 1, w: false, l: false, opcode: 0x6e, reg: dst, vvvv: 0, rm: VexRm::Reg(src as u8), imm: None }
+    }
+    /// vpbroadcastd ymm, xmm
+    pub const fn pbroadcastd(dst: u8, src: u8) -> Self {
+        Self::ymm(1, 2, 0x58, dst, 0, VexRm::Reg(src), None)
+    }
+
+    /// Encodes the instruction. `address` is the host address the instruction will be placed at
+    /// (only needed for RIP relative operands).
+    pub fn encode(&self, address: *const u8) -> ([u8; 16], usize) {
+        let mut out = [0u8; 16];
+        let mut len = 0;
+        let mut push = |byte: u8, len: &mut usize| {
+            out[*len] = byte;
+            *len += 1;
+        };
+        let rm_ext = match self.rm {
+            VexRm::Reg(r) => (r >> 3) & 1,
+            VexRm::Mem(base, _) => ((base as u8) >> 3) & 1,
+            VexRm::Rip(_) => 0,
+        };
+        let r_bar = (!(self.reg >> 3) & 1) << 7;
+        let vvvv_bar = (!self.vvvv & 0xf) << 3;
+        let l = (self.l as u8) << 2;
+        if self.map == 1 && !self.w && rm_ext == 0 {
+            push(0xc5, &mut len);
+            push(r_bar | vvvv_bar | l | self.pp, &mut len);
+        } else {
+            push(0xc4, &mut len);
+            push(r_bar | (1 << 6) | ((!rm_ext & 1) << 5) | self.map, &mut len);
+            push(((self.w as u8) << 7) | vvvv_bar | l | self.pp, &mut len);
+        }
+        push(self.opcode, &mut len);
+        let reg = (self.reg & 7) << 3;
+        let imm_len = self.imm.is_some() as usize;
+        match self.rm {
+            VexRm::Reg(r) => push(0xc0 | reg | (r & 7), &mut len),
+            VexRm::Mem(base, disp) => {
+                let b = (base as u8) & 7;
+                let mode = if disp == 0 && b != 5 {
+                    0
+                } else if (-128..=127).contains(&disp) {
+                    1
+                } else {
+                    2
+                };
+                push((mode << 6) | reg | b, &mut len);
+                if b == 4 {
+                    push(0x24, &mut len); // SIB: no index, base = rsp / r12
+                }
+                match mode {
+                    1 => push(disp as i8 as u8, &mut len),
+                    2 => disp.to_le_bytes().iter().for_each(|byte| push(*byte, &mut len)),
+                    _ => {}
+                }
+            }
+            VexRm::Rip(target) => {
+                push(reg | 5, &mut len);
+                let end = (address as isize) + (len + 4 + imm_len) as isize;
+                let disp = (target as isize - end) as i32;
+                disp.to_le_bytes().iter().for_each(|byte| push(*byte, &mut len));
+            }
+        }
+        if let Some(imm) = self.imm {
+            push(imm, &mut len);
+        }
+        (out, len)
+    }
+}

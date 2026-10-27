@@ -378,6 +378,8 @@ impl UnsealedJitProgram {
         Ok(JitProgram {
             pc_section: pc_section.protect()?,
             text_section: text_section.protect()?,
+            #[cfg(all(feature = "simd-experiment", feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+            simd_stats: Default::default(),
         })
     }
 }
@@ -390,6 +392,9 @@ pub struct JitProgram {
     pc_section: Mapping<Read>,
     /// The executable machine code.
     text_section: Mapping<ReadExecute>,
+    /// Statistics of the experimental vector code generation
+    #[cfg(all(feature = "simd-experiment", feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+    pub simd_stats: crate::jit::SimdJitStats,
 }
 
 impl JitProgram {

@@ -614,6 +614,16 @@ impl<'a, 'b, 'c, C: ContextObject> Interpreter<'a, 'b, 'c, C> {
                     .copy_from_slice(&frame.caller_saved_registers);
                 next_pc = frame.target_pc;
             }
+            #[cfg(feature = "simd-experiment")]
+            ebpf::VOP if config.enable_simd_experiment => {
+                let Some(op) = crate::simd::VecInsn::decode(&insn) else {
+                    throw_error!(self, EbpfError::UnsupportedInstruction);
+                };
+                let vector_base = self.vm.simd_vector_base;
+                if let Err(err) = crate::simd::interpret(&op, &self.reg, vector_base, self.vm.memory()) {
+                    throw_error!(self, err);
+                }
+            }
             _ => throw_error!(self, EbpfError::UnsupportedInstruction),
         }
 

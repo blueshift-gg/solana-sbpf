@@ -152,7 +152,17 @@ const ANCHOR_EXTERNAL_FUNCTION_CALL: usize = 12;
 const ANCHOR_INTERNAL_FUNCTION_CALL_PROLOGUE: usize = 13;
 const ANCHOR_INTERNAL_FUNCTION_CALL_REG: usize = 14;
 const ANCHOR_TRANSLATE_MEMORY_ADDRESS: usize = 21;
-const ANCHOR_COUNT: usize = 33; // Update me when adding or removing anchors
+#[cfg(feature = "simd-experiment")]
+const ANCHOR_SIMD_ROT16: usize = 33;
+#[cfg(feature = "simd-experiment")]
+const ANCHOR_SIMD_ROT8: usize = 34;
+const ANCHOR_COUNT: usize = 35; // Update me when adding or removing anchors
+
+#[cfg(feature = "simd-experiment")]
+#[path = "simd_jit.rs"]
+mod simd_jit;
+#[cfg(feature = "simd-experiment")]
+pub use simd_jit::SimdJitStats;
 
 /// Mapping of guest to host registers
 pub const REGISTER_MAP: [X86Register; 11] = [
@@ -288,6 +298,8 @@ pub struct JitCompiler<'a, C: ContextObject> {
     immediate_value_key: i64,
     diversification_rng: SmallRng,
     stopwatch_is_active: bool,
+    #[cfg(feature = "simd-experiment")]
+    simd: simd_jit::SimdJitState,
 }
 
 #[rustfmt::skip]
@@ -318,6 +330,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         if let Some(q) = pc.checked_div(config.instruction_meter_checkpoint_distance) {
             code_length_estimate += q * MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT;
         }
+        #[cfg(feature = "simd-experiment")]
+        let (simd, vector_instructions) = simd_jit::SimdJitState::new(executable, program, config)?;
+        #[cfg(feature = "simd-experiment")]
+        if simd.enabled {
+            // Vector instructions (transposes, translations) and cache flushes need more room
+            code_length_estimate += 1024 * vector_instructions + 160 * pc;
+        }
         // Relative jump destinations limit the maximum output size
         debug_assert!(code_length_estimate < (i32::MAX as usize));
 
@@ -342,6 +361,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             immediate_value_key,
             diversification_rng,
             stopwatch_is_active: false,
+            #[cfg(feature = "simd-experiment")]
+            simd,
         })
     }
 
@@ -362,10 +383,14 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 return Err(EbpfError::ExhaustedTextSegment(self.pc));
             }
             let mut insn = ebpf::get_insn_unchecked(self.program, self.pc);
+            #[cfg(feature = "simd-experiment")]
+            self.simd_before_instruction(&insn);
             self.result.pc_section_mut()[self.pc] = self.offset_in_text_section as u32;
 
             // Regular instruction meter checkpoints to prevent long linear runs from exceeding their budget
             if self.last_instruction_meter_validation_pc + self.config.instruction_meter_checkpoint_distance <= self.pc {
+                #[cfg(feature = "simd-experiment")]
+                self.simd_before_checkpoint();
                 self.emit_validate_instruction_count(Some(self.pc));
             }
 
@@ -796,6 +821,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     self.emit_ins(X86Instruction::return_near());
                 },
 
+                #[cfg(feature = "simd-experiment")]
+                ebpf::VOP if self.config.enable_simd_experiment => self.emit_simd_instruction(&insn)?,
+
                 _               => return Err(EbpfError::UnsupportedInstruction),
             }
 
@@ -806,12 +834,21 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         if self.offset_in_text_section + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION * 2 >= self.result.text_section().len() {
             return Err(EbpfError::ExhaustedTextSegment(self.pc));
         }
+        #[cfg(feature = "simd-experiment")]
+        self.simd_before_end();
         self.emit_validate_and_profile_instruction_count(self.pc + 1);
         self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64)); // Save pc
         self.emit_set_exception_kind(EbpfError::ExecutionOverrun);
         self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 5)));
 
         self.resolve_jumps();
+        #[cfg(feature = "simd-experiment")]
+        {
+            let mut program = self.result.seal(self.offset_in_text_section)?;
+            program.simd_stats = self.simd.stats;
+            Ok(program)
+        }
+        #[cfg(not(feature = "simd-experiment"))]
         self.result.seal(self.offset_in_text_section)
     }
 
@@ -866,6 +903,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     #[inline(always)]
     pub fn emit_ins(&mut self, instruction: X86Instruction) {
         instruction.emit(self);
+        #[cfg(feature = "simd-experiment")]
+        {
+            self.simd.stats.native_instructions += 1;
+        }
         if self.next_noop_insertion == 0 {
             self.next_noop_insertion = self.noop_range.sample(&mut self.diversification_rng);
             // X86Instruction::noop().emit(self)?;
@@ -969,6 +1010,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     /// Calls an external Rust function
     pub fn emit_rust_call(&mut self, target: Value, arguments: &[Argument], result_reg: Option<X86Register>) {
+        // Avoid AVX to SSE transition penalties in host code
+        #[cfg(feature = "simd-experiment")]
+        self.emit_vzeroupper();
         let mut saved_registers = CALLER_SAVED_REGISTERS.to_vec();
         if let Some(reg) = result_reg {
             if let Some(dst) = saved_registers.iter().position(|x| *x == reg) {
@@ -1390,6 +1434,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         // Restore stack pointer in case we did not exit gracefully
         self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, RSP, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::HostStackPointer))));
+        #[cfg(feature = "simd-experiment")]
+        self.emit_vzeroupper();
         self.emit_ins(X86Instruction::return_near());
 
         // Handler for EbpfError::ExceededMaxInstructions
@@ -1622,6 +1668,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
             self.emit_ins(X86Instruction::return_near());
         }
+
+        #[cfg(feature = "simd-experiment")]
+        self.emit_simd_constants();
     }
 
     fn set_anchor(&mut self, anchor: usize) {

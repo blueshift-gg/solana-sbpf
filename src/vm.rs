@@ -138,6 +138,28 @@ pub struct Config {
     pub enabled_sbpf_versions: std::ops::RangeInclusive<SBPFVersion>,
     /// Size of a region when using AlignedMemoryMapping
     pub aligned_region_size: usize,
+    /// Enable the experimental vector instructions (research prototype)
+    #[cfg(feature = "simd-experiment")]
+    pub enable_simd_experiment: bool,
+    /// How the JIT lowers the experimental vector instructions
+    #[cfg(feature = "simd-experiment")]
+    pub simd_jit_strategy: SimdJitStrategy,
+    /// Skip the AVX2 host feature detection of the JIT.
+    ///
+    /// Only meant for testing under emulators (e.g. Rosetta 2) which execute AVX2 but do not
+    /// advertise it via CPUID.
+    #[cfg(feature = "simd-experiment")]
+    pub simd_assume_avx2: bool,
+}
+
+/// JIT lowering strategy for the experimental vector instructions
+#[cfg(feature = "simd-experiment")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdJitStrategy {
+    /// Every operation loads its operands from and stores its result to memory
+    Direct,
+    /// Slots of the dedicated vector region are cached in host YMM registers within basic blocks
+    RegisterCached,
 }
 
 impl Config {
@@ -165,6 +187,12 @@ impl Default for Config {
             aligned_memory_mapping: false,
             enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V4,
             aligned_region_size: ebpf::MM_REGION_SIZE as usize,
+            #[cfg(feature = "simd-experiment")]
+            enable_simd_experiment: false,
+            #[cfg(feature = "simd-experiment")]
+            simd_jit_strategy: SimdJitStrategy::RegisterCached,
+            #[cfg(feature = "simd-experiment")]
+            simd_assume_avx2: false,
         }
     }
 }
@@ -268,6 +296,12 @@ pub enum RuntimeEnvironmentSlot {
     MemoryMapping = offset_of!(EbpfVm<DummyContextObject>, memory_mapping) as isize,
     /// [EbpfVm::register_trace]
     RegisterTrace = offset_of!(EbpfVm<DummyContextObject>, register_trace) as isize,
+    /// [EbpfVm::simd_vector_base]
+    #[cfg(feature = "simd-experiment")]
+    SimdVectorBase = offset_of!(EbpfVm<DummyContextObject>, simd_vector_base) as isize,
+    /// [EbpfVm::simd_scratch]
+    #[cfg(feature = "simd-experiment")]
+    SimdScratch = offset_of!(EbpfVm<DummyContextObject>, simd_scratch) as isize,
 }
 
 /// A virtual machine to run eBPF programs.
@@ -356,6 +390,12 @@ pub struct EbpfVm<'a, C: ContextObject> {
     pub loader: Arc<BuiltinProgram<C>>,
     /// Collector for the instruction trace
     pub register_trace: Vec<RegisterTraceEntry>,
+    /// Host address of the experimental vector region (null if not attached)
+    #[cfg(feature = "simd-experiment")]
+    pub simd_vector_base: *mut u8,
+    /// Operand translation scratch space of the experimental vector instructions in the JIT
+    #[cfg(feature = "simd-experiment")]
+    pub simd_scratch: [u64; 4],
     /// TCP port for the debugger interface
     #[cfg(feature = "debugger")]
     pub debug_port: Option<u16>,
@@ -402,7 +442,23 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
             #[cfg(feature = "debugger")]
             debug_metadata: None,
             register_trace: Vec::default(),
+            #[cfg(feature = "simd-experiment")]
+            simd_vector_base: std::ptr::null_mut(),
+            #[cfg(feature = "simd-experiment")]
+            simd_scratch: [0; 4],
         }
+    }
+
+    /// Attaches the host memory of the experimental vector region.
+    ///
+    /// # Safety
+    ///
+    /// `vector_memory` must point to [ebpf::VECTOR_MEMORY_SIZE] writable bytes which stay valid as
+    /// long as this VM executes programs, and it must be the same buffer which is mapped at
+    /// [ebpf::MM_VECTOR_START] in the memory mapping.
+    #[cfg(feature = "simd-experiment")]
+    pub unsafe fn set_vector_memory(&mut self, vector_memory: *mut u8) {
+        self.simd_vector_base = vector_memory;
     }
 
     /// Execute the program
@@ -428,6 +484,11 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         self.previous_instruction_meter = initial_insn_count;
         self.due_insn_count = 0;
         self.program_result = ProgramResult::Ok(0);
+        #[cfg(feature = "simd-experiment")]
+        if !self.simd_vector_base.is_null() {
+            // The vector region is zero initialized for every invocation
+            unsafe { std::ptr::write_bytes(self.simd_vector_base, 0, ebpf::VECTOR_MEMORY_SIZE) };
+        }
 
         'execute: {
             match *mode {
@@ -634,5 +695,9 @@ mod tests {
         check_slot!(env, program_result, ProgramResult);
         check_slot!(env, memory_mapping, MemoryMapping);
         check_slot!(env, register_trace, RegisterTrace);
+        #[cfg(feature = "simd-experiment")]
+        check_slot!(env, simd_vector_base, SimdVectorBase);
+        #[cfg(feature = "simd-experiment")]
+        check_slot!(env, simd_scratch, SimdScratch);
     }
 }

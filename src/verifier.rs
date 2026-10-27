@@ -408,6 +408,15 @@ impl Verifier for RequisiteVerifier {
                 ebpf::CALL_REG   => { check_callx_register(&insn, insn_ptr, sbpf_version)?; },
                 ebpf::EXIT       => {},
 
+                #[cfg(feature = "simd-experiment")]
+                ebpf::VOP        => {
+                    if crate::simd::VecInsn::decode(&insn).is_none() {
+                        return Err(VerifierError::UnknownOpCode(insn.opc, insn_ptr));
+                    }
+                    // `dst` is only ever read (vector file base in memory mode)
+                    store = true;
+                },
+
                 _                => {
                     return Err(VerifierError::UnknownOpCode(insn.opc, insn_ptr));
                 }
