@@ -559,6 +559,10 @@ impl<'a, 'b, 'c, C: ContextObject> Interpreter<'a, 'b, 'c, C> {
                     return false;
                 }
                 check_pc!(self, next_pc, target_pc.wrapping_sub(self.program_vm_addr) / ebpf::INSN_SIZE as u64);
+                #[cfg(feature = "simd-experiment")]
+                if config.enable_simd_experiment && self.executable.simd_analysis().callx_forbidden(next_pc as usize) {
+                    throw_error!(self, EbpfError::UnsupportedInstruction);
+                }
             },
 
             ebpf::CALL_IMM => {

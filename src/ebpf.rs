@@ -59,7 +59,7 @@ pub const MM_VECTOR_START: u64 = MM_REGION_SIZE * 6;
 pub const VECTOR_WIDTH: usize = 32;
 /// Number of virtual vector slots
 #[cfg(feature = "simd-experiment")]
-pub const VECTOR_SLOTS: usize = 64;
+pub const VECTOR_SLOTS: usize = 256;
 /// Size of the vector region in bytes
 #[cfg(feature = "simd-experiment")]
 pub const VECTOR_MEMORY_SIZE: usize = VECTOR_WIDTH * VECTOR_SLOTS;

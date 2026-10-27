@@ -12,8 +12,9 @@ pub enum VecMode {
     Slot,
     /// Ordinary VM memory pointed to by the given register
     Memory(u8),
-    /// Dedicated vector region, every operation is a static call (`mov64 r5, operands` +
-    /// `call sol_<op>`), see [super::intrinsics]. Clobbers r0 and r5.
+    /// Dedicated vector region, every operation is a static call (`mov64 r1, operands` +
+    /// `call sol_<op>`, scalar operand in r2), see [super::intrinsics]. Clobbers r0, r1 and, for
+    /// operations with a scalar operand in another register, r2.
     Call,
 }
 
@@ -153,15 +154,16 @@ impl Asm {
 
     fn vop(&mut self, subop: u8, vd: u8, va: u8, vb: u8, src: u8, off: i16) {
         if self.mode == VecMode::Call {
-            let op = VecInsn { subop, vd, va, vb, memory_mode: false, base_reg: 0, src, off };
-            let packed = super::intrinsics::pack(&op);
-            assert_eq!(
-                super::intrinsics::unpack(subop, packed).map(|op| op.encode()),
-                Some(op.encode()),
-                "operands not encodable as an intrinsic call (scalar register must be r1..=r4)"
-            );
-            self.mov64_imm(super::intrinsics::OPERAND_REG, packed as i64);
-            self.raw(ebpf::CALL_IMM, 0, 0, 0, super::intrinsics::hash(subop) as i32 as i64);
+            use super::intrinsics::{hash, pack, unpack, OPERAND_REG, SCALAR_REG};
+            let op = VecInsn { subop, vd, va, vb, memory_mode: false, base_reg: 0, src: if src != 0 { SCALAR_REG } else { 0 }, off };
+            let packed = pack(&op);
+            assert!(unpack(subop, packed).is_some(), "operands not encodable as an intrinsic call");
+            // The scalar operand is passed in r2 (clobbers r2 unless it is already there)
+            if src != 0 && src != SCALAR_REG {
+                self.mov64(SCALAR_REG, src);
+            }
+            self.mov64_imm(OPERAND_REG, packed as i64);
+            self.raw(ebpf::CALL_IMM, 0, 0, 0, hash(subop) as i32 as i64);
             return;
         }
         let (memory_mode, base_reg) = match self.mode {
@@ -219,6 +221,30 @@ impl Asm {
     }
     pub fn vpermd(&mut self, vd: u8, va: u8, vidx: u8) {
         self.vop(VPERMD, vd, va, vidx, 0, 0);
+    }
+    pub fn vsub(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VSUB32, vd, va, vb, 0, 0);
+    }
+    pub fn vmullo(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VMULLO32, vd, va, vb, 0, 0);
+    }
+    pub fn vminu(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VMINU32, vd, va, vb, 0, 0);
+    }
+    pub fn vsrl(&mut self, vd: u8, va: u8, amount: i16) {
+        self.vop(VSRL32, vd, va, 0, 0, amount);
+    }
+    pub fn vsll(&mut self, vd: u8, va: u8, amount: i16) {
+        self.vop(VSLL32, vd, va, 0, 0, amount);
+    }
+    pub fn vsllv(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VSLLV32, vd, va, vb, 0, 0);
+    }
+    pub fn vsrlv(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VSRLV32, vd, va, vb, 0, 0);
+    }
+    pub fn vandn(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VANDN, vd, va, vb, 0, 0);
     }
     pub fn vblendd(&mut self, vd: u8, va: u8, vb: u8, mask: i16) {
         self.vop(VBLENDD, vd, va, vb, 0, mask);

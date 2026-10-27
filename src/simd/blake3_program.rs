@@ -193,6 +193,8 @@ impl Gen {
     /// Program prologue: vector file base, constants
     fn prologue(&mut self) {
         let a = &mut self.a;
+        // r6 = input (r1 doesn't survive vector intrinsic calls)
+        a.mov64(6, 1);
         a.lddw(VECTOR_FILE_REG, ebpf::MM_HEAP_START + HEAP_VECTOR_FILE as u64);
         if self.kernel != Kernel::Scalar {
             for (slot, entry) in [
@@ -206,7 +208,7 @@ impl Gen {
                 (S_LANE, C_LANE),
                 (S_IV, C_IV),
             ] {
-                a.vload(slot, 1, (INPUT_CONSTANTS + 32 * entry) as i16);
+                a.vload(slot, 6, (INPUT_CONSTANTS + 32 * entry) as i16);
             }
         } else {
             a.lddw(8, ebpf::MM_HEAP_START);
@@ -221,7 +223,6 @@ impl Gen {
     fn main(&mut self) {
         self.prologue();
         let a = &mut self.a;
-        a.mov64(6, 1);
         a.ldxdw(7, 6, 0); // len
         a.add64_imm(6, INPUT_DATA as i64); // data
         a.lddw(8, ebpf::MM_HEAP_START);
@@ -528,7 +529,10 @@ impl Gen {
         a.mov64_imm(2, 0);
         a.mov64_imm(3, BLOCK_LEN as i64);
         if simd {
+            // r1 doesn't survive vector intrinsic calls (r7 is callee saved)
+            a.mov64(7, 1);
             a.vmov(S_CV, S_IV);
+            a.mov64(1, 7);
             a.mov64(6, 8);
             a.call(self.compress1);
             a.ldxdw(4, 6, A_OUT);
@@ -649,8 +653,8 @@ impl Gen {
         let a = &mut self.a;
         let [r0, r1, r2, r3] = [S_ROW, S_ROW + 1, S_ROW + 2, S_ROW + 3];
         let [t1, t2, t3, t4] = [S_T, S_T + 1, S_T + 2, S_T + 3];
-        a.vload(S_ML, 1, 0);
-        a.vload(S_MH, 1, 32);
+        // r1 (block) and r2 (counter) don't survive vector intrinsic calls with a scalar operand
+        a.mov64(5, 1);
         a.vmov(r0, S_CV);
         a.vpermd(r1, S_CV, S_HI4);
         a.vmov(r2, S_IV_LO);
@@ -662,6 +666,8 @@ impl Gen {
         a.vblendd(r3, r3, t1, 0x44);
         a.vbcast(t1, 4);
         a.vblendd(r3, r3, t1, 0x88);
+        a.vload(S_ML, 5, 0);
+        a.vload(S_MH, 5, 32);
         let (mask_lo, mask_hi) = permutation_masks();
         for round in 0..7 {
             a.vpermd(t1, S_ML, S_EVEN);
@@ -702,8 +708,8 @@ impl Gen {
         a.stxdw(8, A_NBLOCKS, 3);
         a.stxdw(8, A_PARENT, 5);
         for (i, word) in IV.iter().enumerate() {
-            a.mov32_imm(3, *word as i32 as i64);
-            a.vbcast(S_CV8 + i as u8, 3);
+            a.mov32_imm(2, *word as i32 as i64);
+            a.vbcast(S_CV8 + i as u8, 2);
         }
         a.vbcast(S_CTR_LO, 4);
         let is_parent = a.new_label();
@@ -735,15 +741,15 @@ impl Gen {
         a.or64_imm(4, CHUNK_END);
         a.bind(flags_done);
         // Load and transpose the message blocks of the eight lanes
-        a.ldxdw(1, 8, A_BASE);
-        a.ldxdw(2, 8, A_STRIDE);
+        a.ldxdw(2, 8, A_BASE);
         a.lsh64_imm(5, 6);
-        a.add64(1, 5);
+        a.add64(2, 5);
+        a.ldxdw(5, 8, A_STRIDE);
         for lane in 0..8u8 {
-            a.vload(S_MSG + lane, 1, 0);
-            a.vload(S_MSG + 8 + lane, 1, 32);
+            a.vload(S_MSG + lane, 2, 0);
+            a.vload(S_MSG + 8 + lane, 2, 32);
             if lane < 7 {
-                a.add64(1, 2);
+                a.add64(2, 5);
             }
         }
         a.vtranspose(S_MSG);
@@ -753,13 +759,13 @@ impl Gen {
             a.vmov(S_STATE + i, S_CV8 + i);
         }
         for i in 0..4u8 {
-            a.mov32_imm(3, IV[i as usize] as i32 as i64);
-            a.vbcast(S_STATE + 8 + i, 3);
+            a.mov32_imm(2, IV[i as usize] as i32 as i64);
+            a.vbcast(S_STATE + 8 + i, 2);
         }
         a.vmov(S_STATE + 12, S_CTR_LO);
         a.vmov(S_STATE + 13, S_CTR_HI);
-        a.mov64_imm(3, BLOCK_LEN as i64);
-        a.vbcast(S_STATE + 14, 3);
+        a.mov64_imm(2, BLOCK_LEN as i64);
+        a.vbcast(S_STATE + 14, 2);
         a.vbcast(S_STATE + 15, 4);
         // Seven rounds, the four G functions of each half round interleaved like the official AVX2
         // implementation
@@ -828,9 +834,9 @@ impl Gen {
         a.jlt(5, 0, top);
         // Transpose back into one chaining value per lane and store them
         a.vtranspose(S_CV8);
-        a.ldxdw(1, 8, A_OUT);
+        a.ldxdw(2, 8, A_OUT);
         for lane in 0..8u8 {
-            a.vstore(1, 32 * lane as i16, S_CV8 + lane);
+            a.vstore(2, 32 * lane as i16, S_CV8 + lane);
         }
         a.exit();
     }
@@ -865,7 +871,6 @@ pub fn compress_program(kernel: Kernel, mode: VecMode) -> Vec<u8> {
     {
         let simd = g.simd();
         let a = &mut g.a;
-        a.mov64(6, 1);
         a.lddw(8, ebpf::MM_HEAP_START);
         a.ldxdw(0, 6, 8);
         a.stxdw(8, A_ITER, 0);
@@ -930,10 +935,11 @@ pub fn compress_program(kernel: Kernel, mode: VecMode) -> Vec<u8> {
 pub fn microbench_program(repeat: usize, mode: VecMode) -> Vec<u8> {
     let mut a = Asm::new(mode);
     a.lddw(VECTOR_FILE_REG, ebpf::MM_HEAP_START + HEAP_VECTOR_FILE as u64);
+    a.mov64(3, 1);
     for i in 0..5u8 {
-        a.vload(i, 1, (INPUT_CONSTANTS + 32 * i as usize) as i16);
+        a.vload(i, 3, (INPUT_CONSTANTS + 32 * i as usize) as i16);
     }
-    a.ldxdw(2, 1, 8);
+    a.ldxdw(2, 3, 8);
     let top = a.new_label();
     a.bind(top);
     for _ in 0..repeat {

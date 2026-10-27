@@ -304,6 +304,9 @@ pub struct Executable<C: ContextObject> {
     loader: Arc<BuiltinProgram<C>>,
     /// Compiled program and argument
     pub(crate) compiled_program: std::sync::Mutex<Option<Arc<JitProgram>>>,
+    /// Lazily computed control flow facts of the vector experiment
+    #[cfg(feature = "simd-experiment")]
+    simd_analysis: std::sync::OnceLock<crate::simd::SimdAnalysis>,
 }
 
 impl<C: PartialEq + ContextObject> PartialEq for Executable<C> {
@@ -394,6 +397,12 @@ impl<C: ContextObject> Executable<C> {
         &self.loader
     }
 
+    /// Control flow facts of the vector experiment (computed once)
+    #[cfg(feature = "simd-experiment")]
+    pub fn simd_analysis(&self) -> &crate::simd::SimdAnalysis {
+        self.simd_analysis.get_or_init(|| crate::simd::analyze(self))
+    }
+
     /// Get the JIT compiled program
     ///
     /// This function will not block the calling thread even if there is a concurrent ongoing call
@@ -470,6 +479,8 @@ impl<C: ContextObject> Executable<C> {
             function_registry,
             loader,
             compiled_program: None.into(),
+            #[cfg(feature = "simd-experiment")]
+            simd_analysis: std::sync::OnceLock::new(),
         })
     }
 
@@ -625,6 +636,8 @@ impl<C: ContextObject> Executable<C> {
             function_registry,
             loader,
             compiled_program: None.into(),
+            #[cfg(feature = "simd-experiment")]
+            simd_analysis: std::sync::OnceLock::new(),
         })
     }
 
@@ -798,6 +811,8 @@ impl<C: ContextObject> Executable<C> {
             function_registry,
             loader,
             compiled_program: None.into(),
+            #[cfg(feature = "simd-experiment")]
+            simd_analysis: std::sync::OnceLock::new(),
         })
     }
 

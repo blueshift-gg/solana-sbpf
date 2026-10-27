@@ -915,6 +915,10 @@ impl VexInstruction {
     pub const fn alu(opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
         Self::ymm(1, 1, opcode, dst, src1, src2, None)
     }
+    /// Three operand packed integer op of the 0F38 map: vpmulld (0x40), vpminud (0x3b)
+    pub const fn alu38(opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
+        Self::ymm(1, 2, opcode, dst, src1, src2, None)
+    }
     /// vpsrld ymm, ymm, imm8
     pub const fn psrld(dst: u8, src: u8, imm: u8) -> Self {
         Self::ymm(1, 1, 0x72, 2, dst, VexRm::Reg(src), Some(imm))

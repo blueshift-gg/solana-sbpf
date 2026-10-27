@@ -60,44 +60,49 @@ four more ops were added:
 
 ## Intrinsic call form (SIMD-0645 style, no new opcode)
 
-The same 13 operations are also available without extending the ISA, as static syscalls in the
-style of `sol_multi3` (SIMD-0645). This is `VecMode::Call` in the assembler and
-`src/simd/intrinsics.rs`.
+The operations are also available without extending the ISA, as static syscalls in the style of
+`sol_multi3` (SIMD-0645). This is `VecMode::Call` in the assembler, `src/simd/intrinsics.rs`, and the
+form used by compiled Rust programs (`simd-falcon/`).
 
 ```text
-mov64 r5, <packed operands>       ; compile time constant
+mov64 r1, <packed operands>       ; compile time constant
 call  sol_vadd32x8                ; CALL_IMM, src = 0, imm = murmur32("sol_vadd32x8")
 ```
 
-* **Encoding:** one static call identifier per operation (`sol_vload256`, `sol_vstore256`,
-  `sol_vadd32x8`, `sol_vxor256`, `sol_vand256`, `sol_vor256`, `sol_vror32x8`, `sol_vshufd`,
-  `sol_vtranspose8`, `sol_vbcast32`, `sol_vmov256`, `sol_vpermd`, `sol_vblendd`). `dst`, `src` and
-  `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF.
-* **Operands:** `r5` carries the packed operands (bits 0–5 `vd`, 6–11 `va`, 12–17 `vb` or a 16 bit
-  offset for loads/stores, 18–25 an 8 bit immediate, 28–30 the scalar register). The packed value
-  always fits a `mov64 imm32`. The scalar operand (address or broadcast value) is any of `r1..=r4`,
-  selected by the packed field.
-* **Results:** the operation writes `r0 = 0` and leaves every other register unchanged. It costs the
-  1 CU of the `CALL_IMM`, so with the `mov64 r5` each vector op costs 2 CUs.
-* **Execution:** every engine runs the operation through the same reference semantics.
-  - The interpreter (and any engine without the lowering) dispatches the syscall normally.
-  - The JIT's `codegen` hook checks a block local constant tracker. If `r5` holds a valid constant
-    at the call, it emits exactly the AVX2 code of the opcode form, including register caching,
-    plus `mov eax, 0`.
-  - Otherwise, for example when `r5` was loaded from memory or set before a jump target, it emits
-    a regular syscall to the reference implementation. Results and CUs are identical either way.
+* **Encoding:** one static call identifier per operation, `sol_<mnemonic>` (21 of them, including
+  `sol_vsub32x8`, `sol_vmullo32x8`, `sol_vminu32x8`, `sol_vsrl32x8`, `sol_vsll32x8`,
+  `sol_vsllv32x8`, `sol_vsrlv32x8`, `sol_vandn256`, which exist only for compiled programs such as the
+  Falcon verifier). `dst`, `src` and `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF.
+* **ABI:** `r1` holds the packed operands, `r2` the scalar operand (vload/vstore address, vbcast
+  value). A Rust wrapper `sol_vadd32x8(ops(V0, V0, V1))` compiles to exactly `mov64 r1, imm` +
+  `call`, and compilers reload `r1` before every call because it is caller saved.
+* **Packing:** 8 bit slot numbers (256 slots, 8 KiB region): `vd | va << 8 | vb << 16`, an imm8 in
+  bits 16..24 for one-source ops, a 16 bit offset in bits 8..24 for vload/vstore. `vblendd` uses
+  7 bit slots (`vd | va << 7 | vb << 14 | imm8 << 21`). Every value is below `2^29`.
+* **Results:** `r0 = 0`, every other register unchanged, 1 CU for the `CALL_IMM`, so each vector
+  op costs 2 CUs including the `mov64`.
+* **Execution:** every engine runs the reference semantics. The JIT's `codegen` hook checks a block
+  local constant tracker. If `r1` holds a valid constant it emits the AVX2 code of the opcode form,
+  register caching included, plus `mov eax, 0`. Otherwise it emits a regular syscall to the
+  reference implementation. Results and CUs are identical either way.
 * **Compatibility:** a runtime that doesn't know the identifiers rejects the program at deployment
-  (`LocalVerifier`, `InvalidSyscall`), and an unregistered call fails with
-  `UnsupportedInstruction`. Nothing is ever misinterpreted.
-* **Programs:** a compiler can emit these like any other syscall, e.g.
-  `sol_vadd32x8(ops(V0, V0, V1))`, where `ops` is a const fn. No inline assembly is needed.
-  Because r1–r5 are caller-saved across calls, compilers reload `r5` right before each call, which
-  keeps the operands visible to the constant tracker.
+  (`LocalVerifier`, `InvalidSyscall`), and an unregistered call fails with `UnsupportedInstruction`.
+
+### callx and the register cache
+
+Compiled programs always contain some `callx` (e.g. in `core::fmt`). A `callx` may enter any
+instruction, but the JIT keeps vector state in registers inside a run of vector code. With the
+experiment enabled, `callx` therefore may not enter an instruction that follows a vector op with only
+pure scalar ALU instructions in between and no block start (`simd::SimdAnalysis::callx_forbidden`).
+Both engines throw `UnsupportedInstruction` for such a target; the JIT marks those entries in the pc
+table. Compiled code only ever targets function entries, so this never triggers in practice, and the
+register cache stays on for programs with `callx`.
 
 ## Vector memory region
 
 * `MM_VECTOR_START = 0x6 << 32`. `0x5 << 32` stays reserved for the static-sysvars proposal.
-* 64 slots × 32 bytes = 2048 bytes. Slot `vN` is at `0x600000000 + 32*N`.
+* 256 slots × 32 bytes = 8 KiB. Slot `vN` is at `0x600000000 + 32*N`. The opcode form addresses
+  slots 0..64 (6 bit fields), the intrinsic call form all 256.
 * The embedder owns a `simd::VectorMemory`, maps it with `region()` like stack and heap, and attaches
   it with `EbpfVm::set_vector_memory`. `execute_program` zeroes it on every invocation.
 * It's ordinary mapped memory, so normal scalar loads and stores work on it with the usual bounds and

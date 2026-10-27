@@ -1,0 +1,14 @@
+[package]
+name = "falcon-simd"
+version = "0.1.0"
+edition = "2021"
+description = "Falcon-512 verification with SIMD-0645 style vector intrinsics (experiment)"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+solana-define-syscall = "5.2"
+
+[workspace]

@@ -84,3 +84,9 @@ harness = false
 name = "simd_blake3"
 harness = false
 required-features = ["simd-experiment"]
+
+
+[[bench]]
+name = "simd_falcon"
+harness = false
+required-features = ["simd-experiment"]

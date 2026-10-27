@@ -5,15 +5,15 @@
 //! and a runtime which doesn't know the names rejects the program at verification
 //! (`InvalidSyscall`).
 //!
-//! ABI:
-//! - `r5` holds the packed operands (see [pack]).
-//! - The scalar operand (address of `vload`/`vstore`, value of `vbcast32`) is one of `r1..=r4`,
-//!   selected by a field of the packed operands.
+//! ABI (chosen so that compiled code needs nothing but the call itself; a Rust wrapper
+//! `sol_vadd32x8(ops(V0, V0, V1))` compiles to `mov64 r1, imm` + `call`):
+//! - `r1` holds the packed operands (see [pack]), always a compile time constant in practice.
+//! - `r2` holds the scalar operand: the address of `vload`/`vstore`, the value of `vbcast32`.
 //! - The operation writes `r0 = 0` and leaves every other register unchanged.
 //! - It costs the 1 CU of its `CALL_IMM` instruction and nothing else.
 //!
 //! Every execution backend runs the operation through [interpret]. The JIT lowers a call to inline
-//! AVX2, exactly like the opcode form, when it can prove that `r5` holds a valid constant at the
+//! AVX2, exactly like the opcode form, when it can prove that `r1` holds a valid constant at the
 //! call (block local constant tracking). Otherwise it emits an ordinary syscall to the same
 //! implementation the interpreter uses.
 
@@ -39,10 +39,20 @@ pub const NAMES: [&str; SUBOP_COUNT as usize] = [
     "sol_vmov256",
     "sol_vpermd",
     "sol_vblendd",
+    "sol_vsub32x8",
+    "sol_vmullo32x8",
+    "sol_vminu32x8",
+    "sol_vsrl32x8",
+    "sol_vsll32x8",
+    "sol_vsllv32x8",
+    "sol_vsrlv32x8",
+    "sol_vandn256",
 ];
 
 /// Register holding the packed operands
-pub const OPERAND_REG: u8 = 5;
+pub const OPERAND_REG: u8 = 1;
+/// Register holding the scalar operand
+pub const SCALAR_REG: u8 = 2;
 
 /// Static call identifier of a sub-operation
 pub fn hash(subop: u8) -> u32 {
@@ -58,52 +68,55 @@ pub fn hashes() -> [u32; SUBOP_COUNT as usize] {
     hashes
 }
 
-/// Packs the operands of `op` (slot mode, scalar register in `r1..=r4`) into the `r5` value.
+/// Packs the operands of `op` (slot mode, scalar operand in `r2`) into the `r1` value.
+///
+/// Slots are 8 bit (256 slots). The layout depends on the operation, and every packed value is
+/// below `2^29`, so it always fits a `mov64 r1, imm32`:
 ///
 /// ```text
-/// bits  0.. 5  vd
-/// bits  6..11  va
-/// bits 12..17  vb                (bits 12..27: signed 16 bit offset for vload / vstore)
-/// bits 18..25  imm8              (vror32x8, vshufd, vblendd)
-/// bits 28..30  scalar register   (1..=4 for vload, vstore, vbcast32, else 0)
-/// all other bits zero, so the value always fits a `mov64 r5, imm32`
+/// vload256 / vstore256   bits 0..7 slot (vd / va)   bits 8..23 signed 16 bit offset
+/// vbcast32 / vtranspose8 bits 0..7 vd
+/// two sources            bits 0..7 vd   bits 8..15 va   bits 16..23 vb
+/// one source + imm8      bits 0..7 vd   bits 8..15 va   bits 16..23 imm8   (vror, vshufd, vsrl, vsll)
+/// vmov256                bits 0..7 vd   bits 8..15 va
+/// vblendd                bits 0..6 vd   bits 7..13 va   bits 14..20 vb   bits 21..28 imm8 (slots < 128)
 /// ```
 pub fn pack(op: &VecInsn) -> u64 {
-    let mut packed = op.vd as u64 | (op.va as u64) << 6 | (op.src as u64) << 28;
-    if matches!(op.subop, VLOAD | VSTORE) {
-        packed |= (op.off as u16 as u64) << 12;
-    } else {
-        packed |= (op.vb as u64) << 12 | (op.off as u64 & 0xff) << 18;
+    let (vd, va, vb, imm) = (op.vd as u64, op.va as u64, op.vb as u64, op.off as u16 as u64);
+    match op.subop {
+        VLOAD => vd | imm << 8,
+        VSTORE => va | imm << 8,
+        VBCAST32 | VTRANSPOSE8 => vd,
+        VROR32 | VSHUFD | VSRL32 | VSLL32 => vd | va << 8 | (imm & 0xff) << 16,
+        VBLENDD => (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21,
+        VMOV => vd | va << 8,
+        _ => vd | va << 8 | vb << 16,
     }
-    packed
 }
 
-/// Decodes the packed operands, `None` if they are malformed
+/// Decodes the packed operands, `None` if they are malformed (including any non canonical bits)
 pub fn unpack(subop: u8, packed: u64) -> Option<VecInsn> {
-    if subop >= SUBOP_COUNT || packed >> 31 != 0 {
+    if subop >= SUBOP_COUNT || packed >> 29 != 0 {
         return None;
     }
-    let src = ((packed >> 28) & 7) as u8;
-    let (vb, off) = if matches!(subop, VLOAD | VSTORE) {
-        (0, ((packed >> 12) & 0xffff) as u16 as i16)
-    } else {
-        (((packed >> 12) & 63) as u8, ((packed >> 18) & 0xff) as i16)
-    };
-    let op = VecInsn {
-        subop,
-        vd: (packed & 63) as u8,
-        va: ((packed >> 6) & 63) as u8,
-        vb,
-        memory_mode: false,
-        base_reg: 0,
-        src,
-        off,
-    };
-    let uses_src = matches!(subop, VLOAD | VSTORE | VBCAST32);
-    if uses_src && !(1..=4).contains(&src) {
-        return None;
+    let byte = |shift: u32| ((packed >> shift) & 0xff) as u8;
+    let (mut vd, mut va, mut vb, mut off) = (0u8, 0u8, 0u8, 0i16);
+    match subop {
+        VLOAD => (vd, off) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16),
+        VSTORE => (va, off) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16),
+        VBCAST32 | VTRANSPOSE8 => vd = byte(0),
+        VROR32 | VSHUFD | VSRL32 | VSLL32 => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
+        VBLENDD => {
+            let field = |shift: u32| ((packed >> shift) & 0x7f) as u8;
+            (vd, va, vb, off) = (field(0), field(7), field(14), byte(21) as i16);
+        }
+        VMOV => (vd, va) = (byte(0), byte(8)),
+        _ => (vd, va, vb) = (byte(0), byte(8), byte(16)),
     }
-    let op = VecInsn::decode(&op.encode())?;
+    let src = if matches!(subop, VLOAD | VSTORE | VBCAST32) { SCALAR_REG } else { 0 };
+    let op = VecInsn { subop, vd, va, vb, memory_mode: false, base_reg: 0, src, off };
+    // The opcode form's validation (operand ranges), applied without its 6 bit slot encoding
+    validate_slot_op(&op)?;
     (pack(&op) == packed).then_some(op)
 }
 
@@ -114,7 +127,7 @@ pub fn execute(
     vector_base: *mut u8,
     mapping: &mut MemoryMapping,
 ) -> Result<(), EbpfError> {
-    let op = unpack(subop, args[4]).ok_or(EbpfError::UnsupportedInstruction)?;
+    let op = unpack(subop, args[0]).ok_or(EbpfError::UnsupportedInstruction)?;
     let reg = [0, args[0], args[1], args[2], args[3], args[4]];
     interpret(&op, &reg, vector_base, mapping)
 }
@@ -166,6 +179,6 @@ pub fn register<C: ContextObject>(loader: &mut BuiltinProgram<C>) -> Result<(), 
             $(loader.register_definition::<Intrinsic<$subop>>(NAMES[$subop])?;)*
         };
     }
-    register!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    register!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20);
     Ok(())
 }

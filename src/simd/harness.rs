@@ -33,6 +33,51 @@ impl ContextObject for HarnessContext {
     }
 }
 
+crate::declare_builtin_function!(
+    /// `sol_memset_(dst, c, n)` with Agave's cost: max(10, n / 250) CUs
+    SyscallMemset,
+    fn rust(
+        context: &mut HarnessContext,
+        dst: u64,
+        c: u64,
+        n: u64,
+        _arg4: u64,
+        _arg5: u64,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        context.consume(mem_op_cost(n));
+        if n > 0 {
+            let buf = Result::from(context.mapping.map(crate::memory_region::AccessType::Store, dst, n))?;
+            unsafe { std::ptr::write_bytes(buf.ptr_mut() as *mut u8, c as u8, n as usize) };
+        }
+        Ok(0)
+    }
+);
+
+crate::declare_builtin_function!(
+    /// `sol_memcpy_(dst, src, n)` with Agave's cost: max(10, n / 250) CUs
+    SyscallMemcpy,
+    fn rust(
+        context: &mut HarnessContext,
+        dst: u64,
+        src: u64,
+        n: u64,
+        _arg4: u64,
+        _arg5: u64,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        context.consume(mem_op_cost(n));
+        if n > 0 {
+            let s = Result::from(context.mapping.map(crate::memory_region::AccessType::Load, src, n))?;
+            let d = Result::from(context.mapping.map(crate::memory_region::AccessType::Store, dst, n))?;
+            unsafe { std::ptr::copy(s.ptr_mut() as *const u8, d.ptr_mut() as *mut u8, n as usize) };
+        }
+        Ok(0)
+    }
+);
+
+fn mem_op_cost(n: u64) -> u64 {
+    10.max(n / 250)
+}
+
 /// Execution engine
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
@@ -68,7 +113,8 @@ pub fn running_under_rosetta() -> bool {
 /// Production-like configuration with the experiment enabled
 pub fn config(strategy: SimdJitStrategy) -> Config {
     Config {
-        enabled_sbpf_versions: SBPFVersion::V4..=SBPFVersion::V4,
+        // V3 for compiled (ELF) programs with static syscalls, V4 for the generated ones
+        enabled_sbpf_versions: SBPFVersion::V3..=SBPFVersion::V4,
         aligned_memory_mapping: true,
         enable_simd_experiment: true,
         simd_jit_strategy: strategy,
@@ -98,15 +144,32 @@ impl Runner {
         heap_size: usize,
         config: Config,
     ) -> Result<Self, EbpfError> {
-        let mut loader = BuiltinProgram::new_loader(config);
-        super::intrinsics::register(&mut loader).map_err(|_| EbpfError::UnsupportedInstruction)?;
-        let loader = Arc::new(loader);
         let executable = Executable::from_text_bytes(
             program,
-            loader,
+            Self::loader(config)?,
             SBPFVersion::V4,
             FunctionRegistry::default(),
         )?;
+        Self::with_executable(executable, input, heap_size)
+    }
+
+    /// Loads a compiled SBPF ELF (e.g. built with `cargo-build-sbf --arch v3`)
+    pub fn from_elf(elf: &[u8], input: &[u8], heap_size: usize, config: Config) -> Result<Self, EbpfError> {
+        let executable = Executable::load(elf, Self::loader(config)?).map_err(EbpfError::ElfError)?;
+        Self::with_executable(executable, input, heap_size)
+    }
+
+    /// Loader with the vector intrinsics registered as static syscalls
+    fn loader(config: Config) -> Result<Arc<BuiltinProgram<HarnessContext>>, EbpfError> {
+        let mut loader = BuiltinProgram::new_loader(config);
+        super::intrinsics::register(&mut loader).map_err(EbpfError::ElfError)?;
+        // The memory syscalls compiled programs may use
+        loader.register_definition::<SyscallMemset>("sol_memset_").map_err(EbpfError::ElfError)?;
+        loader.register_definition::<SyscallMemcpy>("sol_memcpy_").map_err(EbpfError::ElfError)?;
+        Ok(Arc::new(loader))
+    }
+
+    fn with_executable(executable: Executable<HarnessContext>, input: &[u8], heap_size: usize) -> Result<Self, EbpfError> {
         executable.verify::<RequisiteVerifier>()?;
         let config = executable.get_config();
         let mut runner = Self {
@@ -160,7 +223,7 @@ impl Runner {
         let vector_ptr = self.vector.host_ptr();
         let mut vm = EbpfVm::new(
             self.executable.get_loader().clone(),
-            SBPFVersion::V4,
+            self.executable.get_sbpf_version(),
             &mut *self.context,
             stack_len,
         );
@@ -179,7 +242,7 @@ impl Runner {
         let stack_len = self.stack.len();
         let mut vm = EbpfVm::new(
             self.executable.get_loader().clone(),
-            SBPFVersion::V4,
+            self.executable.get_sbpf_version(),
             &mut *self.context,
             stack_len,
         );

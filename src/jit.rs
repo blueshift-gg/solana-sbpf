@@ -386,6 +386,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             #[cfg(feature = "simd-experiment")]
             self.simd_before_instruction(&insn);
             self.result.pc_section_mut()[self.pc] = self.offset_in_text_section as u32;
+            #[cfg(feature = "simd-experiment")]
+            if self.simd.enabled && self.executable.simd_analysis().callx_forbidden(self.pc) {
+                // Inside a run of vector code: not a valid callx target (see SimdAnalysis)
+                self.result.pc_section_mut()[self.pc] |= 1 << 31;
+            }
 
             // Regular instruction meter checkpoints to prevent long linear runs from exceeding their budget
             if self.last_instruction_meter_validation_pc + self.config.instruction_meter_checkpoint_distance <= self.pc {

@@ -14,6 +14,12 @@ const CACHE_REGS: usize = 15;
 const SCRATCH_YMM: u8 = 15;
 
 const VPADDD: u8 = 0xfe;
+const VPSUBD: u8 = 0xfa;
+const VPMULLD: u8 = 0x40;
+const VPMINUD: u8 = 0x3b;
+const VPSLLVD: u8 = 0x47;
+const VPSRLVD: u8 = 0x45;
+const VPANDN: u8 = 0xdf;
 const VPXOR: u8 = 0xef;
 const VPAND: u8 = 0xdb;
 const VPOR: u8 = 0xeb;
@@ -121,54 +127,10 @@ impl SimdJitState {
         if !config.enable_simd_experiment {
             return Ok((state, 0));
         }
-        let sbpf_version = executable.get_sbpf_version();
-        let len = program.len() / ebpf::INSN_SIZE;
-        let mut jump_targets = vec![false; len + 1];
-        let mut vector_instructions = 0;
-        let mut has_callx = false;
+        let _ = program;
+        let analysis = executable.simd_analysis();
+        let vector_instructions = analysis.vector_instructions;
         let intrinsic_hashes = simd::intrinsics::hashes();
-        let mut pc = 0;
-        while pc < len {
-            let insn = ebpf::get_insn_unchecked(program, pc);
-            let class = insn.opc & ebpf::BPF_CLS_MASK;
-            match insn.opc {
-                ebpf::VOP => vector_instructions += 1,
-                ebpf::CALL_REG => has_callx = true,
-                ebpf::CALL_IMM if insn.src == 0 && intrinsic_hashes.contains(&(insn.imm as u32)) => {
-                    vector_instructions += 1;
-                }
-                ebpf::CALL_IMM => {
-                    if sbpf_version.static_syscalls() && insn.src == 1 {
-                        let target = pc as i64 + insn.imm + 1;
-                        if (0..len as i64).contains(&target) {
-                            jump_targets[target as usize] = true;
-                        }
-                    } else if let Some((_, target)) =
-                        executable.get_function_registry().lookup_by_key(insn.imm as u32)
-                    {
-                        if target < len {
-                            jump_targets[target] = true;
-                        }
-                    }
-                }
-                ebpf::EXIT => {}
-                _ if class == ebpf::BPF_JMP64
-                    || (class == ebpf::BPF_JMP32 && sbpf_version.enable_jmp32()) =>
-                {
-                    let target = pc as i64 + insn.off as i64 + 1;
-                    if (0..len as i64).contains(&target) {
-                        jump_targets[target as usize] = true;
-                    }
-                }
-                _ => {}
-            }
-            pc += if insn.opc == ebpf::LD_DW_IMM && !sbpf_version.disable_lddw() {
-                2
-            } else {
-                1
-            };
-        }
-        jump_targets[executable.get_entrypoint_instruction_offset().min(len)] = true;
         if vector_instructions > 0
             && !config.simd_assume_avx2
             && !std::arch::is_x86_feature_detected!("avx2")
@@ -180,43 +142,17 @@ impl SimdJitState {
             return Ok((state, 0));
         }
         state.enabled = true;
-        // A callx may enter any instruction, which rules out block local state
-        state.static_flow = !has_callx;
-        state.cached = state.static_flow && config.simd_jit_strategy == SimdJitStrategy::RegisterCached;
-        state.jump_targets = jump_targets;
+        // callx may only enter instructions outside runs of vector code (see simd::SimdAnalysis),
+        // so block local state is sound even in programs which contain callx
+        state.static_flow = true;
+        state.cached = config.simd_jit_strategy == SimdJitStrategy::RegisterCached;
+        state.jump_targets = analysis.jump_targets.clone();
         state.intrinsic_hashes = intrinsic_hashes;
         Ok((state, vector_instructions))
     }
 }
 
-/// Opcodes which neither touch memory, branch, call, nor throw
-fn is_pure_alu(opc: u8) -> bool {
-    let class = opc & ebpf::BPF_CLS_MASK;
-    let op = opc & ebpf::BPF_ALU_OP_MASK;
-    if opc == ebpf::LD_DW_IMM {
-        return true;
-    }
-    if class != ebpf::BPF_ALU32_LOAD && class != ebpf::BPF_ALU64_STORE {
-        return false;
-    }
-    !matches!(
-        opc,
-        ebpf::LD_1B_REG
-            | ebpf::LD_2B_REG
-            | ebpf::LD_4B_REG
-            | ebpf::LD_8B_REG
-            | ebpf::ST_1B_IMM
-            | ebpf::ST_2B_IMM
-            | ebpf::ST_4B_IMM
-            | ebpf::ST_8B_IMM
-            | ebpf::ST_1B_REG
-            | ebpf::ST_2B_REG
-            | ebpf::ST_4B_REG
-            | ebpf::ST_8B_REG
-    ) && op != ebpf::BPF_DIV
-        && op != ebpf::BPF_MOD
-        && opc != ebpf::VOP
-}
+use simd::is_pure_alu;
 
 impl<'a, C: ContextObject> JitCompiler<'a, C> {
     /// Emits a VEX encoded instruction
@@ -331,7 +267,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             None
         };
         if let Some(op) = op {
-            if self.emit_simd_instruction(&op.encode()).is_ok() {
+            if self.emit_simd_op(&op).is_ok() {
                 // The intrinsic returns 0 in r0
                 self.emit_ins(X86Instruction::load_immediate(REGISTER_MAP[0], 0));
                 return;
@@ -673,6 +609,15 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         let Some(op) = VecInsn::decode(insn) else {
             return Err(EbpfError::UnsupportedInstruction);
         };
+        self.emit_simd_op(&op)
+    }
+
+    /// Compiles one decoded vector operation (opcode or intrinsic call form)
+    fn emit_simd_op(&mut self, op: &VecInsn) -> Result<(), EbpfError> {
+        if self.offset_in_text_section + 4096 >= self.result.text_section().len() {
+            return Err(EbpfError::ExhaustedTextSegment(self.pc));
+        }
+        let op = *op;
         self.simd.stats.vector_instructions += 1;
         let (operands, count) = op.operands();
         let operands = &operands[..count];
@@ -714,12 +659,18 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let mem = self.simd_mem(op, &operands[0], scratch[0], 0);
                 self.simd_store(0, mem);
             }
-            VADD32 | VXOR | VAND | VOR | VBLENDD => {
+            VADD32 | VXOR | VAND | VOR | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN => {
                 let a = self.simd_mem(op, &operands[0], scratch[0], 0);
                 self.simd_load(0, a);
                 let b = self.simd_mem(op, &operands[1], scratch[1], 0);
                 let ins = match op.subop {
                     VADD32 => V::alu(VPADDD, 0, 0, b),
+                    VSUB32 => V::alu(VPSUBD, 0, 0, b),
+                    VMULLO32 => V::alu38(VPMULLD, 0, 0, b),
+                    VMINU32 => V::alu38(VPMINUD, 0, 0, b),
+                    VSLLV32 => V::alu38(VPSLLVD, 0, 0, b),
+                    VSRLV32 => V::alu38(VPSRLVD, 0, 0, b),
+                    VANDN => V::alu(VPANDN, 0, 0, b),
                     VXOR => V::alu(VPXOR, 0, 0, b),
                     VAND => V::alu(VPAND, 0, 0, b),
                     VOR => V::alu(VPOR, 0, 0, b),
@@ -740,6 +691,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VSHUFD => {
                 let a = self.simd_mem(op, &operands[0], scratch[0], 0);
                 self.emit_vex(V::pshufd(0, a, op.off as u8));
+                let d = self.simd_mem(op, &operands[1], scratch[1], 0);
+                self.simd_store(0, d);
+            }
+            VSRL32 | VSLL32 => {
+                let a = self.simd_mem(op, &operands[0], scratch[0], 0);
+                self.simd_load(0, a);
+                self.emit_vex(if op.subop == VSRL32 { V::psrld(0, 0, op.off as u8) } else { V::pslld(0, 0, op.off as u8) });
                 let d = self.simd_mem(op, &operands[1], scratch[1], 0);
                 self.simd_store(0, d);
             }
@@ -787,13 +745,19 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let rd = self.simd_destination(op.vd);
                 self.emit_vex(V::pbroadcastd(rd, SCRATCH_YMM));
             }
-            VADD32 | VXOR | VAND | VOR | VBLENDD => {
+            VADD32 | VXOR | VAND | VOR | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
                 let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
                 let rd = self.simd_destination(op.vd);
                 let ins = match op.subop {
                     VADD32 => V::alu(VPADDD, rd, ra, b),
+                    VSUB32 => V::alu(VPSUBD, rd, ra, b),
+                    VMULLO32 => V::alu38(VPMULLD, rd, ra, b),
+                    VMINU32 => V::alu38(VPMINUD, rd, ra, b),
+                    VSLLV32 => V::alu38(VPSLLVD, rd, ra, b),
+                    VSRLV32 => V::alu38(VPSRLVD, rd, ra, b),
+                    VANDN => V::alu(VPANDN, rd, ra, b),
                     VXOR => V::alu(VPXOR, rd, ra, b),
                     VAND => V::alu(VPAND, rd, ra, b),
                     VOR => V::alu(VPOR, rd, ra, b),
@@ -818,6 +782,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.simd_pin(ra);
                 let rd = self.simd_destination(op.vd);
                 self.simd_emit_rotate(rd, ra, op.off as u8);
+            }
+            VSRL32 | VSLL32 => {
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let rd = self.simd_destination(op.vd);
+                self.emit_vex(if op.subop == VSRL32 { V::psrld(rd, ra, op.off as u8) } else { V::pslld(rd, ra, op.off as u8) });
             }
             VMOV => {
                 if op.vd != op.va {

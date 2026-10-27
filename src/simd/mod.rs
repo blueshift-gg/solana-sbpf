@@ -63,8 +63,24 @@ pub const VMOV: u8 = 0x0a;
 pub const VPERMD: u8 = 0x0b;
 /// `v[vd][i] = if (off >> i) & 1 != 0 { v[vb][i] } else { v[va][i] }` (vpblendd)
 pub const VBLENDD: u8 = 0x0c;
+/// `v[vd] = v[va] - v[vb]` (eight wrapping u32 subtractions)
+pub const VSUB32: u8 = 0x0d;
+/// `v[vd] = v[va] * v[vb]` (low 32 bits of eight u32 products, vpmulld)
+pub const VMULLO32: u8 = 0x0e;
+/// `v[vd] = min(v[va], v[vb])` (eight unsigned u32 minimums, vpminud)
+pub const VMINU32: u8 = 0x0f;
+/// `v[vd] = v[va] >> off` (eight logical u32 shifts, `off` in 0..32)
+pub const VSRL32: u8 = 0x10;
+/// `v[vd] = v[va] << off` (eight u32 shifts, `off` in 0..32)
+pub const VSLL32: u8 = 0x11;
+/// `v[vd][i] = v[va][i] << v[vb][i]` (0 for counts above 31, vpsllvd)
+pub const VSLLV32: u8 = 0x12;
+/// `v[vd][i] = v[va][i] >> v[vb][i]` (0 for counts above 31, vpsrlvd)
+pub const VSRLV32: u8 = 0x13;
+/// `v[vd] = !v[va] & v[vb]` (vpandn)
+pub const VANDN: u8 = 0x14;
 /// Number of defined sub-operations
-pub const SUBOP_COUNT: u8 = 0x0d;
+pub const SUBOP_COUNT: u8 = 0x15;
 
 /// Memory mode flag in the immediate
 pub const MEMORY_MODE: u32 = 1 << 24;
@@ -93,6 +109,27 @@ pub struct VecInsn {
     pub off: i16,
 }
 
+/// Operand validation shared by the opcode form and the intrinsic call form
+pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
+    if op.subop >= SUBOP_COUNT || op.src > 10 {
+        return None;
+    }
+    let uses_src = matches!(op.subop, VLOAD | VSTORE | VBCAST32);
+    if !uses_src && op.src != 0 {
+        return None;
+    }
+    let off_ok = match op.subop {
+        VLOAD | VSTORE => true,
+        VROR32 | VSRL32 | VSLL32 => (0..32).contains(&op.off),
+        VSHUFD | VBLENDD => (0..256).contains(&op.off),
+        _ => op.off == 0,
+    };
+    if !off_ok || (op.subop == VTRANSPOSE8 && op.vd as usize > ebpf::VECTOR_SLOTS - 8) {
+        return None;
+    }
+    Some(())
+}
+
 impl VecInsn {
     /// Decodes an instruction, returns `None` if it is not a well formed vector instruction
     pub fn decode(insn: &ebpf::Insn) -> Option<Self> {
@@ -113,28 +150,10 @@ impl VecInsn {
             src: insn.src,
             off: insn.off,
         };
-        if op.subop >= SUBOP_COUNT || insn.src > 10 || insn.dst > 10 {
+        if insn.dst > 10 || (!op.memory_mode && insn.dst != 0) {
             return None;
         }
-        if !op.memory_mode && insn.dst != 0 {
-            return None;
-        }
-        let uses_src = matches!(op.subop, VLOAD | VSTORE | VBCAST32);
-        if !uses_src && insn.src != 0 {
-            return None;
-        }
-        let off_ok = match op.subop {
-            VLOAD | VSTORE => true,
-            VROR32 => (0..32).contains(&op.off),
-            VSHUFD | VBLENDD => (0..256).contains(&op.off),
-            _ => op.off == 0,
-        };
-        if !off_ok {
-            return None;
-        }
-        if op.subop == VTRANSPOSE8 && op.vd as usize > ebpf::VECTOR_SLOTS - 8 {
-            return None;
-        }
+        validate_slot_op(&op)?;
         Some(op)
     }
 
@@ -165,7 +184,7 @@ impl VecInsn {
         match self.subop {
             VLOAD => ([Scalar(AccessType::Load), Slot(self.vd, AccessType::Store), none], 2),
             VSTORE => ([Slot(self.va, AccessType::Load), Scalar(AccessType::Store), none], 2),
-            VADD32 | VXOR | VAND | VOR | VPERMD | VBLENDD => (
+            VADD32 | VXOR | VAND | VOR | VPERMD | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN => (
                 [
                     Slot(self.va, AccessType::Load),
                     Slot(self.vb, AccessType::Load),
@@ -173,7 +192,7 @@ impl VecInsn {
                 ],
                 3,
             ),
-            VROR32 | VSHUFD | VMOV => (
+            VROR32 | VSHUFD | VMOV | VSRL32 | VSLL32 => (
                 [
                     Slot(self.va, AccessType::Load),
                     Slot(self.vd, AccessType::Store),
@@ -362,6 +381,14 @@ pub fn compute(op: &VecInsn, a: &Lanes, b: &Lanes) -> Lanes {
                 out[i] = b[i];
             }
         }),
+        VSUB32 => (0..8).for_each(|i| out[i] = a[i].wrapping_sub(b[i])),
+        VMULLO32 => (0..8).for_each(|i| out[i] = a[i].wrapping_mul(b[i])),
+        VMINU32 => (0..8).for_each(|i| out[i] = a[i].min(b[i])),
+        VSRL32 => (0..8).for_each(|i| out[i] = a[i] >> (op.off as u32 & 31)),
+        VSLL32 => (0..8).for_each(|i| out[i] = a[i] << (op.off as u32 & 31)),
+        VSLLV32 => (0..8).for_each(|i| out[i] = if b[i] > 31 { 0 } else { a[i] << b[i] }),
+        VSRLV32 => (0..8).for_each(|i| out[i] = if b[i] > 31 { 0 } else { a[i] >> b[i] }),
+        VANDN => (0..8).for_each(|i| out[i] = !a[i] & b[i]),
         VMOV | VLOAD | VSTORE => {}
         _ => unreachable!(),
     }
@@ -435,7 +462,7 @@ pub fn interpret(
             }
         }
         VBCAST32 => write_lanes(host[0], &[reg[op.src as usize] as u32; 8]),
-        VADD32 | VXOR | VAND | VOR | VPERMD | VBLENDD => {
+        VADD32 | VXOR | VAND | VOR | VPERMD | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN => {
             let a = read_lanes(host[0]);
             let b = read_lanes(host[1]);
             write_lanes(host[2], &compute(op, &a, &b));
@@ -477,6 +504,14 @@ pub fn disassemble(insn: &ebpf::Insn) -> String {
         VMOV => format!("vmov {vd}, {va}"),
         VPERMD => format!("vpermd {vd}, {va}, {vb}"),
         VBLENDD => format!("vblendd {vd}, {va}, {vb}, {:#x}", op.off),
+        VSUB32 => format!("vsub32x8 {vd}, {va}, {vb}"),
+        VMULLO32 => format!("vmullo32x8 {vd}, {va}, {vb}"),
+        VMINU32 => format!("vminu32x8 {vd}, {va}, {vb}"),
+        VSRL32 => format!("vsrl32x8 {vd}, {va}, {}", op.off),
+        VSLL32 => format!("vsll32x8 {vd}, {va}, {}", op.off),
+        VSLLV32 => format!("vsllv32x8 {vd}, {va}, {vb}"),
+        VSRLV32 => format!("vsrlv32x8 {vd}, {va}, {vb}"),
+        VANDN => format!("vandn256 {vd}, {va}, {vb}"),
         _ => unreachable!(),
     }
 }
@@ -526,4 +561,115 @@ impl VectorMemory {
     pub fn slot(&self, index: usize) -> Lanes {
         read_lanes(self.as_slice()[index * ebpf::VECTOR_WIDTH..].as_ptr())
     }
+}
+
+/// Opcodes which neither touch memory, branch, call, nor throw
+pub(crate) fn is_pure_alu(opc: u8) -> bool {
+    let class = opc & ebpf::BPF_CLS_MASK;
+    let op = opc & ebpf::BPF_ALU_OP_MASK;
+    if opc == ebpf::LD_DW_IMM {
+        return true;
+    }
+    if class != ebpf::BPF_ALU32_LOAD && class != ebpf::BPF_ALU64_STORE {
+        return false;
+    }
+    !matches!(
+        opc,
+        ebpf::LD_1B_REG
+            | ebpf::LD_2B_REG
+            | ebpf::LD_4B_REG
+            | ebpf::LD_8B_REG
+            | ebpf::ST_1B_IMM
+            | ebpf::ST_2B_IMM
+            | ebpf::ST_4B_IMM
+            | ebpf::ST_8B_IMM
+            | ebpf::ST_1B_REG
+            | ebpf::ST_2B_REG
+            | ebpf::ST_4B_REG
+            | ebpf::ST_8B_REG
+    ) && op != ebpf::BPF_DIV
+        && op != ebpf::BPF_MOD
+        && opc != ebpf::VOP
+}
+
+/// Static control flow facts about a program, shared by the interpreter and the JIT
+#[derive(Debug, Default)]
+pub struct SimdAnalysis {
+    /// Basic block starts (jump and call targets, the entry point)
+    pub jump_targets: Vec<bool>,
+    /// Instructions a `callx` may not enter: those inside a run of vector code, i.e. after a
+    /// vector instruction with only pure scalar ALU instructions in between and no block start.
+    /// There the JIT keeps vector state in registers. Entering one throws UnsupportedInstruction
+    /// in every engine.
+    pub callx_forbidden: Vec<bool>,
+    /// Vector instructions (opcode form and intrinsic calls)
+    pub vector_instructions: usize,
+}
+
+impl SimdAnalysis {
+    /// Whether `callx` may not enter instruction `pc`
+    pub fn callx_forbidden(&self, pc: usize) -> bool {
+        self.callx_forbidden.get(pc).copied().unwrap_or(false)
+    }
+}
+
+/// Computes [SimdAnalysis]
+pub fn analyze<C: crate::vm::ContextObject>(executable: &crate::elf::Executable<C>) -> SimdAnalysis {
+    let sbpf_version = executable.get_sbpf_version();
+    let (_, program) = executable.get_text_bytes();
+    let len = program.len() / ebpf::INSN_SIZE;
+    let intrinsic_hashes = intrinsics::hashes();
+    let is_vector = |insn: &ebpf::Insn| {
+        insn.opc == ebpf::VOP
+            || (insn.opc == ebpf::CALL_IMM && insn.src == 0 && intrinsic_hashes.contains(&(insn.imm as u32)))
+    };
+    let step = |insn: &ebpf::Insn| if insn.opc == ebpf::LD_DW_IMM && !sbpf_version.disable_lddw() { 2 } else { 1 };
+    let mut jump_targets = vec![false; len + 1];
+    let mut vector_instructions = 0;
+    let mut pc = 0;
+    while pc < len {
+        let insn = ebpf::get_insn_unchecked(program, pc);
+        let class = insn.opc & ebpf::BPF_CLS_MASK;
+        if is_vector(&insn) {
+            vector_instructions += 1;
+        } else if insn.opc == ebpf::CALL_IMM {
+            if sbpf_version.static_syscalls() && insn.src == 1 {
+                let target = pc as i64 + insn.imm + 1;
+                if (0..len as i64).contains(&target) {
+                    jump_targets[target as usize] = true;
+                }
+            } else if let Some((_, target)) = executable.get_function_registry().lookup_by_key(insn.imm as u32) {
+                if target < len {
+                    jump_targets[target] = true;
+                }
+            }
+        } else if insn.opc != ebpf::EXIT
+            && insn.opc != ebpf::CALL_REG
+            && (class == ebpf::BPF_JMP64 || (class == ebpf::BPF_JMP32 && sbpf_version.enable_jmp32()))
+        {
+            let target = pc as i64 + insn.off as i64 + 1;
+            if (0..len as i64).contains(&target) {
+                jump_targets[target as usize] = true;
+            }
+        }
+        pc += step(&insn);
+    }
+    jump_targets[executable.get_entrypoint_instruction_offset().min(len)] = true;
+    let mut callx_forbidden = vec![false; len + 1];
+    let mut in_vector_run = false;
+    let mut pc = 0;
+    while pc < len {
+        let insn = ebpf::get_insn_unchecked(program, pc);
+        if jump_targets[pc] {
+            in_vector_run = false;
+        }
+        callx_forbidden[pc] = in_vector_run;
+        if is_vector(&insn) {
+            in_vector_run = true;
+        } else if !is_pure_alu(insn.opc) {
+            in_vector_run = false;
+        }
+        pc += step(&insn);
+    }
+    SimdAnalysis { jump_targets, callx_forbidden, vector_instructions }
 }
