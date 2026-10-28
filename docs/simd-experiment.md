@@ -227,8 +227,8 @@ AVX-512 hosts AVX2-only plus every CPU feature profile of `simd::features::PROFI
   tracking, the cache flushes, jumps which start a block); faults (access violations, division by zero, the instruction
   meter at checkpoints and at `lddw`) in the middle of vector code leave the vector file written
   back.
-* *Alignment:* misaligned vector files (offsets 1, 8, 16, 31; under Rosetta 2 an aligned load planted
-  in the JIT went unnoticed, so this is only checked on real hardware), and in debug builds the JIT checks
+* *Alignment:* misaligned vector files (offsets 1, 8, 16, 31; an aligned load planted in the JIT
+  crashes the suite with SIGSEGV on real x86 hardware, Rosetta 2 doesn't fault on it), and in debug builds the JIT checks
   RSP before every call into Rust (`test rsp, 15; jz; ud2`), so run the suites in debug builds too.
 * The tests must notice planted bugs: an off by one slot count, broken templates, a missing write
   back or flush, an aligned load from the vector file, the stack parity bug all make them fail.
