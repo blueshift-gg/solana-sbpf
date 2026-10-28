@@ -114,6 +114,9 @@ pub struct SimdJitState {
     pub(super) avx512: bool,
     /// AVX512_VBMI2 (vpcompressw) in addition
     vbmi2: bool,
+    /// AVX512DQ (vpmullq) and AVX512_IFMA (vpmadd52*) in addition
+    dq: bool,
+    ifma: bool,
     pairs: [PairState; ebpf::VECTOR_SLOTS / 2],
     zregs: [Option<u8>; ZREGS],
     zlast_use: [u64; ZREGS],
@@ -144,6 +147,8 @@ impl SimdJitState {
             pinned: [false; CACHE_REGS],
             avx512: false,
             vbmi2: false,
+            dq: false,
+            ifma: false,
             pairs: [PairState::default(); ebpf::VECTOR_SLOTS / 2],
             zregs: [None; ZREGS],
             zlast_use: [0; ZREGS],
@@ -186,7 +191,11 @@ impl SimdJitState {
                 && std::arch::is_x86_feature_detected!("avx512f")
                 && std::arch::is_x86_feature_detected!("avx512bw")
                 && std::arch::is_x86_feature_detected!("avx512vl"));
-        state.vbmi2 = state.avx512 && (config.simd_force_avx512 || std::arch::is_x86_feature_detected!("avx512vbmi2"));
+        let (avx512, force) = (state.avx512, config.simd_force_avx512);
+        let feature = |detected: bool| avx512 && (force || detected);
+        state.vbmi2 = feature(std::arch::is_x86_feature_detected!("avx512vbmi2"));
+        state.dq = feature(std::arch::is_x86_feature_detected!("avx512dq"));
+        state.ifma = feature(std::arch::is_x86_feature_detected!("avx512ifma"));
         // callx may only enter instructions outside runs of vector code (see simd::SimdAnalysis),
         // so block local state is sound even in programs which contain callx
         state.static_flow = true;
@@ -791,8 +800,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         let op = *op;
         self.simd.stats.vector_instructions += 1;
-        let native_compress = self.simd.vbmi2 || op.subop != VCOMPRESSLT16;
-        if self.simd.avx512 && native_compress && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64) {
+        if self.simd.avx512 && self.simd_avx512_native(&op) && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64) {
             // A slot is cached at one width only
             let (slots, count) = Self::simd_operand_slots(&op);
             for &slot in &slots[..count] {
@@ -822,6 +830,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VTRANSPOSE8 | VTRANSPOSE64 => self.emit_simd_fixed(&op),
             VPERMI2D | VPERMT2D => self.emit_simd_cross(&op),
             VCOMPRESSLT16 => self.emit_simd_compress_scalar(&op),
+            // No AVX2 equivalent (or a missing AVX-512 extension): the reference implementation
+            VSRA64 | VMULLO64 | VMADD52LO | VMADD52HI | VCMP | VBLENDM | VCOMPRESS | VEXPAND => self.emit_simd_fallback(&op),
             VPERMD if op.wide => self.emit_simd_cross(&op),
             VMOVMSK8 if op.wide => self.emit_simd_movmsk_wide(&op),
             _ if op.wide => {
@@ -1161,6 +1171,73 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::permi2d(1, rd, ra, b));
             }
+            VADD64 | VSUB64 | VMULU32 | VSLLV64 | VSRLV64 => {
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let rd = self.simd_destination(op.vd);
+                self.emit_vex(match op.subop {
+                    VADD64 => V::alu(0xd4, rd, ra, b),
+                    VSUB64 => V::alu(0xfb, rd, ra, b),
+                    VMULU32 => V::alu(0xf4, rd, ra, b),
+                    VSLLV64 => V::alu38w(0x47, rd, ra, b),
+                    _ => V::alu38w(0x45, rd, ra, b),
+                });
+            }
+            VSLL64 | VSRL64 | VSRA64 => {
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let rd = self.simd_destination(op.vd);
+                let imm = op.off as u8;
+                match op.subop {
+                    VSLL64 => self.emit_vex(V::psllq(rd, ra, imm)),
+                    VSRL64 => self.emit_vex(V::psrlq(rd, ra, imm)),
+                    _ => self.emit_evex(E::shift_imm_q(1, 0x72, 4, rd, ra, imm)),
+                }
+            }
+            VMULLO64 => {
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let rd = self.simd_destination(op.vd);
+                self.emit_evex(E::alu_q(1, 2, 0x40, rd, ra, b));
+            }
+            VMADD52LO | VMADD52HI => {
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let rd = self.simd_ensure_reg(op.vd);
+                self.simd_pin(rd);
+                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let rd = self.simd_destination(op.vd);
+                self.emit_evex(E::alu_q(1, 2, if op.subop == VMADD52LO { 0xb4 } else { 0xb5 }, rd, ra, b));
+            }
+            VCMP => {
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                self.emit_evex(E::pcmp(1, (op.off >> 4) as u8, op.off & 8 != 0, KMASK, ra, b, (op.off & 7) as u8));
+                self.emit_vex(V::kmovq_to_gpr(REGISTER_MAP[op.dst as usize], KMASK));
+            }
+            VBLENDM => {
+                self.emit_vex(V::kmov_from_gpr(KMASK, REGISTER_MAP[op.src as usize], true));
+                let rb = self.simd_ensure_reg(op.vb);
+                self.simd_pin(rb);
+                let a = if op.va == op.vb { VexRm::Reg(rb) } else { self.simd_source(op.va) };
+                let rd = self.simd_destination(op.vd);
+                self.emit_evex(E::pblendm(1, op.off as u8, rd, rb, a, KMASK));
+            }
+            VCOMPRESS | VEXPAND => {
+                self.emit_vex(V::kmov_from_gpr(KMASK, REGISTER_MAP[op.src as usize], true));
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let rd = self.simd_destination(op.vd);
+                if op.subop == VCOMPRESS {
+                    self.emit_evex(E::pcompress(1, op.off as u8, rd, ra, KMASK));
+                    self.emit_simd_lane_count(op, 32 >> op.off);
+                } else {
+                    self.emit_evex(E::pexpand(1, op.off as u8, rd, ra, KMASK));
+                }
+            }
             VSHUFB => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
@@ -1287,6 +1364,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         match op.subop {
             VBCAST32 | VBCAST64 | VINS64 => ([op.vd, 0, 0], 1),
             VEXT64 | VMOVMSK8 => ([op.va, 0, 0], 1),
+            VCMP => ([op.va, op.vb, 0], 2),
+            VCOMPRESS | VEXPAND | VSLL64 | VSRL64 | VSRA64 => ([op.vd, op.va, 0], 2),
             VMOV | VROR32 | VSHUFD | VSRL32 | VSLL32 => ([op.vd, op.va, 0], 2),
             _ => ([op.vd, op.va, op.vb], 3),
         }
@@ -1474,6 +1553,68 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let zd = self.simd_zdestination(pd);
                 self.emit_evex(if op.subop == VTERNLOG { E::pternlogd(2, zd, za, b, op.off as u8) } else { E::permi2d(2, zd, za, b) });
             }
+            VADD64 | VSUB64 | VMULU32 | VSLLV64 | VSRLV64 | VMULLO64 => {
+                let za = self.simd_zensure(pa);
+                self.simd_zpin(za);
+                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
+                let zd = self.simd_zdestination(pd);
+                let (map, opcode) = match op.subop {
+                    VADD64 => (1, 0xd4),
+                    VSUB64 => (1, 0xfb),
+                    VMULU32 => (1, 0xf4),
+                    VSLLV64 => (2, 0x47),
+                    VSRLV64 => (2, 0x45),
+                    _ => (2, 0x40),
+                };
+                self.emit_evex(E::alu_q(2, map, opcode, zd, za, b));
+            }
+            VSLL64 | VSRL64 | VSRA64 => {
+                let za = self.simd_zensure(pa);
+                self.simd_zpin(za);
+                let zd = self.simd_zdestination(pd);
+                let (opcode, ext) = match op.subop {
+                    VSLL64 => (0x73, 6),
+                    VSRL64 => (0x73, 2),
+                    _ => (0x72, 4),
+                };
+                self.emit_evex(E::shift_imm_q(2, opcode, ext, zd, za, op.off as u8));
+            }
+            VMADD52LO | VMADD52HI => {
+                let za = self.simd_zensure(pa);
+                self.simd_zpin(za);
+                let zd = self.simd_zensure(pd);
+                self.simd_zpin(zd);
+                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
+                let zd = self.simd_zdestination(pd);
+                self.emit_evex(E::alu_q(2, 2, if op.subop == VMADD52LO { 0xb4 } else { 0xb5 }, zd, za, b));
+            }
+            VCMP => {
+                let za = self.simd_zensure(pa);
+                self.simd_zpin(za);
+                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
+                self.emit_evex(E::pcmp(2, (op.off >> 4) as u8, op.off & 8 != 0, KMASK, za, b, (op.off & 7) as u8));
+                self.emit_vex(V::kmovq_to_gpr(REGISTER_MAP[op.dst as usize], KMASK));
+            }
+            VBLENDM => {
+                self.emit_vex(V::kmov_from_gpr(KMASK, REGISTER_MAP[op.src as usize], true));
+                let zb = self.simd_zensure(pb);
+                self.simd_zpin(zb);
+                let a = if pa == pb { VexRm::Reg(zb) } else { self.simd_zsource(pa) };
+                let zd = self.simd_zdestination(pd);
+                self.emit_evex(E::pblendm(2, op.off as u8, zd, zb, a, KMASK));
+            }
+            VCOMPRESS | VEXPAND => {
+                self.emit_vex(V::kmov_from_gpr(KMASK, REGISTER_MAP[op.src as usize], true));
+                let za = self.simd_zensure(pa);
+                self.simd_zpin(za);
+                let zd = self.simd_zdestination(pd);
+                if op.subop == VCOMPRESS {
+                    self.emit_evex(E::pcompress(2, op.off as u8, zd, za, KMASK));
+                    self.emit_simd_lane_count(op, 64 >> op.off);
+                } else {
+                    self.emit_evex(E::pexpand(2, op.off as u8, zd, za, KMASK));
+                }
+            }
             VPERMT2D => {
                 let zidx = self.simd_zensure(pa);
                 self.simd_zpin(zidx);
@@ -1598,5 +1739,61 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         self.emit_ins(X86Instruction::pop(z));
         self.emit_ins(X86Instruction::pop(t));
+    }
+
+    /// Whether the AVX-512 lowering has an instruction for the operation on this host
+    fn simd_avx512_native(&self, op: &VecInsn) -> bool {
+        use crate::simd::*;
+        match op.subop {
+            VCOMPRESSLT16 => self.simd.vbmi2,
+            VCOMPRESS | VEXPAND => op.off >= 2 || self.simd.vbmi2,
+            VMULLO64 => self.simd.dq,
+            VMADD52LO | VMADD52HI => self.simd.ifma,
+            _ => true,
+        }
+    }
+
+    /// `dst = popcnt(src & low lanes)` for a compress over `lanes` lanes
+    fn emit_simd_lane_count(&mut self, op: &VecInsn, lanes: u32) {
+        let (dst, src) = (REGISTER_MAP[op.dst as usize], REGISTER_MAP[op.src as usize]);
+        if lanes == 64 {
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, src, dst));
+        } else {
+            // A 32 bit mov zero extends
+            self.emit_ins(X86Instruction::mov(OperandSize::S32, src, dst));
+            if lanes < 32 {
+                self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, dst, (1i64 << lanes) - 1, None));
+            }
+        }
+        // popcnt r64, r64 (no helper for it in the emitter)
+        let d = dst as u8;
+        self.emit::<u8>(0xf3);
+        self.emit::<u8>(0x48 | if d >= 8 { 0x05 } else { 0 });
+        self.emit::<u8>(0x0f);
+        self.emit::<u8>(0xb8);
+        self.emit::<u8>(0xc0 | (d & 7) << 3 | (d & 7));
+        self.simd.stats.native_instructions += 1;
+    }
+
+    /// Operations without an instruction on this host: one call to the reference implementation
+    /// (the scalar result, if any, comes back in the destination register)
+    fn emit_simd_fallback(&mut self, op: &VecInsn) {
+        // Host calls clobber all vector registers and read and write the vector file in memory
+        self.simd_flush(true);
+        self.simd.stats.intrinsic_slow_paths += 1;
+        let encoded = simd::encode_for_host(op);
+        let scalar = if simd::uses_src(op.subop) { Value::Register(REGISTER_MAP[op.src as usize]) } else { Value::Constant64(0, false) };
+        let dst = simd::writes_dst(op.subop).then(|| REGISTER_MAP[op.dst as usize]);
+        self.emit_rust_call(
+            Value::Constant64(simd::jit_interpret as *const u8 as i64, false),
+            &[
+                // First, the other arguments may overwrite it
+                Argument { index: 2, value: scalar },
+                Argument { index: 1, value: Value::Constant64(encoded as i64, false) },
+                Argument { index: 0, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::SimdVectorBase), false) },
+            ],
+            dst,
+        );
+        self.simd.r11 = R11::Unknown;
     }
 }

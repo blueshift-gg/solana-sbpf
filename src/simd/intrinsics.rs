@@ -72,6 +72,21 @@ pub const NAMES_256: [&str; SUBOP_COUNT as usize] = [
     "sol_avx2_shufb256",
     "sol_avx512_permt2d256",
     "sol_avx512_compresslt16x16",
+    "sol_avx2_add64x4",
+    "sol_avx2_sub64x4",
+    "sol_avx2_sll64x4",
+    "sol_avx2_srl64x4",
+    "sol_avx512_sra64x4",
+    "sol_avx2_sllv64x4",
+    "sol_avx2_srlv64x4",
+    "sol_avx2_mulu32x4",
+    "sol_avx512_mullo64x4",
+    "sol_avx512_madd52lo64x4",
+    "sol_avx512_madd52hi64x4",
+    "sol_avx512_cmp256",
+    "sol_avx512_blendm256",
+    "sol_avx512_compress256",
+    "sol_avx512_expand256",
 ];
 
 /// Function names of the 512 bit forms (slot pairs, AVX-512F/BW), indexed by sub-operation
@@ -116,6 +131,21 @@ pub const NAMES_512: [Option<&str>; SUBOP_COUNT as usize] = [
     Some("sol_avx512_shufb512"),
     Some("sol_avx512_permt2d512"),
     Some("sol_avx512_compresslt16x32"),
+    Some("sol_avx512_add64x8"),
+    Some("sol_avx512_sub64x8"),
+    Some("sol_avx512_sll64x8"),
+    Some("sol_avx512_srl64x8"),
+    Some("sol_avx512_sra64x8"),
+    Some("sol_avx512_sllv64x8"),
+    Some("sol_avx512_srlv64x8"),
+    Some("sol_avx512_mulu32x8"),
+    Some("sol_avx512_mullo64x8"),
+    Some("sol_avx512_madd52lo64x8"),
+    Some("sol_avx512_madd52hi64x8"),
+    Some("sol_avx512_cmp512"),
+    Some("sol_avx512_blendm512"),
+    Some("sol_avx512_compress512"),
+    Some("sol_avx512_expand512"),
 ];
 
 /// Register holding the packed operands
@@ -162,7 +192,10 @@ pub fn hashes() -> Vec<(u32, u8, bool)> {
 /// ext64                  bits 0..7 va   bits 8..9 lane
 /// movmsk8                bits 0..7 va
 /// two sources            bits 0..7 vd   bits 8..15 va   bits 16..23 vb   (also permi2d)
-/// one source + imm8      bits 0..7 vd   bits 8..15 va   bits 16..23 imm8   (ror, shufd, srl, sll)
+/// one source + imm8      bits 0..7 vd   bits 8..15 va   bits 16..23 imm8   (ror, shufd, shifts)
+/// cmp                    bits 0..7 va   bits 8..15 vb   bits 16..23 imm8 (predicate, signedness, lane size)
+/// blendm                 bits 0..7 vd   bits 8..15 va   bits 16..23 vb   bits 24..25 lane size (mask in r2)
+/// compress / expand      bits 0..7 vd   bits 8..15 va   bits 16..17 lane size (mask in r2)
 /// mov                    bits 0..7 vd   bits 8..15 va
 /// blendd / blendw /      bits 0..6 vd   bits 7..13 va   bits 14..20 vb   bits 21..28 imm8 (slots < 128)
 /// ternlog
@@ -176,7 +209,10 @@ pub fn pack(op: &VecInsn) -> u64 {
         VINS64 => vd | imm << 8,
         VEXT64 => va | imm << 8,
         VMOVMSK8 => va,
-        VROR32 | VSHUFD | VSRL32 | VSLL32 => vd | va << 8 | (imm & 0xff) << 16,
+        VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 => vd | va << 8 | (imm & 0xff) << 16,
+        VCMP => va | vb << 8 | (imm & 0xff) << 16,
+        VBLENDM => vd | va << 8 | vb << 16 | (imm & 3) << 24,
+        VCOMPRESS | VEXPAND => vd | va << 8 | (imm & 3) << 16,
         VBLENDD | VBLENDW | VTERNLOG => (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21,
         VMOV => vd | va << 8,
         _ => vd | va << 8 | vb << 16,
@@ -197,7 +233,10 @@ pub fn unpack(subop: u8, wide: bool, packed: u64) -> Option<VecInsn> {
         VINS64 => (vd, off) = (byte(0), byte(8) as i16),
         VEXT64 => (va, off) = (byte(0), byte(8) as i16),
         VMOVMSK8 => va = byte(0),
-        VROR32 | VSHUFD | VSRL32 | VSLL32 => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
+        VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
+        VCMP => (va, vb, off) = (byte(0), byte(8), byte(16) as i16),
+        VBLENDM => (vd, va, vb, off) = (byte(0), byte(8), byte(16), byte(24) as i16),
+        VCOMPRESS | VEXPAND => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
         VBLENDD | VBLENDW | VTERNLOG => {
             let field = |shift: u32| ((packed >> shift) & 0x7f) as u8;
             (vd, va, vb, off) = (field(0), field(7), field(14), byte(21) as i16);
@@ -273,8 +312,8 @@ pub fn register<C: ContextObject>(loader: &mut BuiltinProgram<C>) -> Result<(), 
         };
     }
     register!(false: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39);
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54);
     register!(true: 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-        32, 33, 34, 35, 36, 37, 38, 39);
+        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54);
     Ok(())
 }

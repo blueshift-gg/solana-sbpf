@@ -308,6 +308,50 @@ fn op_cases() -> Vec<(&'static str, Body)> {
             a.vadd(1, 1, 0); // the result used by a cached op
         })));
     }
+    for wide in [false, true] {
+        // Rosetta 2 shifts by the low bits of a 64 bit count in vpsllvq / vpsrlvq instead of giving 0
+        // for counts above 63, so there the variable counts stay in range
+        let in_range = solana_sbpf::simd::harness::running_under_rosetta();
+        cases.push(("int64", Box::new(move |a| {
+            use solana_sbpf::simd::*;
+            let (d, x, y) = if wide { (0, 2, 4) } else { (0, 1, 2) };
+            a.vsrl(14, 14, 26); // small shift counts
+            if in_range {
+                a.mov64_imm(3, 63);
+                a.vbcast64(13, 3);
+                a.vand(14, 14, 13);
+                a.vand(y, y, 13);
+                if wide {
+                    a.vand(y + 1, y + 1, 13);
+                }
+            }
+            for subop in [VADD64, VSUB64, VSLLV64, VSRLV64, VMULU32, VMULLO64] {
+                a.vop_full(subop, wide, d, x, y, 0, 0, 0);
+                a.vop_full(subop, wide, 6, 6, 14, 0, 0, 0);
+            }
+            for (subop, n) in [(VSLL64, 13), (VSRL64, 63), (VSRA64, 7), (VSRA64, 0)] {
+                a.vop_full(subop, wide, 8, x, 0, 0, 0, n);
+            }
+            a.vop_full(VMADD52LO, wide, 10, x, y, 0, 0, 0);
+            a.vop_full(VMADD52HI, wide, 12, 12, y, 0, 0, 0);
+        })));
+        cases.push(("masks", Box::new(move |a| {
+            use solana_sbpf::simd::*;
+            for size in 0..4i16 {
+                for (k, pred) in [(0, 1i16), (1, 6), (2, 0 | 8), (3, 2 | 8), (4, 4)].iter() {
+                    a.vop_full(VCMP, wide, 0, 2, 4, 6, 0, pred | size << 4);
+                    a.vins64(15, 6, (*k % 4) as i16);
+                }
+                a.lddw(3, 0xa5c3_0ff0_6996_1248);
+                a.vop_full(VBLENDM, wide, 8, 2, 4, 0, 3, size);
+                a.vop_full(VCOMPRESS, wide, 10, 2, 0, 7, 3, size);
+                a.vins64(14, 7, size);
+                a.vop_full(VEXPAND, wide, 12, 2, 0, 0, 3, size);
+                a.vop_full(VCOMPRESS, wide, 4, 4, 0, 7, 3, size); // in place
+                a.vop_full(VBLENDM, wide, 2, 2, 2, 0, 3, size);
+            }
+        })));
+    }
     cases.push(("wide_bcast", Box::new(|a| {
         a.lddw(3, 0x8765_4321_0fed_cba9);
         a.wide(solana_sbpf::simd::VBCAST32, 2, 0, 0, 3, 0);
@@ -658,6 +702,86 @@ fn wide_ops_reference() {
         let idx = (lane32(&input, 32 + i) & 31) as usize;
         let expected = if idx < 16 { lane32(&input, idx) } else { lane32(&input, 16 + idx - 16) };
         assert_eq!(lane32(&out, i), expected, "vpermt2d512 lane {i}");
+    }
+    // 64 bit arithmetic and mask operations against the model
+    let q = |buf: &[u8], i: usize| u64::from_le_bytes(buf[8 * i..8 * i + 8].try_into().unwrap());
+    for wide in [false, true] {
+        let lanes = if wide { 8 } else { 4 };
+        let arith: [(u8, i16, fn(u64, u64, u32) -> u64); 11] = [
+            (simd::VADD64, 0, |x, y, _| x.wrapping_add(y)),
+            (simd::VSUB64, 0, |x, y, _| x.wrapping_sub(y)),
+            (simd::VSLL64, 13, |x, _, n| x << n),
+            (simd::VSRL64, 63, |x, _, n| x >> n),
+            (simd::VSRA64, 9, |x, _, n| ((x as i64) >> n) as u64),
+            (simd::VSLLV64, 0, |x, y, _| if y > 63 { 0 } else { x << y }),
+            (simd::VSRLV64, 0, |x, y, _| if y > 63 { 0 } else { x >> y }),
+            (simd::VMULU32, 0, |x, y, _| (x as u32 as u64) * (y as u32 as u64)),
+            (simd::VMULLO64, 0, |x, y, _| x.wrapping_mul(y)),
+            (simd::VMADD52LO, 0, |x, y, _| ((x & ((1 << 52) - 1)) as u128 * (y & ((1 << 52) - 1)) as u128) as u64 & ((1 << 52) - 1)),
+            (simd::VMADD52HI, 0, |x, y, _| (((x & ((1 << 52) - 1)) as u128 * (y & ((1 << 52) - 1)) as u128) >> 52) as u64),
+        ];
+        for (subop, off, f) in arith {
+            let body = move |a: &mut Asm| {
+                a.vand(4, 4, 6); // shift counts: lanes of v4 / v5 & v6 / v7 (random, often > 63; the
+                                 // interpreter only, Rosetta 2 gets vpsllvq wrong for those)
+                a.vand(5, 5, 7);
+                a.vop_full(subop, wide, 8, 0, 4, 0, 0, off);
+            };
+            let (out, _) = run_op(&op_program(VecMode::Slot, &body), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+            for i in 0..lanes {
+                let (x, y) = (q(&input, i), q(&input, 16 + i) & q(&input, 24 + i));
+                let acc = if matches!(subop, simd::VMADD52LO | simd::VMADD52HI) { q(&input, 32 + i) } else { 0 };
+                assert_eq!(q(&out, 32 + i), acc.wrapping_add(f(x, y, off as u32)), "{} lane {i}", simd::mnemonic(subop, wide));
+            }
+        }
+        for size in 0..4u32 {
+            let bytes = 1usize << size;
+            let n = 32 * (1 + wide as usize) / bytes;
+            let lane = |buf: &[u8], first: usize, i: usize| (0..bytes).fold(0u64, |v, k| v | (buf[first + bytes * i + k] as u64) << (8 * k));
+            let signed = |v: u64| ((v << (64 - 8 * bytes)) as i64) >> (64 - 8 * bytes);
+            let mask_in = 0xa5c3_0ff0_6996_1248u64;
+            for pred in 0..16i16 {
+                let body = move |a: &mut Asm| {
+                    a.vmov(4, 2); // equal lanes in some places
+                    a.vblendd(4, 4, 6, 0x5a);
+                    a.vop_full(simd::VCMP, wide, 0, 0, 4, 6, 0, pred | (size as i16) << 4);
+                    a.vins64(15, 6, 0);
+                };
+                let (out, _) = run_op(&op_program(VecMode::Slot, &body), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+                let mut b_src = input[4 * 32..4 * 32 + 32 * (1 + wide as usize)].to_vec();
+                // v4 = blend(v2, v6, 0x5a) on the low slot, v5 untouched
+                for l in 0..8 {
+                    let from = if (0x5a >> l) & 1 != 0 { 6 * 32 } else { 2 * 32 };
+                    b_src[4 * l..4 * l + 4].copy_from_slice(&input[from + 4 * l..from + 4 * l + 4]);
+                }
+                let mut mask = 0u64;
+                for i in 0..n {
+                    let (x, y) = (lane(&input, 0, i), lane(&b_src, 0, i));
+                    let ord = if pred & 8 != 0 { x.cmp(&y) } else { signed(x).cmp(&signed(y)) };
+                    let t = [ord.is_eq(), ord.is_lt(), ord.is_le(), false, ord.is_ne(), ord.is_ge(), ord.is_gt(), true][(pred & 7) as usize];
+                    mask |= (t as u64) << i;
+                }
+                assert_eq!(q(&out, 60), mask, "cmp size {size} pred {pred} wide {wide}");
+            }
+            let body = move |a: &mut Asm| {
+                a.lddw(3, mask_in);
+                a.vop_full(simd::VBLENDM, wide, 8, 0, 4, 0, 3, size as i16);
+                a.vop_full(simd::VCOMPRESS, wide, 10, 0, 0, 6, 3, size as i16);
+                a.vins64(15, 6, 0);
+                a.vop_full(simd::VEXPAND, wide, 12, 0, 0, 0, 3, size as i16);
+            };
+            let (out, _) = run_op(&op_program(VecMode::Slot, &body), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+            let bit = |i: usize| (mask_in >> i) & 1 != 0;
+            let kept: Vec<u64> = (0..n).filter(|&i| bit(i)).map(|i| lane(&input, 0, i)).collect();
+            let mut k = 0;
+            for i in 0..n {
+                assert_eq!(lane(&out, 8 * 32, i), if bit(i) { lane(&input, 0, i) } else { lane(&input, 4 * 32, i) }, "blendm");
+                assert_eq!(lane(&out, 10 * 32, i), kept.get(i).copied().unwrap_or(0), "compress");
+                let e = if bit(i) { k += 1; lane(&input, 0, k - 1) } else { 0 };
+                assert_eq!(lane(&out, 12 * 32, i), e, "expand size {size} wide {wide} lane {i}");
+            }
+            assert_eq!(q(&out, 60), kept.len() as u64, "compress count");
+        }
     }
     // vpermi2d256 against the model
     let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.vpermi2d(0, 4, 5, false)), &input, Engine::Interpreter, SimdJitStrategy::Direct);
@@ -1066,8 +1190,12 @@ fn arithmetic_ops_and_high_slots() {
     a.vsllv(135, 200, 150);
     a.vsrlv(136, 255, 150);
     a.vandn(137, 200, 255);
+    // Operations which may take the host fallback, on slots beyond 63
+    a.vop_full(solana_sbpf::simd::VMADD52HI, false, 138, 200, 255, 0, 0, 0);
+    a.vop_full(solana_sbpf::simd::VCMP, false, 0, 200, 255, 0, 0, 0x21);
+    a.vins64(139, 0, 1);
     a.lddw(2, ebpf::MM_HEAP_START);
-    for (i, slot) in [130u8, 131, 132, 133, 134, 247, 135, 136, 137].iter().enumerate() {
+    for (i, slot) in [130u8, 131, 132, 133, 134, 247, 135, 136, 137, 138, 139].iter().enumerate() {
         a.vstore(2, 32 * i as i16, *slot);
     }
     a.mov64_imm(0, 0);
@@ -1085,8 +1213,17 @@ fn arithmetic_ops_and_high_slots() {
         assert_eq!(out(7)[l], y[l] >> 13);
         assert_eq!(out(8)[l], !x[l] & y[l]);
     }
-    // vtranspose8 v240..v247: v247 lane 0 is v240 lane 7, which is zero (the region starts zeroed)
+    // vtranspose8 v240..v247: v247 lane 0 is v240 lane 7, which is zero (the file starts zeroed)
     assert_eq!(out(5), [0; 8]);
+    let q = |i: usize, l: usize| out(i)[2 * l] as u64 | (out(i)[2 * l + 1] as u64) << 32;
+    let xq = |l: usize| x[2 * l] as u64 | (x[2 * l + 1] as u64) << 32;
+    let yq = |l: usize| y[2 * l] as u64 | (y[2 * l + 1] as u64) << 32;
+    let m52 = (1u64 << 52) - 1;
+    for l in 0..4 {
+        assert_eq!(q(9, l), (((xq(l) & m52) as u128 * (yq(l) & m52) as u128) >> 52) as u64);
+    }
+    let lt: u64 = (0..8).filter(|&l| (x[l] as i32) < (y[l] as i32)).map(|l| 1 << l).sum();
+    assert_eq!(q(10, 1), lt);
 }
 
 /// callx may enter functions but not the middle of a run of vector code (where the JIT keeps vector
@@ -1237,3 +1374,4 @@ fn avx512_lowering() {
         }
     }
 }
+

@@ -80,12 +80,32 @@ is the 256 bit operation on both halves unless noted. The intrinsic name (next s
 | 0x24 | `sol_avx2_transpose4x4q` | `sol_avx512_transpose8x8q` | u64 matrix: rows `vd..vd + 4` / pairs `vd, vd + 2, .., vd + 14` | 8 / 32 instructions / 24 zmm instructions |
 | 0x25 | `sol_avx2_shufb256` | `sol_avx512_shufb512` | byte shuffle per 128 bit lane (index bit 7 zeroes) | `vpshufb` |
 | 0x26 | `sol_avx512_permt2d256` | `sol_avx512_permt2d512` | `v[d][i] = (v[d] ++ v[b])[v[a][i] & (2 L - 1)]` (first table overwritten, index kept) | 4 / 9 instructions per half / `vpermt2d` |
+| 0x28, 0x29 | `sol_avx2_add64x4`, `sub64x4` | `sol_avx512_add64x8`, `sub64x8` | wrapping u64 add / sub | `vpaddq`, `vpsubq` |
+| 0x2a..0x2c | `sol_avx2_sll64x4`, `srl64x4`, `sol_avx512_sra64x4` | `..64x8` | u64 shift by imm (0..64), arithmetic right | `vpsllq`, `vpsrlq` / `vpsraq` |
+| 0x2d, 0x2e | `sol_avx2_sllv64x4`, `srlv64x4` | `..64x8` | per lane u64 shift, 0 above 63 | `vpsllvq`, `vpsrlvq` |
+| 0x2f | `sol_avx2_mulu32x4` | `sol_avx512_mulu32x8` | `u32 x u32 -> u64` of the low halves | `vpmuludq` |
+| 0x30 | `sol_avx512_mullo64x4` | `sol_avx512_mullo64x8` | low 64 bits of u64 products | `vpmullq` (DQ) |
+| 0x31, 0x32 | `sol_avx512_madd52lo64x4`, `madd52hi64x4` | `..64x8` | `d += lo / hi 52 bits of lo52(a) * lo52(b)` | `vpmadd52luq` / `huq` (IFMA) |
+| 0x33 | `sol_avx512_cmp256` | `sol_avx512_cmp512` | lane mask of `pred(a, b)` in `dst` / r0; `off`: predicate (vpcmp encoding), bit 3 unsigned, bits 4..5 lane size | `vpcmp*` + `kmovq` |
+| 0x34 | `sol_avx512_blendm256` | `sol_avx512_blendm512` | `d = mask ? a : b`, mask in `src` / r2, lane size in `off` | `kmovq` + `vpblendm*` |
+| 0x35 | `sol_avx512_compress256` | `sol_avx512_compress512` | masked lanes of `a` packed (rest 0), count in `dst` / r0 | `kmovq` + `vpcompress*` + `popcnt` (8 / 16 bit lanes: VBMI2) |
+| 0x36 | `sol_avx512_expand256` | `sol_avx512_expand512` | low lanes of `a` spread to the mask bits (rest 0) | `kmovq` + `vpexpand*` |
 | 0x27 | `sol_avx512_compresslt16x16` | `sol_avx512_compresslt16x32` | u16 lanes of `a` below those of `b`, in order, packed into `d` (rest 0); count in `dst` / r0 | branchless scalar loop over the vector file / `vpcmpuw` + `vpcompressw` (VBMI2) + `kmovd` + `popcnt` |
 
 The BLAKE3 work needed the first 13; the rest came with the Falcon verifier (16 bit NTT arithmetic,
 Keccak on 64 bit lanes, vectorized rejection sampling) and the private vector file (lane moves).
 `compresslt16` needs AVX512_VBMI2 for its native form (Ice Lake, Zen 4 and later); on other hosts the
 JIT emits a branchless loop of 5 scalar instructions per lane.
+
+Masks are scalar bitmasks (bit `i` = lane `i`) passed in `src` / r2 and returned in `dst` / r0, so mask
+logic is ordinary scalar ALU code and there is no mask register file in the VM. Operations without a
+native lowering on the host (`sra64`, `mullo64`, `madd52*`, the mask operations without AVX-512, and
+those whose AVX-512 extension is missing: DQ, IFMA, VBMI2 for 8 / 16 bit compress / expand) run the
+reference implementation through one host call (counted as `intrinsic_slow_paths`): correct
+everywhere, slow without the extension.
+
+Rosetta 2 gets `vpsllvq` / `vpsrlvq` wrong for counts above 63 whose low bits are small (it shifts by
+the low bits instead of returning 0); the tests keep those counts in range when running under it.
 
 ## Intrinsic call form (SIMD-0645 style, no new opcode)
 
@@ -98,7 +118,7 @@ mov64 r1, <packed operands>       ; compile time constant
 call  sol_avx2_add32x8            ; CALL_IMM, src = 0, imm = murmur32("sol_avx2_add32x8")
 ```
 
-* **Encoding:** one static call identifier per operation and width (73 of them, the names in the
+* **Encoding:** one static call identifier per operation and width (103 of them, the names in the
   table above). `dst`, `src` and `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF.
   The names say which ISA level each operation maps to: `sol_avx_` (moves), `sol_avx2_` (AVX2
   integer operations) and `sol_avx512_` (AVX-512 operations, and every 512 bit form). Every

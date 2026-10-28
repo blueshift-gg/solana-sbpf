@@ -927,6 +927,14 @@ impl VexInstruction {
     pub const fn alu38w(opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
         Self { w: true, ..Self::ymm(1, 2, opcode, dst, src1, src2, None) }
     }
+    /// vpsllq ymm, ymm, imm8
+    pub const fn psllq(dst: u8, src: u8, imm: u8) -> Self {
+        Self::ymm(1, 1, 0x73, 6, dst, VexRm::Reg(src), Some(imm))
+    }
+    /// kmovd k, r32 / kmovq k, r64
+    pub const fn kmov_from_gpr(k: u8, src: X86Register, q: bool) -> Self {
+        Self { pp: 3, map: 1, w: q, l: false, opcode: 0x92, reg: k, vvvv: 0, rm: VexRm::Reg(src as u8), imm: None }
+    }
     /// vpsrlq ymm, ymm, imm8
     pub const fn psrlq(dst: u8, src: u8, imm: u8) -> Self {
         Self::ymm(1, 1, 0x73, 2, dst, VexRm::Reg(src), Some(imm))
@@ -1199,6 +1207,30 @@ impl EvexInstruction {
     pub const fn pcompressw(vl: u8, dst: u8, src: u8, k: u8) -> Self {
         Self { mask: k, zero: true, ..Self::op(1, 2, true, vl, 0x63, src, 0, VexRm::Reg(dst), None) }
     }
+    /// Quadword shift by an immediate: opcode 0x73 /6 vpsllq, 0x73 /2 vpsrlq, 0x72 /4 vpsraq
+    pub const fn shift_imm_q(vl: u8, opcode: u8, ext: u8, dst: u8, src: u8, imm: u8) -> Self {
+        Self::op(1, 1, true, vl, opcode, ext, dst, VexRm::Reg(src), Some(imm))
+    }
+    /// vpcmp{b,w,d,q} / vpcmpu* k, src1, src2, predicate for lanes of `1 << size` bytes
+    pub const fn pcmp(vl: u8, size: u8, unsigned: bool, k: u8, src1: u8, src2: VexRm, predicate: u8) -> Self {
+        let opcode = if size < 2 { 0x3e } else { 0x1e } | !unsigned as u8;
+        Self::op(1, 3, size & 1 != 0, vl, opcode, k, src1, src2, Some(predicate))
+    }
+    /// vpblendm{b,w,d,q} dst {k}, src1, src2: `k ? src2 : src1`
+    pub const fn pblendm(vl: u8, size: u8, dst: u8, src1: u8, src2: VexRm, k: u8) -> Self {
+        let opcode = if size < 2 { 0x66 } else { 0x64 };
+        Self { mask: k, ..Self::op(1, 2, size & 1 != 0, vl, opcode, dst, src1, src2, None) }
+    }
+    /// vpcompress{b,w,d,q} dst {k}{z}, src (b / w: VBMI2)
+    pub const fn pcompress(vl: u8, size: u8, dst: u8, src: u8, k: u8) -> Self {
+        let opcode = if size < 2 { 0x63 } else { 0x8b };
+        Self { mask: k, zero: true, ..Self::op(1, 2, size & 1 != 0, vl, opcode, src, 0, VexRm::Reg(dst), None) }
+    }
+    /// vpexpand{b,w,d,q} dst {k}{z}, src (b / w: VBMI2)
+    pub const fn pexpand(vl: u8, size: u8, dst: u8, src: u8, k: u8) -> Self {
+        let opcode = if size < 2 { 0x62 } else { 0x89 };
+        Self { mask: k, zero: true, ..Self::op(1, 2, size & 1 != 0, vl, opcode, dst, 0, VexRm::Reg(src), None) }
+    }
     /// vpmovb2m k, zmm (byte sign bits)
     pub const fn pmovb2m(k: u8, src: u8) -> Self {
         Self::op(2, 2, false, 2, 0x29, k, 0, VexRm::Reg(src), None)
@@ -1308,6 +1340,28 @@ mod evex_tests {
             (E::pcmpuw(1, 1, 3, r(4), 1), "62 f3 e5 28 3e cc 01"),     // vpcmpltuw k1, ymm3, ymm4
             (E::pcompressw(2, 18, 16, 1), "62 a2 fd c9 63 c2"),        // vpcompressw zmm18 {k1} {z}, zmm16
             (E::pcompressw(1, 2, 3, 1), "62 f2 fd a9 63 da"),          // vpcompressw ymm2 {k1} {z}, ymm3
+            (E::alu_q(2, 1, 0xd4, 16, 17, r(18)), "62 a1 f5 40 d4 c2"), // vpaddq zmm16, zmm17, zmm18
+            (E::alu_q(2, 1, 0xf4, 16, 17, r(18)), "62 a1 f5 40 f4 c2"), // vpmuludq zmm16, zmm17, zmm18
+            (E::alu_q(2, 2, 0x40, 16, 17, r(18)), "62 a2 f5 40 40 c2"), // vpmullq zmm16, zmm17, zmm18
+            (E::alu_q(1, 2, 0x40, 1, 2, r(3)), "62 f2 ed 28 40 cb"),   // vpmullq ymm1, ymm2, ymm3
+            (E::alu_q(2, 2, 0xb4, 16, 17, r(18)), "62 a2 f5 40 b4 c2"), // vpmadd52luq zmm16, zmm17, zmm18
+            (E::alu_q(2, 2, 0xb5, 16, 17, r(18)), "62 a2 f5 40 b5 c2"), // vpmadd52huq zmm16, zmm17, zmm18
+            (E::shift_imm_q(2, 0x73, 6, 16, 17, 5), "62 b1 fd 40 73 f1 05"), // vpsllq zmm16, zmm17, 5
+            (E::shift_imm_q(2, 0x73, 2, 16, 17, 5), "62 b1 fd 40 73 d1 05"), // vpsrlq zmm16, zmm17, 5
+            (E::shift_imm_q(2, 0x72, 4, 16, 17, 5), "62 b1 fd 40 72 e1 05"), // vpsraq zmm16, zmm17, 5
+            (E::shift_imm_q(1, 0x72, 4, 1, 2, 63), "62 f1 f5 28 72 e2 3f"),  // vpsraq ymm1, ymm2, 63
+            (E::pcmp(2, 0, false, 1, 16, r(17), 6), "62 b3 7d 40 3f c9 06"), // vpcmpnleb k1, zmm16, zmm17
+            (E::pcmp(2, 0, true, 1, 16, r(17), 1), "62 b3 7d 40 3e c9 01"),  // vpcmpltub k1, zmm16, zmm17
+            (E::pcmp(2, 1, false, 1, 16, r(17), 0), "62 b3 fd 40 3f c9 00"), // vpcmpeqw k1, zmm16, zmm17
+            (E::pcmp(2, 2, false, 1, 16, r(17), 2), "62 b3 7d 40 1f c9 02"), // vpcmpled k1, zmm16, zmm17
+            (E::pcmp(1, 3, true, 1, 3, r(4), 4), "62 f3 e5 28 1e cc 04"),    // vpcmpnequq k1, ymm3, ymm4
+            (E::pblendm(2, 0, 16, 17, r(18), 1), "62 a2 75 41 66 c2"),  // vpblendmb zmm16 {k1}, zmm17, zmm18
+            (E::pblendm(2, 3, 16, 17, r(18), 1), "62 a2 f5 41 64 c2"),  // vpblendmq zmm16 {k1}, zmm17, zmm18
+            (E::pcompress(2, 0, 18, 16, 1), "62 a2 7d c9 63 c2"),      // vpcompressb zmm18 {k1} {z}, zmm16
+            (E::pcompress(2, 2, 18, 16, 1), "62 a2 7d c9 8b c2"),      // vpcompressd zmm18 {k1} {z}, zmm16
+            (E::pcompress(1, 3, 2, 3, 1), "62 f2 fd a9 8b da"),        // vpcompressq ymm2 {k1} {z}, ymm3
+            (E::pexpand(2, 1, 18, 16, 1), "62 a2 fd c9 62 d0"),        // vpexpandw zmm18 {k1} {z}, zmm16
+            (E::pexpand(2, 2, 18, 16, 1), "62 a2 7d c9 89 d0"),        // vpexpandd zmm18 {k1} {z}, zmm16
         ];
         for (insn, expected) in cases {
             let (bytes, len) = insn.encode();
@@ -1317,6 +1371,11 @@ mod evex_tests {
             (V::kmovq_to_gpr(R8, 1), "c4 61 fb 93 c1"),                // kmovq r8, k1
             (V::kmovd_to_gpr(RAX, 1), "c5 fb 93 c1"),                  // kmovd eax, k1
             (V::kmovd_to_gpr(R14, 1), "c5 7b 93 f1"),                  // kmovd r14d, k1
+            (V::kmov_from_gpr(1, RDX, false), "c5 fb 92 ca"),          // kmovd k1, edx
+            (V::kmov_from_gpr(1, R9, true), "c4 c1 fb 92 c9"),         // kmovq k1, r9
+            (V::psllq(1, 2, 7), "c5 f5 73 f2 07"),                     // vpsllq ymm1, ymm2, 7
+            (V::alu(0xd4, 1, 2, VexRm::Reg(3)), "c5 ed d4 cb"),        // vpaddq ymm1, ymm2, ymm3
+            (V::alu(0xf4, 1, 2, VexRm::Reg(3)), "c5 ed f4 cb"),        // vpmuludq ymm1, ymm2, ymm3
             (V::movq_from_gpr(15, R9), "c4 41 f9 6e f9"),              // vmovq xmm15, r9
             (V::movq_to_gpr(RAX, 3), "c4 e1 f9 7e d8"),                // vmovq rax, xmm3
             (V::pextrq(R10, 15, 1), "c4 43 f9 16 fa 01"),              // vpextrq r10, xmm15, 1

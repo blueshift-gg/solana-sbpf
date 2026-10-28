@@ -129,8 +129,42 @@ pub const VPERMT2D: u8 = 0x26;
 /// The u16 lanes `i` of `v[va]` with `v[va][i] < v[vb][i]` (unsigned), in order, packed into the
 /// low lanes of `v[vd]` (the others zero); `r[dst]` = their number (vpcmpuw + vpcompressw)
 pub const VCOMPRESSLT16: u8 = 0x27;
+/// `v[vd].u64[i] = v[va].u64[i] + v[vb].u64[i]` (wrapping)
+pub const VADD64: u8 = 0x28;
+/// `v[vd].u64[i] = v[va].u64[i] - v[vb].u64[i]` (wrapping)
+pub const VSUB64: u8 = 0x29;
+/// `v[vd].u64[i] = v[va].u64[i] << off` (`off` in 0..64)
+pub const VSLL64: u8 = 0x2a;
+/// `v[vd].u64[i] = v[va].u64[i] >> off` (logical, `off` in 0..64)
+pub const VSRL64: u8 = 0x2b;
+/// `v[vd].i64[i] = v[va].i64[i] >> off` (arithmetic, `off` in 0..64)
+pub const VSRA64: u8 = 0x2c;
+/// `v[vd].u64[i] = v[va].u64[i] << v[vb].u64[i]` (0 for counts above 63)
+pub const VSLLV64: u8 = 0x2d;
+/// `v[vd].u64[i] = v[va].u64[i] >> v[vb].u64[i]` (0 for counts above 63)
+pub const VSRLV64: u8 = 0x2e;
+/// `v[vd].u64[i] = (v[va].u64[i] as u32) * (v[vb].u64[i] as u32)` (full 64 bit products, vpmuludq)
+pub const VMULU32: u8 = 0x2f;
+/// `v[vd].u64[i] = v[va].u64[i] * v[vb].u64[i]` (low 64 bits, vpmullq)
+pub const VMULLO64: u8 = 0x30;
+/// `v[vd].u64[i] += (lo52(a) * lo52(b)) mod 2^52` for the low 52 bits of the u64 lanes (vpmadd52luq)
+pub const VMADD52LO: u8 = 0x31;
+/// `v[vd].u64[i] += (lo52(a) * lo52(b)) >> 52` (vpmadd52huq)
+pub const VMADD52HI: u8 = 0x32;
+/// `r[dst]` = bit `i` set if `pred(v[va][i], v[vb][i])` for the lanes of size `8 << (off >> 4)` bits;
+/// `off & 7` is the predicate (0 eq, 1 lt, 2 le, 3 false, 4 ne, 5 ge, 6 gt, 7 true, as vpcmp),
+/// `off & 8` unsigned (vpcmp{b,w,d,q} / vpcmpu*)
+pub const VCMP: u8 = 0x33;
+/// `v[vd][i] = r[src] bit i ? v[va][i] : v[vb][i]` for lanes of `8 << off` bits (vpblendm*)
+pub const VBLENDM: u8 = 0x34;
+/// The lanes `i` of `v[va]` with `r[src]` bit `i` set, in order, packed into the low lanes of `v[vd]`
+/// (the others zero); `r[dst]` = their number. Lanes of `8 << off` bits (vpcompress*)
+pub const VCOMPRESS: u8 = 0x35;
+/// `v[vd][i] = r[src] bit i ? v[va][k++] : 0` (the low lanes of `v[va]` spread to the set bits),
+/// lanes of `8 << off` bits (vpexpand*)
+pub const VEXPAND: u8 = 0x36;
 /// Number of defined sub-operations
-pub const SUBOP_COUNT: u8 = 0x28;
+pub const SUBOP_COUNT: u8 = 0x37;
 
 /// 512 bit flag in the immediate
 pub const WIDE: u32 = 1 << 24;
@@ -168,12 +202,12 @@ pub fn has_wide_form(subop: u8) -> bool {
 
 /// Sub-operations which read the scalar source register
 pub fn uses_src(subop: u8) -> bool {
-    matches!(subop, VLOAD | VSTORE | VBCAST32 | VBCAST64 | VINS64)
+    matches!(subop, VLOAD | VSTORE | VBCAST32 | VBCAST64 | VINS64 | VBLENDM | VCOMPRESS | VEXPAND)
 }
 
 /// Sub-operations which write the scalar destination register
 pub fn writes_dst(subop: u8) -> bool {
-    matches!(subop, VEXT64 | VMOVMSK8 | VCOMPRESSLT16)
+    matches!(subop, VEXT64 | VMOVMSK8 | VCOMPRESSLT16 | VCMP | VCOMPRESS)
 }
 
 /// Operand validation shared by the opcode form and the intrinsic call form
@@ -189,6 +223,9 @@ pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
         VROR32 | VSRL32 | VSLL32 => (0..32).contains(&op.off),
         VSHUFD | VBLENDD | VTERNLOG | VBLENDW => (0..256).contains(&op.off),
         VINS64 | VEXT64 => (0..4).contains(&op.off),
+        VSLL64 | VSRL64 | VSRA64 => (0..64).contains(&op.off),
+        VCMP => (0..64).contains(&op.off),
+        VBLENDM | VCOMPRESS | VEXPAND => (0..4).contains(&op.off),
         _ => op.off == 0,
     };
     if !off_ok {
@@ -291,6 +328,31 @@ pub fn transfer(
         }
     }
     Ok(())
+}
+
+/// Packs an operation for [jit_interpret]: 8 bit slots (the intrinsic form reaches all 256),
+/// sub-operation, width and offset
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+pub(crate) fn encode_for_host(op: &VecInsn) -> u64 {
+    op.vd as u64 | (op.va as u64) << 8 | (op.vb as u64) << 16 | (op.subop as u64) << 24 | (op.wide as u64) << 31
+        | (op.off as u16 as u64) << 32
+}
+
+/// Entry point of the JIT for operations without a native lowering on the host (no memory access,
+/// so no errors): runs the reference implementation, returns the scalar result
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_interpret(vector_base: *mut u8, encoded: u64, scalar: u64) -> u64 {
+    let op = VecInsn {
+        vd: encoded as u8,
+        va: (encoded >> 8) as u8,
+        vb: (encoded >> 16) as u8,
+        subop: (encoded >> 24) as u8 & 63,
+        wide: (encoded >> 31) & 1 != 0,
+        dst: 0,
+        src: 1,
+        off: (encoded >> 32) as u16 as i16,
+    };
+    interpret_registers(&op, &[0, scalar], vector_base).unwrap_or(0)
 }
 
 /// Entry point of the JIT for [transfer]: `spec` = `store | slot << 8 | slots << 16`
@@ -397,7 +459,39 @@ pub fn compute(op: &VecInsn, a: &Lanes, b: &Lanes) -> Lanes {
             out = std::array::from_fn(|i| u32::from_le_bytes([r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]]));
         }
         VMOV => {}
+        VADD64 | VSUB64 | VSLL64 | VSRL64 | VSRA64 | VSLLV64 | VSRLV64 | VMULU32 | VMULLO64 => {
+            let q = |x: &Lanes, i: usize| x[2 * i] as u64 | (x[2 * i + 1] as u64) << 32;
+            for i in 0..4 {
+                let (x, y, n) = (q(a, i), q(b, i), op.off as u32);
+                let r = match op.subop {
+                    VADD64 => x.wrapping_add(y),
+                    VSUB64 => x.wrapping_sub(y),
+                    VSLL64 => x << n,
+                    VSRL64 => x >> n,
+                    VSRA64 => ((x as i64) >> n) as u64,
+                    VSLLV64 => if y > 63 { 0 } else { x << y },
+                    VSRLV64 => if y > 63 { 0 } else { x >> y },
+                    VMULU32 => (x as u32 as u64) * (y as u32 as u64),
+                    _ => x.wrapping_mul(y),
+                };
+                (out[2 * i], out[2 * i + 1]) = (r as u32, (r >> 32) as u32);
+            }
+        }
         _ => unreachable!(),
+    }
+    out
+}
+
+/// vpmadd52luq / vpmadd52huq on one half: `d += lo / hi 52 bits of lo52(a) * lo52(b)`
+fn madd52(op: &VecInsn, a: &Lanes, b: &Lanes, d: &Lanes) -> Lanes {
+    let q = |x: &Lanes, i: usize| x[2 * i] as u64 | (x[2 * i + 1] as u64) << 32;
+    let m = (1u64 << 52) - 1;
+    let mut out = [0u32; 8];
+    for i in 0..4 {
+        let p = (q(a, i) & m) as u128 * (q(b, i) & m) as u128;
+        let part = if op.subop == VMADD52LO { p as u64 & m } else { (p >> 52) as u64 };
+        let r = q(d, i).wrapping_add(part);
+        (out[2 * i], out[2 * i + 1]) = (r as u32, (r >> 32) as u32);
     }
     out
 }
@@ -433,6 +527,9 @@ pub fn transpose8(rows: &mut [Lanes; 8]) {
 
 /// Lane-wise result of a two (three for vternlog) operand sub-operation on one 256 bit half
 fn compute_half(op: &VecInsn, a: &Lanes, b: &Lanes, d: &Lanes) -> Lanes {
+    if matches!(op.subop, VMADD52LO | VMADD52HI) {
+        return madd52(op, a, b, d);
+    }
     if op.subop == VTERNLOG {
         std::array::from_fn(|i| ternlog(d[i], a[i], b[i], op.off as u8))
     } else {
@@ -455,6 +552,11 @@ pub fn interpret(
         transfer(op.subop == VSTORE, slot, op.transfer_slots(), vm_addr, vector_base, mapping)?;
         return Ok(0);
     }
+    interpret_registers(op, reg, vector_base)
+}
+
+/// [interpret] for every operation but load / store (no guest memory access)
+pub fn interpret_registers(op: &VecInsn, reg: &[u64], vector_base: *mut u8) -> Result<u64, EbpfError> {
     if vector_base.is_null() {
         return Err(EbpfError::UnsupportedInstruction);
     }
@@ -489,6 +591,60 @@ pub fn interpret(
         VEXT64 => {
             return Ok(u64::from_le(unsafe { std::ptr::read_unaligned(slot(op.va).add(8 * op.off as usize).cast::<u64>()) }));
         }
+        VCMP | VBLENDM | VCOMPRESS | VEXPAND => {
+            // Lanes of `size` bytes over the operand bytes
+            let size = 1usize << (if op.subop == VCMP { op.off >> 4 } else { op.off });
+            let n = ebpf::VECTOR_WIDTH * op.halves() / size;
+            let lane = |s: u8, i: usize| -> u64 {
+                let mut v = 0u64;
+                for k in 0..size {
+                    v |= (unsafe { *slot(s).add(size * i + k) } as u64) << (8 * k);
+                }
+                v
+            };
+            let put = |i: usize, v: u64| {
+                for k in 0..size {
+                    unsafe { *slot(op.vd).add(size * i + k) = (v >> (8 * k)) as u8 };
+                }
+            };
+            let bit = |i: usize| (scalar >> i) & 1 != 0;
+            let a: Vec<u64> = (0..n).map(|i| lane(op.va, i)).collect();
+            let b: Vec<u64> = (0..n).map(|i| lane(op.vb, i)).collect();
+            match op.subop {
+                VCMP => {
+                    let signed = |x: u64| ((x << (64 - 8 * size)) as i64) >> (64 - 8 * size);
+                    let mut mask = 0u64;
+                    for i in 0..n {
+                        let ord = if op.off & 8 != 0 { a[i].cmp(&b[i]) } else { signed(a[i]).cmp(&signed(b[i])) };
+                        let t = match op.off & 7 {
+                            0 => ord.is_eq(),
+                            1 => ord.is_lt(),
+                            2 => ord.is_le(),
+                            3 => false,
+                            4 => ord.is_ne(),
+                            5 => ord.is_ge(),
+                            6 => ord.is_gt(),
+                            _ => true,
+                        };
+                        mask |= (t as u64) << i;
+                    }
+                    return Ok(mask);
+                }
+                VBLENDM => (0..n).for_each(|i| put(i, if bit(i) { a[i] } else { b[i] })),
+                VCOMPRESS => {
+                    let kept: Vec<u64> = (0..n).filter(|&i| bit(i)).map(|i| a[i]).collect();
+                    (0..n).for_each(|i| put(i, kept.get(i).copied().unwrap_or(0)));
+                    return Ok(kept.len() as u64);
+                }
+                _ => {
+                    let mut k = 0;
+                    for i in 0..n {
+                        put(i, if bit(i) { k += 1; a[k - 1] } else { 0 });
+                    }
+                }
+            }
+            return Ok(0);
+        }
         VCOMPRESSLT16 => {
             let n = 16 * op.halves();
             let word = |s: u8, i: usize| unsafe { std::ptr::read_unaligned(slot(s).add(2 * i).cast::<u16>()) };
@@ -512,12 +668,12 @@ pub fn interpret(
     if !op.wide && !matches!(op.subop, VBCAST32 | VBCAST64 | VPERMI2D | VPERMT2D) {
         // The common case: one 256 bit lane-wise operation
         let (a, b) = (read(op.va), read(op.vb));
-        let out = if op.subop == VTERNLOG { compute_half(op, &a, &b, &read(op.vd)) } else { compute(op, &a, &b) };
+        let out = if matches!(op.subop, VTERNLOG | VMADD52LO | VMADD52HI) { compute_half(op, &a, &b, &read(op.vd)) } else { compute(op, &a, &b) };
         write_lanes(slot(op.vd), &out);
         return Ok(0);
     }
     // Every source is read before the destination is written
-    let reads_d = matches!(op.subop, VTERNLOG | VPERMI2D | VPERMT2D);
+    let reads_d = matches!(op.subop, VTERNLOG | VPERMI2D | VPERMT2D | VMADD52LO | VMADD52HI);
     let a: [Lanes; 2] = std::array::from_fn(|h| if h < halves { read(op.va + h as u8) } else { [0; 8] });
     let b: [Lanes; 2] = std::array::from_fn(|h| if h < halves { read(op.vb + h as u8) } else { [0; 8] });
     let d: [Lanes; 2] = std::array::from_fn(|h| if h < halves && reads_d { read(op.vd + h as u8) } else { [0; 8] });
@@ -578,6 +734,11 @@ pub fn disassemble(insn: &ebpf::Insn) -> String {
         VEXT64 => format!("{name} r{}, v{va}, {}", op.dst, op.off),
         VMOVMSK8 => format!("{name} r{}, v{va}", op.dst),
         VCOMPRESSLT16 => format!("{name} r{}, v{vd}, v{va}, v{vb}", op.dst),
+        VCMP => format!("{name} r{}, v{va}, v{vb}, {:#x}", op.dst, op.off),
+        VBLENDM => format!("{name} v{vd}, v{va}, v{vb}, r{}, {}", op.src, op.off),
+        VCOMPRESS => format!("{name} r{}, v{vd}, v{va}, r{}, {}", op.dst, op.src, op.off),
+        VEXPAND => format!("{name} v{vd}, v{va}, r{}, {}", op.src, op.off),
+        VSLL64 | VSRL64 | VSRA64 => format!("{name} v{vd}, v{va}, {}", op.off),
         VMOV => format!("{name} v{vd}, v{va}"),
         VROR32 | VSRL32 | VSLL32 => format!("{name} v{vd}, v{va}, {}", op.off),
         VSHUFD => format!("{name} v{vd}, v{va}, {:#x}", op.off),
