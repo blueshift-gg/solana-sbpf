@@ -815,3 +815,164 @@ fn every_feature_profile_compiles_every_operation() {
         }
     }
 }
+
+/// Every valid scalar instruction between the operand setup of an intrinsic call and the call
+/// (the JIT tracks the constant in r1 to lower calls inline), and between two vector operations
+/// (R11 tracking, which scalar instructions flush the register cache, jumps to the next instruction
+/// which start a block, exits in the middle). The scalar instruction writes the operand registers
+/// r1 / r2 / r3 and r0 in some configurations, memory operations use heap pointers (r5, r9), large
+/// immediates take the sanitized path (which uses R11).
+#[test]
+fn scalar_instructions_between_vector_ops() {
+    use simd::*;
+    let init = vector_init(17);
+    let heap = ebpf::MM_HEAP_START + 64;
+    // (dst, src, off, imm)
+    let configs: [(u8, u8, i16, i64); 10] = [
+        (1, 5, 0, 1),
+        (1, 2, 0, 0x100),
+        (2, 9, 8, 0x12_3457),
+        (3, 1, 0, -1),
+        (0, 3, 16, 3),
+        (4, 1, 0, 0x7fff_0001),
+        (9, 0, 24, 7),
+        (5, 9, 0, 2),
+        (6, 0, 0, 1),
+        // r0 (the result of the first call) as the second call's operands
+        (1, 0, 0, 0),
+    ];
+    // Vector operations exercising different lowerings and scalar operands
+    let ops: [VecInsn; 7] = [
+        op(VADD32, false, 8, 12, 16, 0),
+        op(VCMP, false, 0, 8, 12, 1),      // writes r0
+        op(VCOMPRESS, false, 20, 8, 0, 2), // mask in r3, writes r0
+        op(VBCAST32, false, 22, 0, 0, 0),  // scalar in r2
+        op(VTESTM, true, 0, 8, 12, 2),     // AVX2: two halves through R11
+        op(VLOAD, false, 24, 0, 0, 32),    // address in r2
+        op(VSRLV64, false, 26, 8, 12, 0),  // template (Rosetta workaround)
+    ];
+    let after = op(VXOR, false, 28, 20, 8, 0);
+    let (mut valid, mut cases, mut completed) = (0, 0, 0);
+    let mut opcodes: Vec<Option<u8>> = (0..=255u8)
+        .filter(|opc| {
+            !matches!(
+                *opc,
+                ebpf::CALL_IMM | ebpf::CALL_REG | ebpf::LD_DW_IMM | ebpf::VOP
+            )
+        })
+        .map(Some)
+        .collect();
+    opcodes.push(None); // lddw
+    for opc in opcodes {
+        for (k, &(dst, src, off, imm)) in configs.iter().enumerate() {
+            let jump = opc.is_some_and(|o| {
+                matches!(o & ebpf::BPF_CLS_MASK, ebpf::BPF_JMP64 | ebpf::BPF_JMP32)
+            });
+            let off = if jump { 0 } else { off };
+            let scalar = |a: &mut Asm| match opc {
+                Some(opc) => a.raw(opc, dst, src, off, imm),
+                None => a.lddw(dst, 0x8000_0000_0000_0001u64.wrapping_mul(imm as u64)),
+            };
+            // Valid in this context at all? (verifier)
+            {
+                let mut a = Asm::new(VecMode::Call);
+                scalar(&mut a);
+                a.mov64_imm(0, 0);
+                a.exit();
+                if Runner::new(
+                    &a.finish(),
+                    &input_for(&init, 0),
+                    HEAP_LEN,
+                    config(SimdJitStrategy::Direct),
+                )
+                .is_err()
+                {
+                    continue;
+                }
+            }
+            valid += 1;
+            for (j, first) in ops.iter().enumerate() {
+                for placement in ["after operand setup", "between vector ops"] {
+                    let mut a = Asm::new(VecMode::Call);
+                    prologue(&mut a, heap, 0x0f0f_00ff_5555_aaaa);
+                    a.lddw(5, heap);
+                    a.lddw(9, heap + 128);
+                    a.lddw(4, 0x0102_0304_0506_0708);
+                    a.mov64_imm(0, 5);
+                    // Dirty cached operands
+                    for s in [8u8, 12, 16, 20] {
+                        a.vop_full(VADD32, false, s, s, s, 0, 0, 0);
+                    }
+                    let second = &ops[(j + 1 + k) % ops.len()];
+                    if placement == "after operand setup" {
+                        a.mov64_imm(1, pack(first) as i64);
+                        scalar(&mut a);
+                        a.raw(
+                            ebpf::CALL_IMM,
+                            0,
+                            0,
+                            0,
+                            hash(first.subop, first.wide) as i32 as i64,
+                        );
+                    } else {
+                        a.mov64_imm(1, pack(first) as i64);
+                        a.raw(
+                            ebpf::CALL_IMM,
+                            0,
+                            0,
+                            0,
+                            hash(first.subop, first.wide) as i32 as i64,
+                        );
+                        scalar(&mut a);
+                        // r1 still holds the first operation's operands unless the scalar
+                        // instruction wrote it: call the second one with whatever r1 holds now
+                        // half the time
+                        if k % 2 == 0 {
+                            a.mov64_imm(1, pack(second) as i64);
+                        }
+                        a.raw(
+                            ebpf::CALL_IMM,
+                            0,
+                            0,
+                            0,
+                            hash(second.subop, second.wide) as i32 as i64,
+                        );
+                    }
+                    a.vop_full(after.subop, false, after.vd, after.va, after.vb, 0, 0, 0);
+                    // Every register to the heap (r9 through the stack)
+                    a.stxdw(10, -8, 9);
+                    a.lddw(9, ebpf::MM_HEAP_START + 1024);
+                    for reg in 0..9u8 {
+                        a.stxdw(9, 8 * reg as i16, reg);
+                    }
+                    a.ldxdw(0, 10, -8);
+                    a.stxdw(9, 72, 0);
+                    a.mov64_imm(0, 0);
+                    a.exit();
+                    let outcome = differential(&a.finish(), &input_for(&init, 0), Placement::Front);
+                    completed += outcome
+                        .as_ref()
+                        .is_ok_and(|out| out.result.starts_with("Ok"))
+                        as usize;
+                    if let Err(err) = outcome {
+                        panic!(
+                            "{}",
+                            format!(
+                                "{} r{dst} r{src} off {off} imm {imm:#x}, {placement}, {}: {err}",
+                                opc.map_or("lddw".to_string(), |o| format!("opcode {o:#04x}")),
+                                mnemonic(first.subop, first.wide)
+                            )
+                        );
+                    }
+                    cases += 1;
+                }
+            }
+        }
+    }
+    eprintln!("{valid} valid instructions, {cases} cases, {completed} ran to the end");
+    assert!(
+        valid > 400 && cases > 5_000 && completed * 2 > cases,
+        "{}",
+        format!("{valid} valid instructions, {cases} cases, {completed} ran to the end")
+    );
+}

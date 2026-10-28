@@ -222,7 +222,9 @@ AVX-512 hosts AVX2-only plus every CPU feature profile of `simd::features::PROFI
   up to the end and beyond, transfers at the edges of guest memory regions with every mask pattern.
 * *Divergence:* every operation with every aliasing of its operands, each with the operands in
   memory, cached and dirty, or evicted; every scalar register (including `dst == src`) for the
-  operations with scalar operands; faults (access violations, division by zero, the instruction
+  operations with scalar operands; every valid scalar instruction between the operand setup of a
+  call and the call (the JIT's constant tracking of r1) and between two vector operations (R11
+  tracking, the cache flushes, jumps which start a block); faults (access violations, division by zero, the instruction
   meter at checkpoints and at `lddw`) in the middle of vector code leave the vector file written
   back.
 * *Alignment:* misaligned vector files (offsets 1, 8, 16, 31; under Rosetta 2 an aligned load planted
