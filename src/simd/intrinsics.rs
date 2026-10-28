@@ -67,6 +67,8 @@ pub const NAMES_256: [&str; SUBOP_COUNT as usize] = [
     "sol_avx2_bcast64x4",
     "sol_avx2_movmsk8x32",
     "sol_avx512_permi2d256",
+    "sol_avx512_rolv64x4",
+    "sol_avx2_transpose4x4q",
 ];
 
 /// Function names of the 512 bit forms (slot pairs, AVX-512F/BW), indexed by sub-operation
@@ -106,6 +108,8 @@ pub const NAMES_512: [Option<&str>; SUBOP_COUNT as usize] = [
     Some("sol_avx512_bcast64x8"),
     Some("sol_avx512_movmsk8x64"),
     Some("sol_avx512_permi2d512"),
+    Some("sol_avx512_rolv64x8"),
+    Some("sol_avx512_transpose8x8q"),
 ];
 
 /// Register holding the packed operands
@@ -147,7 +151,7 @@ pub fn hashes() -> Vec<(u32, u8, bool)> {
 ///
 /// ```text
 /// load256 / store256     bits 0..7 first slot   bits 8..23 signed 16 bit offset   bits 24..28 slots - 1
-/// bcast / transpose8     bits 0..7 vd
+/// bcast / transpose      bits 0..7 vd
 /// ins64                  bits 0..7 vd   bits 8..9 lane
 /// ext64                  bits 0..7 va   bits 8..9 lane
 /// movmsk8                bits 0..7 va
@@ -162,7 +166,7 @@ pub fn pack(op: &VecInsn) -> u64 {
     match op.subop {
         VLOAD => vd | imm << 8 | vb << 24,
         VSTORE => va | imm << 8 | vb << 24,
-        VBCAST32 | VBCAST64 | VTRANSPOSE8 => vd,
+        VBCAST32 | VBCAST64 | VTRANSPOSE8 | VTRANSPOSE64 => vd,
         VINS64 => vd | imm << 8,
         VEXT64 => va | imm << 8,
         VMOVMSK8 => va,
@@ -183,7 +187,7 @@ pub fn unpack(subop: u8, wide: bool, packed: u64) -> Option<VecInsn> {
     match subop {
         VLOAD => (vd, off, vb) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16, byte(24)),
         VSTORE => (va, off, vb) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16, byte(24)),
-        VBCAST32 | VBCAST64 | VTRANSPOSE8 => vd = byte(0),
+        VBCAST32 | VBCAST64 | VTRANSPOSE8 | VTRANSPOSE64 => vd = byte(0),
         VINS64 => (vd, off) = (byte(0), byte(8) as i16),
         VEXT64 => (va, off) = (byte(0), byte(8) as i16),
         VMOVMSK8 => va = byte(0),
@@ -263,8 +267,8 @@ pub fn register<C: ContextObject>(loader: &mut BuiltinProgram<C>) -> Result<(), 
         };
     }
     register!(false: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34);
+        28, 29, 30, 31, 32, 33, 34, 35, 36);
     register!(true: 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-        32, 33, 34);
+        32, 33, 34, 35, 36);
     Ok(())
 }

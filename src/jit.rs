@@ -166,7 +166,9 @@ const ANCHOR_SIMD_BLENDD_MASKS: usize = 37;
 const ANCHOR_SIMD_BLENDW_MASKS: usize = 38;
 #[cfg(feature = "simd-experiment")]
 const ANCHOR_SIMD_C31: usize = 39;
-const ANCHOR_COUNT: usize = 40; // Update me when adding or removing anchors
+#[cfg(feature = "simd-experiment")]
+const ANCHOR_SIMD_C63Q: usize = 40;
+const ANCHOR_COUNT: usize = 41; // Update me when adding or removing anchors
 
 #[cfg(feature = "simd-experiment")]
 #[path = "simd_jit.rs"]

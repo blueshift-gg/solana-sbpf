@@ -248,6 +248,42 @@ fn op_cases() -> Vec<(&'static str, Body)> {
             a.wide(subop, 14, 14, 14, 0, off);
         })));
     }
+    cases.push(("rolv64", Box::new(|a| {
+        use solana_sbpf::simd::VROLV64;
+        a.vop_full(VROLV64, false, 1, 2, 3, 0, 0, 0);
+        a.vop_full(VROLV64, false, 4, 4, 5, 0, 0, 0);
+        a.vsrl(6, 6, 25); // small counts, 0..=127 covering 64
+        a.vop_full(VROLV64, false, 7, 8, 6, 0, 0, 0);
+        a.wide(VROLV64, 8, 10, 6, 0, 0);
+        a.wide(VROLV64, 12, 12, 12, 0, 0);
+    })));
+    cases.push(("transpose64", Box::new(|a| {
+        use solana_sbpf::simd::VTRANSPOSE64;
+        a.vadd(0, 0, 1); // cached, dirty
+        a.vop_full(VTRANSPOSE64, false, 1, 0, 0, 0, 0, 0);
+        a.wide(VTRANSPOSE64, 0, 0, 0, 0, 0);
+        a.vxor(3, 3, 4);
+    })));
+    cases.push(("keccak_like", Box::new(|a| {
+        use solana_sbpf::simd::{VPERMD, VROLV64, VTERNLOG, VTRANSPOSE64, VXOR};
+        // The op mix of the 64 bit Keccak: 512 bit xor / ternlog / permd / rolv64 and the transpose
+        a.vsrl(14, 14, 26);
+        for round in 0..3 {
+            a.wide(VXOR, 8, 0, 2, 0, 0);
+            a.wide(VTERNLOG, 8, 4, 6, 0, 0x96);
+            a.wide(VPERMD, 10, 8, 14, 0, 0);
+            a.wide(VROLV64, 10, 10, 14, 0, 0);
+            for y in 0..4u8 {
+                a.wide(VTERNLOG, 2 * y, 8, 10, 0, 0x96);
+                a.wide(VROLV64, 2 * y, 2 * y, 14, 0, 0);
+            }
+            a.wide(VTERNLOG, 0, 2, 4, 0, 0xd2);
+            if round != 1 {
+                a.wide(VTRANSPOSE64, 0, 0, 0, 0, 0);
+            }
+            a.vadd(3, 3, 5); // narrow op on a slot of a pair
+        }
+    })));
     cases.push(("wide_bcast", Box::new(|a| {
         a.lddw(3, 0x8765_4321_0fed_cba9);
         a.wide(solana_sbpf::simd::VBCAST32, 2, 0, 0, 3, 0);
@@ -509,7 +545,7 @@ fn wide_ops_reference() {
     use solana_sbpf::simd::{self, intrinsics::NAMES_512, VecInsn};
     let input = random_input(41);
     for subop in 0..simd::SUBOP_COUNT {
-        if NAMES_512[subop as usize].is_none() || matches!(subop, simd::VMOVMSK8 | simd::VBCAST32 | simd::VBCAST64) {
+        if NAMES_512[subop as usize].is_none() || matches!(subop, simd::VMOVMSK8 | simd::VBCAST32 | simd::VBCAST64 | simd::VTRANSPOSE64) {
             continue;
         }
         let off = match subop {
@@ -553,6 +589,24 @@ fn wide_ops_reference() {
             }
         }
         let _ = VecInsn::decode;
+    }
+    // vtranspose64 (4 x 4 and 8 x 8) and vrolv64 against the model
+    let q = |buf: &[u8], i: usize| u64::from_le_bytes(buf[8 * i..8 * i + 8].try_into().unwrap());
+    let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.vop_full(simd::VTRANSPOSE64, false, 4, 0, 0, 0, 0, 0)), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+    for r in 0..4 {
+        for c in 0..4 {
+            assert_eq!(q(&out, 16 + 4 * r + c), q(&input, 16 + 4 * c + r));
+        }
+    }
+    let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.wide(simd::VTRANSPOSE64, 0, 0, 0, 0, 0)), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+    for r in 0..8 {
+        for c in 0..8 {
+            assert_eq!(q(&out, 8 * r + c), q(&input, 8 * c + r));
+        }
+    }
+    let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.wide(simd::VROLV64, 0, 2, 4, 0, 0)), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+    for i in 0..8 {
+        assert_eq!(q(&out, i), q(&input, 8 + i).rotate_left((q(&input, 16 + i) % 64) as u32));
     }
     // vpermi2d256 against the model
     let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.vpermi2d(0, 4, 5, false)), &input, Engine::Interpreter, SimdJitStrategy::Direct);

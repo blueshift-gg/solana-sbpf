@@ -115,8 +115,13 @@ pub const VMOVMSK8: u8 = 0x21;
 /// `v[vd][i] = (v[va] ++ v[vb])[v[vd][i] & (2 L - 1)]` for `L` u32 lanes per operand: two table
 /// permutation, the index operand is overwritten (vpermi2d)
 pub const VPERMI2D: u8 = 0x22;
+/// `v[vd].u64[i] = v[va].u64[i].rotate_left(v[vb].u64[i] % 64)` (vprolvq)
+pub const VROLV64: u8 = 0x23;
+/// Transposes the matrix of u64 lanes whose rows are the slots `vd..vd + 4` (4 x 4), or for the 512
+/// bit form the slot pairs `vd, vd + 2, .., vd + 14` (8 x 8)
+pub const VTRANSPOSE64: u8 = 0x24;
 /// Number of defined sub-operations
-pub const SUBOP_COUNT: u8 = 0x23;
+pub const SUBOP_COUNT: u8 = 0x25;
 
 /// 512 bit flag in the immediate
 pub const WIDE: u32 = 1 << 24;
@@ -182,6 +187,7 @@ pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
     }
     match op.subop {
         VTRANSPOSE8 if op.vd as usize > ebpf::VECTOR_SLOTS - 8 => return None,
+        VTRANSPOSE64 if op.vd as usize > ebpf::VECTOR_SLOTS - if op.wide { 16 } else { 4 } => return None,
         VLOAD | VSTORE => {
             let first = if op.subop == VLOAD { op.vd } else { op.va } as usize;
             if op.vb as usize >= MAX_TRANSFER_SLOTS || first + op.vb as usize >= ebpf::VECTOR_SLOTS {
@@ -350,6 +356,11 @@ pub fn compute(op: &VecInsn, a: &Lanes, b: &Lanes) -> Lanes {
         VSRLV32 => (0..8).for_each(|i| out[i] = if b[i] > 31 { 0 } else { a[i] >> b[i] }),
         VANDN => (0..8).for_each(|i| out[i] = !a[i] & b[i]),
         VROLV32 => (0..8).for_each(|i| out[i] = a[i].rotate_left(b[i] % 32)),
+        VROLV64 => (0..4).for_each(|i| {
+            let q = |x: &Lanes| x[2 * i] as u64 | (x[2 * i + 1] as u64) << 32;
+            let r = q(a).rotate_left((q(b) % 64) as u32);
+            (out[2 * i], out[2 * i + 1]) = (r as u32, (r >> 32) as u32);
+        }),
         VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VBLENDW => {
             let (a, b) = (words(a), words(b));
             let mut w = [0u16; 16];
@@ -443,6 +454,18 @@ pub fn interpret(
             }
             return Ok(0);
         }
+        VTRANSPOSE64 => {
+            // Row r is slot vd + r (4 lanes) or pair vd + 2 r (8 lanes)
+            let n = 4 * op.halves();
+            let lane = |r: usize, c: usize| unsafe { slot(op.vd).add(r * 8 * n + 8 * c).cast::<u64>() };
+            let m: Vec<u64> = (0..n * n).map(|i| unsafe { std::ptr::read_unaligned(lane(i / n, i % n)) }).collect();
+            for r in 0..n {
+                for c in 0..n {
+                    unsafe { std::ptr::write_unaligned(lane(r, c), m[c * n + r]) };
+                }
+            }
+            return Ok(0);
+        }
         VINS64 => {
             unsafe { std::ptr::write_unaligned(slot(op.vd).add(8 * op.off as usize).cast::<u64>(), scalar.to_le()) };
             return Ok(0);
@@ -509,6 +532,7 @@ pub fn disassemble(insn: &ebpf::Insn) -> String {
         VLOAD => format!("{name} {}, {addr}", range(vd)),
         VSTORE => format!("{name} {addr}, {}", range(va)),
         VTRANSPOSE8 => format!("{name} v{vd}..v{}", vd + 7),
+        VTRANSPOSE64 => format!("{name} v{vd}..v{}", vd as usize + if op.wide { 15 } else { 3 }),
         VBCAST32 | VBCAST64 => format!("{name} v{vd}, r{}", op.src),
         VINS64 => format!("{name} v{vd}, r{}, {}", op.src, op.off),
         VEXT64 => format!("{name} r{}, v{va}, {}", op.dst, op.off),

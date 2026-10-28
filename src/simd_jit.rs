@@ -260,6 +260,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit::<u32>(value);
             }
         }
+        self.set_anchor(ANCHOR_SIMD_C63Q);
+        for _ in 0..4 {
+            self.emit::<u64>(63);
+        }
         if self.simd.avx512 {
             // Opmasks of the 512 bit blends: the imm8 repeated for every 8 lanes
             self.set_anchor(ANCHOR_SIMD_BLENDD_MASKS);
@@ -783,7 +787,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         let op = *op;
         self.simd.stats.vector_instructions += 1;
-        if self.simd.avx512 && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8) {
+        if self.simd.avx512 && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64) {
             // A slot is cached at one width only
             let (slots, count) = Self::simd_operand_slots(&op);
             for &slot in &slots[..count] {
@@ -810,8 +814,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         match op.subop {
             VLOAD if self.emit_simd_static_load(&op) => {}
             VLOAD | VSTORE => self.emit_simd_transfer(&op),
-            VTRANSPOSE8 | VPERMI2D => self.emit_simd_fixed(&op),
-            VPERMD if op.wide => self.emit_simd_fixed(&op),
+            VTRANSPOSE8 | VTRANSPOSE64 => self.emit_simd_fixed(&op),
+            VPERMI2D => self.emit_simd_cross(&op),
+            VPERMD if op.wide => self.emit_simd_cross(&op),
             VMOVMSK8 if op.wide => self.emit_simd_movmsk_wide(&op),
             _ if op.wide => {
                 // Lane-wise on the two halves. All slots are even, so the low half's result never
@@ -868,8 +873,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.simd_touch(reg);
     }
 
-    /// Operations on fixed registers (cross half permutations, transpose): flush, load every source
-    /// into ymm0.., compute, leave the results resident and dirty
+    /// Transposes: flush, load the matrix into fixed registers, transpose, leave the results resident
+    /// and dirty
     fn emit_simd_fixed(&mut self, op: &VecInsn) {
         use crate::simd::*;
         self.simd_flush(true);
@@ -885,53 +890,161 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     self.simd_assign(op.vd + row as u8, *reg);
                 }
             }
-            (VPERMD, true) => {
+            (VTRANSPOSE64, false) => {
+                for row in 0..4u8 {
+                    load(self, row, op.vd + row);
+                }
+                self.simd_emit_transpose4q([0, 1, 2, 3], [4, 5, 6, 7]);
+                for row in 0..4u8 {
+                    self.simd_assign(op.vd + row, row);
+                }
+            }
+            (VTRANSPOSE64, true) if self.simd.avx512 => {
+                // r0..r7 in zmm16..23, t in zmm24..31, u in zmm16..23, columns in zmm24..31
+                for row in 0..8u8 {
+                    self.emit_evex(E::load(16 + row, REGISTER_SCRATCH, Self::slot_disp(op.vd + 2 * row)));
+                }
+                for i in 0..4u8 {
+                    self.emit_evex(E::alu_q(2, 1, VPUNPCKLQDQ, 24 + 2 * i, 16 + 2 * i, VexRm::Reg(17 + 2 * i)));
+                    self.emit_evex(E::alu_q(2, 1, VPUNPCKHQDQ, 25 + 2 * i, 16 + 2 * i, VexRm::Reg(17 + 2 * i)));
+                }
+                for (base, t) in [(16u8, 24u8), (20, 28)] {
+                    self.emit_evex(E::shufi64x2(base, t, t + 2, 0x88));
+                    self.emit_evex(E::shufi64x2(base + 1, t + 1, t + 3, 0x88));
+                    self.emit_evex(E::shufi64x2(base + 2, t, t + 2, 0xdd));
+                    self.emit_evex(E::shufi64x2(base + 3, t + 1, t + 3, 0xdd));
+                }
+                for k in 0..4u8 {
+                    self.emit_evex(E::shufi64x2(24 + k, 16 + k, 20 + k, 0x88));
+                    self.emit_evex(E::shufi64x2(28 + k, 16 + k, 20 + k, 0xdd));
+                }
+                // Column k is the new row k; zmm31 is the scratch register, so that one is stored
+                for k in 0..8u8 {
+                    let (reg, pair) = (24 + k, op.vd / 2 + k);
+                    if reg == SCRATCH_ZMM {
+                        self.emit_evex(E::store(reg, REGISTER_SCRATCH, Self::slot_disp(2 * pair)));
+                    } else {
+                        self.simd.pairs[pair as usize] = PairState { reg: Some(reg), dirty: true };
+                        self.simd.zregs[(reg - ZBASE) as usize] = Some(pair);
+                        self.simd_ztouch(reg);
+                    }
+                }
+            }
+            _ => {
+                // 8 x 8 as four 4 x 4 blocks of 256 bit halves: [A B; C D] -> [A' C'; B' D']
+                let row = |r: u8, hi: u8| op.vd + 2 * r + hi;
+                for (src, dst) in [((0u8, 0u8), (0u8, 0u8)), ((4, 1), (4, 1))] {
+                    // A and D in place
+                    for r in 0..4u8 {
+                        load(self, r, row(src.0 + r, src.1));
+                    }
+                    self.simd_emit_transpose4q([0, 1, 2, 3], [4, 5, 6, 7]);
+                    for r in 0..4u8 {
+                        self.emit_vex(V::store(r, REGISTER_SCRATCH, Self::slot_disp(row(dst.0 + r, dst.1))));
+                    }
+                }
+                // B (rows 0..4, high halves) and C (rows 4..8, low halves) swap places
+                for r in 0..4u8 {
+                    load(self, r, row(r, 1));
+                    load(self, 8 + r, row(4 + r, 0));
+                }
+                self.simd_emit_transpose4q([0, 1, 2, 3], [4, 5, 6, 7]);
+                self.simd_emit_transpose4q([8, 9, 10, 11], [4, 5, 6, 7]);
+                for r in 0..4u8 {
+                    self.simd_assign(row(4 + r, 0), r);
+                    self.simd_assign(row(r, 1), 8 + r);
+                }
+            }
+        }
+    }
+
+    /// 4 x 4 transpose of the u64 lanes of the registers `m` in place, `t` are temporaries
+    fn simd_emit_transpose4q(&mut self, m: [u8; 4], t: [u8; 4]) {
+        let r = VexRm::Reg;
+        self.emit_vex(V::alu(VPUNPCKLQDQ, t[0], m[0], r(m[1])));
+        self.emit_vex(V::alu(VPUNPCKHQDQ, t[1], m[0], r(m[1])));
+        self.emit_vex(V::alu(VPUNPCKLQDQ, t[2], m[2], r(m[3])));
+        self.emit_vex(V::alu(VPUNPCKHQDQ, t[3], m[2], r(m[3])));
+        self.emit_vex(V::perm2i128(m[0], t[0], r(t[2]), 0x20));
+        self.emit_vex(V::perm2i128(m[1], t[1], r(t[3]), 0x20));
+        self.emit_vex(V::perm2i128(m[2], t[0], r(t[2]), 0x31));
+        self.emit_vex(V::perm2i128(m[3], t[1], r(t[3]), 0x31));
+    }
+
+    /// Makes `reg` (a temporary) the new, dirty register of `slot`
+    fn simd_rebind(&mut self, slot: u8, reg: u8) {
+        if let Some(old) = self.simd.slots[slot as usize].reg {
+            self.simd.regs[old as usize] = None;
+        }
+        self.simd_assign(slot, reg);
+    }
+
+    /// Cross half permutations without AVX-512, in the register cache: both halves are computed into
+    /// temporaries before any destination is written (the operands may alias)
+    fn emit_simd_cross(&mut self, op: &VecInsn) {
+        use crate::simd::*;
+        self.simd_ensure_base();
+        self.simd.pinned = [false; CACHE_REGS];
+        let ensure = |jit: &mut Self, slot: u8| {
+            let reg = jit.simd_ensure_reg(slot);
+            jit.simd_pin(reg);
+            reg
+        };
+        let temp = |jit: &mut Self| {
+            let reg = jit.simd_allocate();
+            jit.simd_pin(reg);
+            reg
+        };
+        let s = SCRATCH_YMM;
+        match (op.subop, op.wide) {
+            (VPERMD, _) => {
                 // out_h = idx_h bit 3 ? a_hi[idx_h & 7] : a_lo[idx_h & 7]
-                for (reg, slot) in [(0, op.va), (1, op.va + 1), (2, op.vb), (3, op.vb + 1)] {
-                    load(self, reg, slot);
+                let (a0, a1) = (ensure(self, op.va), ensure(self, op.va + 1));
+                let idx = [ensure(self, op.vb), ensure(self, op.vb + 1)];
+                let out = [temp(self), temp(self)];
+                let m = temp(self);
+                for h in 0..2 {
+                    self.emit_vex(V::permd(out[h], idx[h], VexRm::Reg(a0)));
+                    self.emit_vex(V::permd(s, idx[h], VexRm::Reg(a1)));
+                    self.emit_vex(V::pslld(m, idx[h], 28));
+                    self.emit_vex(V::blendvps(out[h], out[h], s, m));
                 }
-                for h in 0..2u8 {
-                    let idx = 2 + h;
-                    self.emit_vex(V::permd(4, idx, VexRm::Reg(0)));
-                    self.emit_vex(V::permd(5, idx, VexRm::Reg(1)));
-                    self.emit_vex(V::pslld(6, idx, 28));
-                    self.emit_vex(V::blendvps(7 + h, 4, 5, 6));
-                }
-                self.simd_assign(op.vd, 7);
-                self.simd_assign(op.vd + 1, 8);
+                self.simd_rebind(op.vd, out[0]);
+                self.simd_rebind(op.vd + 1, out[1]);
             }
             (VPERMI2D, false) => {
                 // out = idx bit 3 ? b[idx & 7] : a[idx & 7]
-                for (reg, slot) in [(0, op.va), (1, op.vb), (2, op.vd)] {
-                    load(self, reg, slot);
-                }
-                self.emit_vex(V::permd(4, 2, VexRm::Reg(0)));
-                self.emit_vex(V::permd(5, 2, VexRm::Reg(1)));
-                self.emit_vex(V::pslld(6, 2, 28));
-                self.emit_vex(V::blendvps(7, 4, 5, 6));
-                self.simd_assign(op.vd, 7);
+                let (a, b, idx) = (ensure(self, op.va), ensure(self, op.vb), ensure(self, op.vd));
+                let (out, m) = (temp(self), temp(self));
+                self.emit_vex(V::permd(out, idx, VexRm::Reg(a)));
+                self.emit_vex(V::permd(s, idx, VexRm::Reg(b)));
+                self.emit_vex(V::pslld(m, idx, 28));
+                self.emit_vex(V::blendvps(out, out, s, m));
+                self.simd_rebind(op.vd, out);
             }
             _ => {
-                // VPERMI2D, 512 bit: bit 3 of the index picks the half, bit 4 the table
-                for (reg, slot) in [(0, op.va), (1, op.va + 1), (2, op.vb), (3, op.vb + 1), (4, op.vd), (5, op.vd + 1)] {
-                    load(self, reg, slot);
+                // 512 bit: bit 3 of the index picks the half, bit 4 the table
+                let (a0, a1) = (ensure(self, op.va), ensure(self, op.va + 1));
+                let (b0, b1) = (ensure(self, op.vb), ensure(self, op.vb + 1));
+                let idx = [ensure(self, op.vd), ensure(self, op.vd + 1)];
+                let out = [temp(self), temp(self)];
+                let (m, t) = (temp(self), temp(self));
+                for h in 0..2 {
+                    self.emit_vex(V::pslld(m, idx[h], 28));
+                    self.emit_vex(V::permd(out[h], idx[h], VexRm::Reg(a0)));
+                    self.emit_vex(V::permd(s, idx[h], VexRm::Reg(a1)));
+                    self.emit_vex(V::blendvps(out[h], out[h], s, m));
+                    self.emit_vex(V::permd(t, idx[h], VexRm::Reg(b0)));
+                    self.emit_vex(V::permd(s, idx[h], VexRm::Reg(b1)));
+                    self.emit_vex(V::blendvps(t, t, s, m));
+                    self.emit_vex(V::pslld(m, idx[h], 27));
+                    self.emit_vex(V::blendvps(out[h], out[h], t, m));
                 }
-                for h in 0..2u8 {
-                    let idx = 4 + h;
-                    self.emit_vex(V::pslld(8, idx, 28));
-                    self.emit_vex(V::permd(6, idx, VexRm::Reg(0)));
-                    self.emit_vex(V::permd(7, idx, VexRm::Reg(1)));
-                    self.emit_vex(V::blendvps(6, 6, 7, 8));
-                    self.emit_vex(V::permd(7, idx, VexRm::Reg(2)));
-                    self.emit_vex(V::permd(9, idx, VexRm::Reg(3)));
-                    self.emit_vex(V::blendvps(7, 7, 9, 8));
-                    self.emit_vex(V::pslld(8, idx, 27));
-                    self.emit_vex(V::blendvps(10 + h, 6, 7, 8));
-                }
-                self.simd_assign(op.vd, 10);
-                self.simd_assign(op.vd + 1, 11);
+                self.simd_rebind(op.vd, out[0]);
+                self.simd_rebind(op.vd + 1, out[1]);
             }
         }
+        self.simd.pinned = [false; CACHE_REGS];
     }
 
     /// Register holding `slot` for a read, ymm15 loaded from memory if it isn't cached
@@ -1039,6 +1152,31 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::permi2d(1, rd, ra, b));
+            }
+            VROLV64 if self.simd.avx512 => {
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let rd = self.simd_destination(op.vd);
+                self.emit_evex(E::alu_q(1, 2, 0x15, rd, ra, b));
+            }
+            VROLV64 => {
+                // rd = ra << c | (ra >> 1) >> (c ^ 63) for c = rb & 63
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let rb = self.simd_ensure_reg(op.vb);
+                self.simd_pin(rb);
+                let t = self.simd_allocate();
+                self.simd_pin(t);
+                let rd = self.simd_destination(op.vd);
+                let c63 = VexRm::Rip(self.anchors[ANCHOR_SIMD_C63Q]);
+                self.emit_vex(V::load_rip(SCRATCH_YMM, self.anchors[ANCHOR_SIMD_C63Q]));
+                self.emit_vex(V::alu(VPAND, SCRATCH_YMM, SCRATCH_YMM, VexRm::Reg(rb)));
+                self.emit_vex(V::alu38w(VPSLLVD, t, ra, VexRm::Reg(SCRATCH_YMM)));
+                self.emit_vex(V::alu(VPXOR, SCRATCH_YMM, SCRATCH_YMM, c63));
+                self.emit_vex(V::psrlq(rd, ra, 1));
+                self.emit_vex(V::alu38w(VPSRLVD, rd, rd, VexRm::Reg(SCRATCH_YMM)));
+                self.emit_vex(V::alu(VPOR, rd, rd, VexRm::Reg(t)));
             }
             VROR32 if self.simd.avx512 => {
                 let ra = self.simd_ensure_reg(op.va);
@@ -1256,8 +1394,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_evex(E::pmovb2m(KMASK, za));
                 self.emit_vex(V::kmovq_to_gpr(REGISTER_MAP[op.dst as usize], KMASK));
             }
-            VADD32 | VXOR | VAND | VOR | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN | VROLV32 | VADD16
-            | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDD | VBLENDW => {
+            VADD32 | VXOR | VAND | VOR | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN | VROLV32 | VROLV64
+            | VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDD | VBLENDW => {
                 if matches!(op.subop, VBLENDD | VBLENDW) {
                     let (anchor, size) = if op.subop == VBLENDD { (ANCHOR_SIMD_BLENDD_MASKS, 2) } else { (ANCHOR_SIMD_BLENDW_MASKS, 4) };
                     let entry = unsafe { self.anchors[anchor].add(size * op.off as usize) };
@@ -1284,6 +1422,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     VSLLV32 => E::alu38(2, 0x47, zd, za, b),
                     VSRLV32 => E::alu38(2, 0x45, zd, za, b),
                     VROLV32 => E::alu38(2, 0x15, zd, za, b),
+                    VROLV64 => E::alu_q(2, 2, 0x15, zd, za, b),
                     VMINU16 => E::alu38(2, 0x3a, zd, za, b),
                     VBLENDD => E::pblendmd(zd, za, b, KMASK),
                     _ => E::pblendmw(zd, za, b, KMASK),

@@ -923,6 +923,14 @@ impl VexInstruction {
     pub const fn alu38(opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
         Self::ymm(1, 2, opcode, dst, src1, src2, None)
     }
+    /// Three operand packed integer op of the 0F38 map with VEX.W1: vpsllvq (0x47), vpsrlvq (0x45)
+    pub const fn alu38w(opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
+        Self { w: true, ..Self::ymm(1, 2, opcode, dst, src1, src2, None) }
+    }
+    /// vpsrlq ymm, ymm, imm8
+    pub const fn psrlq(dst: u8, src: u8, imm: u8) -> Self {
+        Self::ymm(1, 1, 0x73, 2, dst, VexRm::Reg(src), Some(imm))
+    }
     /// vpsrld ymm, ymm, imm8
     pub const fn psrld(dst: u8, src: u8, imm: u8) -> Self {
         Self::ymm(1, 1, 0x72, 2, dst, VexRm::Reg(src), Some(imm))
@@ -1124,6 +1132,15 @@ impl EvexInstruction {
     pub const fn alu38(vl: u8, opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
         Self::op(1, 2, false, vl, opcode, dst, src1, src2, None)
     }
+    /// Three operand packed integer op with EVEX.W1 (quadword elements): vpunpcklqdq (map 1, 0x6c),
+    /// vpunpckhqdq (map 1, 0x6d), vprolvq (map 2, 0x15)
+    pub const fn alu_q(vl: u8, map: u8, opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
+        Self::op(1, map, true, vl, opcode, dst, src1, src2, None)
+    }
+    /// vshufi64x2 zmm, zmm, zmm, imm8 (128 bit lanes: two from src1, two from src2)
+    pub const fn shufi64x2(dst: u8, src1: u8, src2: u8, imm: u8) -> Self {
+        Self::op(1, 3, true, 2, 0x43, dst, src1, VexRm::Reg(src2), Some(imm))
+    }
     /// Shift / rotate by an immediate (opcode 0x72): /0 vprord, /1 vprold, /2 vpsrld, /6 vpslld
     pub const fn shift_imm(vl: u8, ext: u8, dst: u8, src: u8, imm: u8) -> Self {
         Self::op(1, 1, false, vl, 0x72, ext, dst, VexRm::Reg(src), Some(imm))
@@ -1257,6 +1274,11 @@ mod evex_tests {
             (E::pbroadcastd_gpr(16, RAX), "62 e2 7d 48 7c c0"),        // vpbroadcastd zmm16, eax
             (E::pbroadcastq_gpr(30, R9), "62 42 fd 48 7c f1"),         // vpbroadcastq zmm30, r9
             (E::pmovb2m(1, 30), "62 92 7e 48 29 ce"),                  // vpmovb2m k1, zmm30
+            (E::alu_q(2, 1, 0x6c, 24, 16, r(17)), "62 21 fd 40 6c c1"), // vpunpcklqdq zmm24, zmm16, zmm17
+            (E::alu_q(2, 1, 0x6d, 31, 22, r(23)), "62 21 cd 40 6d ff"), // vpunpckhqdq zmm31, zmm22, zmm23
+            (E::alu_q(2, 2, 0x15, 16, 17, VexRm::Mem(R11, 64)), "62 c2 f5 40 15 43 01"), // vprolvq zmm16, zmm17, [r11 + 64]
+            (E::alu_q(1, 2, 0x15, 1, 2, r(3)), "62 f2 ed 28 15 cb"),   // vprolvq ymm1, ymm2, ymm3
+            (E::shufi64x2(16, 24, 26, 0x88), "62 83 bd 40 43 c2 88"),  // vshufi64x2 zmm16, zmm24, zmm26, 0x88
         ];
         for (insn, expected) in cases {
             let (bytes, len) = insn.encode();
@@ -1271,6 +1293,9 @@ mod evex_tests {
             (V::pbroadcastq(2, 15), "c4 c2 7d 59 d7"),                 // vpbroadcastq ymm2, xmm15
             (V::pmovmskb(RCX, 14), "c4 c1 7d d7 ce"),                  // vpmovmskb ecx, ymm14
             (V::blendvps(7, 4, 5, 6), "c4 e3 5d 4a fd 60"),            // vblendvps ymm7, ymm4, ymm5, ymm6
+            (V::alu38w(0x47, 1, 2, VexRm::Reg(3)), "c4 e2 ed 47 cb"),  // vpsllvq ymm1, ymm2, ymm3
+            (V::alu38w(0x45, 12, 12, VexRm::Reg(15)), "c4 42 9d 45 e7"), // vpsrlvq ymm12, ymm12, ymm15
+            (V::psrlq(12, 3, 1), "c5 9d 73 d3 01"),                    // vpsrlq ymm12, ymm3, 1
         ];
         for (insn, expected) in vex {
             let (bytes, len) = insn.encode(std::ptr::null());
