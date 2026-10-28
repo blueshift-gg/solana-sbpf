@@ -1115,6 +1115,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             }
         }
 
+        // Debug builds check the ABI stack alignment at every call into Rust: test rsp, 15; jz +2; ud2
+        #[cfg(all(feature = "simd-experiment", debug_assertions))]
+        for byte in [0x48, 0xf7, 0xc4, 0x0f, 0x00, 0x00, 0x00, 0x74, 0x02, 0x0f, 0x0b] {
+            self.emit::<u8>(byte);
+        }
+
         match target {
             Value::Register(reg) => {
                 self.emit_ins(X86Instruction::call_reg(reg, None));

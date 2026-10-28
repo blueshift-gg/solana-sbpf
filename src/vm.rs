@@ -162,6 +162,10 @@ pub struct Config {
     /// JIT: one host call each. Slow; for comparing the lowerings of a host against the reference.
     #[cfg(feature = "simd-experiment")]
     pub simd_force_reference: bool,
+    /// AVX-512 extensions the JIT must not use even if the host has them
+    /// ([crate::simd::features] bits), to test the lowerings of other CPUs on one host
+    #[cfg(feature = "simd-experiment")]
+    pub simd_disabled_features: u32,
 }
 
 /// JIT lowering strategy for the experimental vector instructions
@@ -211,6 +215,8 @@ impl Default for Config {
             simd_force_avx512: false,
             #[cfg(feature = "simd-experiment")]
             simd_force_reference: false,
+            #[cfg(feature = "simd-experiment")]
+            simd_disabled_features: 0,
         }
     }
 }

@@ -408,24 +408,12 @@ fn op_cases() -> Vec<(&'static str, Body)> {
         }),
     ));
     for wide in [false, true] {
-        // Rosetta 2 shifts by the low bits of a 64 bit count in vpsllvq / vpsrlvq instead of giving 0
-        // for counts above 63, so there the variable counts stay in range
-        let in_range = solana_sbpf::simd::harness::running_under_rosetta();
         cases.push((
             "int64",
             Box::new(move |a| {
                 use solana_sbpf::simd::*;
                 let (d, x, y) = if wide { (0, 2, 4) } else { (0, 1, 2) };
                 a.vsrl(14, 14, 26); // small shift counts
-                if in_range {
-                    a.mov64_imm(3, 63);
-                    a.vbcast64(13, 3);
-                    a.vand(14, 14, 13);
-                    a.vand(y, y, 13);
-                    if wide {
-                        a.vand(y + 1, y + 1, 13);
-                    }
-                }
                 for subop in [VADD64, VSUB64, VSLLV64, VSRLV64, VMULU32, VMULLO64] {
                     a.vop_full(subop, wide, d, x, y, 0, 0, 0);
                     a.vop_full(subop, wide, 6, 6, 14, 0, 0, 0);
@@ -539,9 +527,7 @@ fn op_cases() -> Vec<(&'static str, Body)> {
                     a.vop_full(subop, wide, d, x, y, 0, 0, off);
                     a.vop_full(subop, wide, 8, 8, y, 0, 0, off);
                 }
-                if !solana_sbpf::simd::harness::running_under_rosetta() {
-                    a.vop_full(VSRAV64, wide, 10, x, y, 0, 0, 0);
-                }
+                a.vop_full(VSRAV64, wide, 10, x, y, 0, 0, 0);
             }),
         ));
     }
@@ -1123,8 +1109,7 @@ fn wide_ops_reference() {
         ];
         for (subop, off, f) in arith {
             let body = move |a: &mut Asm| {
-                a.vand(4, 4, 6); // shift counts: lanes of v4 / v5 & v6 / v7 (random, often > 63; the
-                                 // interpreter only, Rosetta 2 gets vpsllvq wrong for those)
+                a.vand(4, 4, 6); // shift counts: lanes of v4 / v5 & v6 / v7 (random, often > 63)
                 a.vand(5, 5, 7);
                 a.vop_full(subop, wide, 8, 0, 4, 0, 0, off);
             };
@@ -2067,7 +2052,9 @@ fn falcon_programs() {
                         stats
                     );
                     if strategy == SimdJitStrategy::RegisterCached && !cfg!(feature = "tracer") {
-                        assert!(stats.cache_hits > 3_000, "{:?}", stats);
+                        // AVX2 about 4200, AVX-512 about 2650 (the ZMM pair cache needs far fewer
+                        // hits: a third of the vector loads, 15 instead of ~1300 reloads)
+                        assert!(stats.cache_hits > 2_000, "{:?}", stats);
                     }
                 }
             }
@@ -2216,15 +2203,10 @@ fn edge_input(variant: u64) -> Vec<u8> {
 #[test]
 fn tiers_agree() {
     let host_avx512 = std::is_x86_feature_detected!("avx512f");
-    let in_range = solana_sbpf::simd::harness::running_under_rosetta();
     let mut inputs: Vec<Vec<u8>> = (0..3).map(random_input).collect();
     inputs.extend((0..4).map(edge_input));
     for (k, input) in inputs.iter().enumerate() {
         for (name, body) in op_cases() {
-            // Rosetta 2 gets vpsllvq / vpsrlvq wrong for some counts above 63
-            if in_range && k >= 3 && name.starts_with("int64") {
-                continue;
-            }
             for mode in [VecMode::Slot, VecMode::Call] {
                 let program = op_program(mode, &*body);
                 let (expected, cus) = run_op(
@@ -2648,7 +2630,6 @@ fn exhaustive_byte_ops() {
 #[test]
 fn exhaustive_shifts_and_widths() {
     use solana_sbpf::simd::*;
-    let rosetta = solana_sbpf::simd::harness::running_under_rosetta();
     for wide in [false, true] {
         let n = 32 * (1 + wide as usize);
         let data = |seed: u64, size: usize| {
@@ -2706,8 +2687,7 @@ fn exhaustive_shifts_and_widths() {
                 let counts: Vec<u8> = (0..n / size)
                     .flat_map(|k| {
                         let c: u64 = match (i + k) % 4 {
-                            // Rosetta 2 gets vpsrlvq wrong for counts above 63 with small low bits
-                            3 if !(rosetta && size == 8) => r(),
+                            3 => r(),
                             _ => ((i * 3 + k) % 71) as u64,
                         };
                         c.to_le_bytes()[..size].to_vec()

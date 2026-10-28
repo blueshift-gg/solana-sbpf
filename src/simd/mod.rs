@@ -639,16 +639,6 @@ pub(crate) fn encode_for_host(op: &VecInsn) -> u64 {
 /// so no errors): runs the reference implementation, returns the scalar result
 #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
 pub(crate) extern "C" fn jit_interpret(vector_base: *mut u8, encoded: u64, scalar: u64) -> u64 {
-    // The JIT must call with an ABI aligned stack (this frame is not a leaf, so RSP stays aligned)
-    #[cfg(debug_assertions)]
-    {
-        let sp: u64;
-        unsafe { std::arch::asm!("mov {}, rsp", out(reg) sp) };
-        if !sp.is_multiple_of(16) {
-            eprintln!("jit_interpret: misaligned stack {sp:#x}");
-            std::process::abort();
-        }
-    }
     let op = VecInsn {
         vd: encoded as u8,
         va: (encoded >> 8) as u8,
@@ -1633,6 +1623,74 @@ impl VectorMemory {
     pub fn slot(&self, index: usize) -> Lanes {
         read_lanes(&self.as_slice()[index * ebpf::VECTOR_WIDTH..])
     }
+}
+
+/// Whether this x86_64 process is translated by Rosetta 2 (which executes AVX2 but hides it from
+/// CPUID)
+pub fn running_under_rosetta() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        let mut value: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let name = b"sysctl.proc_translated\0";
+        let ret = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr().cast(),
+                (&raw mut value).cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        ret == 0 && value == 1
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+/// AVX-512 extensions beyond F / BW / VL / DQ... which the JIT uses when the host has them, as bits
+/// of [crate::vm::Config::simd_disabled_features]
+pub mod features {
+    /// AVX-512 VBMI2
+    pub const VBMI2: u32 = 1 << 0;
+    /// AVX-512 DQ
+    pub const DQ: u32 = 1 << 1;
+    /// AVX-512 IFMA
+    pub const IFMA: u32 = 1 << 2;
+    /// AVX-512 CD
+    pub const CD: u32 = 1 << 3;
+    /// AVX-512 VBMI
+    pub const VBMI: u32 = 1 << 4;
+    /// AVX-512 BITALG
+    pub const BITALG: u32 = 1 << 5;
+    /// AVX-512 VPOPCNTDQ
+    pub const VPOPCNTDQ: u32 = 1 << 6;
+    /// GFNI (EVEX forms)
+    pub const GFNI: u32 = 1 << 7;
+    /// AVX-512 VNNI
+    pub const VNNI: u32 = 1 << 8;
+    /// VPCLMULQDQ (also the VEX forms)
+    pub const VPCLMULQDQ: u32 = 1 << 9;
+    /// Every feature
+    pub const ALL: u32 = (1 << 10) - 1;
+    /// Feature sets of real CPUs with AVX-512 (name, disabled features)
+    pub const PROFILES: [(&str, u32); 4] = [
+        (
+            "skylake-sp",
+            VBMI2 | IFMA | VBMI | BITALG | VPOPCNTDQ | GFNI | VNNI | VPCLMULQDQ,
+        ),
+        (
+            "cascade-lake",
+            VBMI2 | IFMA | VBMI | BITALG | VPOPCNTDQ | GFNI | VPCLMULQDQ,
+        ),
+        (
+            "cannon-lake",
+            VBMI2 | BITALG | VPOPCNTDQ | GFNI | VNNI | VPCLMULQDQ,
+        ),
+        ("ice-lake / zen 4", 0),
+    ];
 }
 
 /// Opcodes which neither touch memory, branch, call, nor throw

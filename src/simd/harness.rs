@@ -85,30 +85,7 @@ pub enum Engine {
     Jit,
 }
 
-/// Whether this x86_64 process is translated by Rosetta 2 (which executes AVX2 but hides it from
-/// CPUID)
-pub fn running_under_rosetta() -> bool {
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        let mut value: libc::c_int = 0;
-        let mut size = std::mem::size_of::<libc::c_int>();
-        let name = b"sysctl.proc_translated\0";
-        let ret = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr().cast(),
-                (&raw mut value).cast(),
-                &raw mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        ret == 0 && value == 1
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-    {
-        false
-    }
-}
+pub use crate::simd::running_under_rosetta;
 
 /// Production-like configuration with the experiment enabled
 pub fn config(strategy: SimdJitStrategy) -> Config {
@@ -233,9 +210,22 @@ impl Runner {
 
     /// Runs the program once, returns the consumed CUs and the result
     pub fn run(&mut self, engine: Engine) -> (u64, ProgramResult) {
+        let vector_ptr = self.vector.host_ptr();
+        unsafe { self.run_with_vector(engine, vector_ptr) }
+    }
+
+    /// Runs with the vector file at `vector_ptr` (e.g. a [GuardedVectorFile])
+    ///
+    /// # Safety
+    ///
+    /// `vector_ptr` must point to [ebpf::VECTOR_MEMORY_SIZE] writable bytes.
+    pub unsafe fn run_with_vector(
+        &mut self,
+        engine: Engine,
+        vector_ptr: *mut u8,
+    ) -> (u64, ProgramResult) {
         self.context.remaining = self.budget;
         let stack_len = self.stack.len();
-        let vector_ptr = self.vector.host_ptr();
         let mut vm = EbpfVm::new(
             self.executable.get_loader().clone(),
             self.executable.get_sbpf_version(),
@@ -271,5 +261,88 @@ impl Runner {
 
     pub fn heap(&self) -> &[u8] {
         self.heap.as_slice()
+    }
+}
+
+/// A vector file between inaccessible guard pages, so any access outside of it faults. `offset`
+/// places the file that many bytes after the start of its pages (no alignment); the file ends at the
+/// trailing guard page if `offset` is 0 and the size is a multiple of the page size, otherwise the
+/// bytes after it up to the guard page are filled with a canary which [Self::canary_intact] checks.
+pub struct GuardedVectorFile {
+    map: *mut u8,
+    map_len: usize,
+    data: *mut u8,
+    data_len: usize,
+    offset: usize,
+}
+
+impl GuardedVectorFile {
+    const CANARY: u8 = 0xa5;
+
+    /// `at_end`: the file ends exactly at the trailing guard page (`offset` must be 0), otherwise
+    /// it starts right after the leading guard page plus `offset`
+    pub fn new(at_end: bool, offset: usize) -> Self {
+        assert!(!at_end || offset == 0);
+        // At least 16 KiB: Rosetta 2 reports 4 KiB pages but protects the host's 16 KiB pages
+        let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize).max(16 << 10);
+        let size = ebpf::VECTOR_MEMORY_SIZE;
+        let data_len = (size + offset).div_ceil(page) * page;
+        let map_len = data_len + 2 * page;
+        unsafe {
+            let map = libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert!(map != libc::MAP_FAILED, "mmap failed");
+            let map = map.cast::<u8>();
+            let data = map.add(page);
+            assert_eq!(
+                libc::mprotect(data.cast(), data_len, libc::PROT_READ | libc::PROT_WRITE),
+                0
+            );
+            std::ptr::write_bytes(data, Self::CANARY, data_len);
+            let offset = if at_end { data_len - size } else { offset };
+            Self {
+                map,
+                map_len,
+                data,
+                data_len,
+                offset,
+            }
+        }
+    }
+
+    pub fn ptr(&mut self) -> *mut u8 {
+        unsafe { self.data.add(self.offset) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.data.add(self.offset), ebpf::VECTOR_MEMORY_SIZE) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(self.data.add(self.offset), ebpf::VECTOR_MEMORY_SIZE)
+        }
+    }
+
+    /// Whether the bytes around the file (inside the accessible pages) are unchanged
+    pub fn canary_intact(&self) -> bool {
+        let all = unsafe { std::slice::from_raw_parts(self.data, self.data_len) };
+        let end = self.offset + ebpf::VECTOR_MEMORY_SIZE;
+        all[..self.offset]
+            .iter()
+            .chain(&all[end..])
+            .all(|b| *b == Self::CANARY)
+    }
+}
+
+impl Drop for GuardedVectorFile {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.map.cast(), self.map_len) };
     }
 }

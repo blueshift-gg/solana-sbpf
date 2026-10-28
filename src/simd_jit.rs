@@ -73,7 +73,10 @@ const TAB_CONF_BIT64: usize = TAB_CONF_BIT32 + 7 * 32;
 /// 0x0000ffff / 0xffff0000 in every u32
 const TAB_LO16: usize = TAB_CONF_BIT64 + 3 * 32;
 const TAB_HI16: usize = TAB_LO16 + 32;
-const TAB_END: usize = TAB_HI16 + 32;
+/// !63 in every u64, zero (Rosetta 2 workaround)
+const TAB_NOT63Q: usize = TAB_HI16 + 32;
+const TAB_ZERO: usize = TAB_NOT63Q + 32;
+const TAB_END: usize = TAB_ZERO + 32;
 /// Upper bound of all constants emitted after the subroutines (shuffle masks, opmask tables, tables)
 pub(super) const CONSTANTS_SIZE: usize = TAB_END + 4096;
 
@@ -161,6 +164,10 @@ pub struct SimdJitState {
     jump_targets: Vec<bool>,
     /// R11 contents can be tracked across instructions (no callx into the middle of blocks)
     static_flow: bool,
+    /// Translated by Rosetta 2, which shifts by the low bits of counts above 63 in vpsllvq /
+    /// vpsrlvq instead of giving 0 (x86-64 macOS builds only)
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    rosetta: bool,
     slots: [SlotState; ebpf::VECTOR_SLOTS],
     regs: [Option<u8>; CACHE_REGS],
     last_use: [u64; CACHE_REGS],
@@ -208,6 +215,8 @@ impl SimdJitState {
             cached: false,
             jump_targets: Vec::new(),
             static_flow: false,
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            rosetta: false,
             slots: [SlotState::default(); ebpf::VECTOR_SLOTS],
             regs: [None; CACHE_REGS],
             last_use: [0; CACHE_REGS],
@@ -269,22 +278,32 @@ impl SimdJitState {
                 && std::arch::is_x86_feature_detected!("avx512vl"));
         state.force_reference = config.simd_force_reference;
         let (avx512, force) = (state.avx512, config.simd_force_avx512);
-        let feature = |detected: bool| avx512 && (force || detected);
-        state.vbmi2 = feature(std::arch::is_x86_feature_detected!("avx512vbmi2"));
-        state.dq = feature(std::arch::is_x86_feature_detected!("avx512dq"));
-        state.ifma = feature(std::arch::is_x86_feature_detected!("avx512ifma"));
-        state.cd = feature(std::arch::is_x86_feature_detected!("avx512cd"));
-        state.vbmi = feature(std::arch::is_x86_feature_detected!("avx512vbmi"));
-        state.bitalg = feature(std::arch::is_x86_feature_detected!("avx512bitalg"));
-        state.vpopcntdq = feature(std::arch::is_x86_feature_detected!("avx512vpopcntdq"));
-        state.gfni = feature(std::arch::is_x86_feature_detected!("gfni"));
-        state.vnni = feature(std::arch::is_x86_feature_detected!("avx512vnni"));
+        let enabled = |bit: u32| config.simd_disabled_features & bit == 0;
+        let feature = |bit: u32, detected: bool| avx512 && enabled(bit) && (force || detected);
+        use simd::features::*;
+        state.vbmi2 = feature(VBMI2, std::arch::is_x86_feature_detected!("avx512vbmi2"));
+        state.dq = feature(DQ, std::arch::is_x86_feature_detected!("avx512dq"));
+        state.ifma = feature(IFMA, std::arch::is_x86_feature_detected!("avx512ifma"));
+        state.cd = feature(CD, std::arch::is_x86_feature_detected!("avx512cd"));
+        state.vbmi = feature(VBMI, std::arch::is_x86_feature_detected!("avx512vbmi"));
+        state.bitalg = feature(BITALG, std::arch::is_x86_feature_detected!("avx512bitalg"));
+        state.vpopcntdq = feature(
+            VPOPCNTDQ,
+            std::arch::is_x86_feature_detected!("avx512vpopcntdq"),
+        );
+        state.gfni = feature(GFNI, std::arch::is_x86_feature_detected!("gfni"));
+        state.vnni = feature(VNNI, std::arch::is_x86_feature_detected!("avx512vnni"));
         // VEX forms: also without AVX-512 (e.g. Zen 3)
         state.vpclmul = !config.simd_force_reference
+            && enabled(VPCLMULQDQ)
             && (state.avx512 && force || std::arch::is_x86_feature_detected!("vpclmulqdq"));
         // callx may only enter instructions outside runs of vector code (see simd::SimdAnalysis),
         // so block local state is sound even in programs which contain callx
         state.static_flow = true;
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        {
+            state.rosetta = simd::running_under_rosetta();
+        }
         state.cached = config.simd_jit_strategy == SimdJitStrategy::RegisterCached;
         state.jump_targets = analysis.jump_targets.clone();
         state.intrinsics = simd::intrinsics::hashes();
@@ -527,6 +546,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         for v in [0x0000_ffffu32, 0xffff_0000] {
             for _ in 0..8 {
                 self.emit::<u32>(v);
+            }
+        }
+        for v in [!63u64, 0] {
+            for _ in 0..4 {
+                self.emit::<u64>(v);
             }
         }
         debug_assert_eq!(self.offset_in_text_section - start, TAB_END);
@@ -1122,7 +1146,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             // The AVX2 lowering on an AVX-512 host (an extension is missing): YMM cache only
             let (slots, count) = Self::simd_operand_slots(&op);
             for &slot in &slots[..count] {
-                for s in slot..slot + op.halves() as u8 {
+                // (in usize: slot 255 + 1 must not wrap to an empty range)
+                for s in (slot as usize..slot as usize + op.halves()).map(|s| s as u8) {
                     self.simd_drop_pair(s / 2);
                 }
             }
@@ -1688,13 +1713,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     self.simd_source(op.vb)
                 };
                 let rd = self.simd_destination(op.vd);
-                self.emit_vex(match op.subop {
-                    VADD64 => V::alu(0xd4, rd, ra, b),
-                    VSUB64 => V::alu(0xfb, rd, ra, b),
-                    VMULU32 => V::alu(0xf4, rd, ra, b),
-                    VSLLV64 => V::alu38w(0x47, rd, ra, b),
-                    _ => V::alu38w(0x45, rd, ra, b),
-                });
+                match op.subop {
+                    VADD64 => self.emit_vex(V::alu(0xd4, rd, ra, b)),
+                    VSUB64 => self.emit_vex(V::alu(0xfb, rd, ra, b)),
+                    VMULU32 => self.emit_vex(V::alu(0xf4, rd, ra, b)),
+                    VSLLV64 => self.emit_simd_shiftv64(true, rd, ra, b),
+                    _ => self.emit_simd_shiftv64(false, rd, ra, b),
+                }
             }
             VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64 | VPOPCNT | VLZCNT | VZEXT | VSEXT => {
                 let ra = self.simd_pinned(op.va);
@@ -1836,7 +1861,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_vex(V::alu(VPXOR, t, t, VexRm::Reg(t)));
                 self.emit_vex(V::alu38(0x37, SCRATCH_YMM, t, VexRm::Reg(ra)));
                 self.emit_vex(V::alu(VPXOR, t, ra, VexRm::Reg(SCRATCH_YMM)));
-                self.emit_vex(V::alu38w(0x45, t, t, b));
+                self.emit_simd_shiftv64(false, t, t, b);
                 let rd = self.simd_destination(op.vd);
                 self.emit_vex(V::alu(VPXOR, rd, t, VexRm::Reg(SCRATCH_YMM)));
             }
@@ -2866,7 +2891,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         let n = (ebpf::VECTOR_WIDTH * op.halves()) as i32 >> shift;
         // The operands must be in memory
         for slot in [op.vd, op.va] {
-            for s in slot..slot + op.halves() as u8 {
+            // (in usize: slot 255 + 1 must not wrap to an empty range)
+            for s in (slot as usize..slot as usize + op.halves()).map(|s| s as u8) {
                 self.simd_drop_slot(s);
                 self.simd_drop_pair(s / 2);
             }
@@ -3624,11 +3650,41 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             SCRATCH_YMM,
             VexRm::Reg(c),
         ));
-        self.emit_vex(shift(!left, t, ra, SCRATCH_YMM));
-        let rd = self.simd_destination(op.vd);
+        let rd = if q {
+            self.emit_simd_shiftv64(!left, t, ra, VexRm::Reg(SCRATCH_YMM));
+            let rd = self.simd_destination(op.vd);
+            self.emit_simd_shiftv64(left, rd, rd, VexRm::Reg(c));
+            rd
+        } else {
+            self.emit_vex(shift(!left, t, ra, SCRATCH_YMM));
+            let rd = self.simd_destination(op.vd);
+            self.emit_vex(shift(left, rd, rd, c));
+            rd
+        };
         debug_assert_eq!(rd, rd0);
-        self.emit_vex(shift(left, rd, rd, c));
         self.emit_vex(V::alu(VPOR, rd, rd, VexRm::Reg(t)));
+    }
+
+    /// vpsllvq (`left`) / vpsrlvq. Under Rosetta 2 (x86-64 macOS builds only) the lanes with counts
+    /// above 63 are zeroed explicitly: the in range mask is computed first (the count may alias
+    /// `dst`), then and-ed into the result. Every register operand must be pinned.
+    fn emit_simd_shiftv64(&mut self, left: bool, dst: u8, src: u8, count: VexRm) {
+        let opcode = if left { 0x47 } else { 0x45 };
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        if self.simd.rosetta {
+            self.simd_pin(dst);
+            let m = self.simd_temp();
+            self.emit_vex(V::load_rip(m, unsafe {
+                self.anchors[ANCHOR_SIMD_TABLES].add(TAB_NOT63Q)
+            }));
+            self.emit_vex(V::alu(VPAND, m, m, count));
+            self.emit_vex(V::alu38(0x29, m, m, self.simd_table(TAB_ZERO)));
+            self.emit_vex(V::alu38w(opcode, dst, src, count));
+            self.emit_vex(V::alu(VPAND, dst, dst, VexRm::Reg(m)));
+            self.simd_unpin(m);
+            return;
+        }
+        self.emit_vex(V::alu38w(opcode, dst, src, count));
     }
 
     /// Masked load / store: one call which translates the span of the set lanes and copies them
@@ -4024,11 +4080,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_vex(V::psrlq(s, rb, 8 * j));
                 self.emit_vex(V::alu(VPAND, s, s, c63));
             }
-            self.emit_vex(V::alu38w(0x45, t, ra, r(s)));
+            self.emit_simd_shiftv64(false, t, ra, r(s));
             self.emit_vex(V::alu(VPXOR, k, k, r(k)));
             self.emit_vex(V::alu(VPOR, k, k, c64));
             self.emit_vex(V::alu(0xfb, k, k, r(s)));
-            self.emit_vex(V::alu38w(0x47, u, ra, r(k)));
+            self.emit_simd_shiftv64(true, u, ra, r(k));
             self.emit_vex(V::alu(VPOR, t, t, r(u)));
             self.emit_vex(V::alu(VPAND, t, t, ffq));
             if j > 0 {
@@ -4185,7 +4241,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         };
         let n = (ebpf::VECTOR_WIDTH * op.halves()) as i32 >> shift;
         for slot in [op.vd, op.va] {
-            for s in slot..slot + op.halves() as u8 {
+            // (in usize: slot 255 + 1 must not wrap to an empty range)
+            for s in (slot as usize..slot as usize + op.halves()).map(|s| s as u8) {
                 self.simd_drop_slot(s);
                 self.simd_drop_pair(s / 2);
             }

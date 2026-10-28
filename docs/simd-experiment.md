@@ -203,8 +203,33 @@ shifts, every u16 index of `permw`, and masked loads / stores at region ends. Th
 reference interpreter bug (signed `min` / `max` compared sign extended lanes as unsigned): the JIT
 was right.
 
-Rosetta 2 gets `vpsllvq` / `vpsrlvq` wrong for counts above 63 whose low bits are small (it shifts by
-the low bits instead of returning 0); the tests keep those counts in range when running under it.
+Rosetta 2 gets `vpsllvq` / `vpsrlvq` wrong for counts above 63 (it shifts by the low bits instead of
+returning 0). x86-64 macOS builds of the JIT detect Rosetta and zero those lanes explicitly (three
+more instructions per u64 variable shift: `sllv64`, `srlv64`, `srav64`, the u64 funnel shifts and
+`multishift`), so the tests run every count there too. Other targets don't contain the workaround,
+so the code for real hardware is unchanged.
+
+**Robustness** (`tests/simd_robustness.rs`). Each test runs the interpreter and every JIT tier of the
+host (cached, direct, reference, with heavy code diversification, without value sanitization, and on
+AVX-512 hosts AVX2-only plus every CPU feature profile of `simd::features::PROFILES` through
+`Config::simd_disabled_features`) and compares result, CUs, guest memory and the vector file:
+
+* *Out of bounds:* every operation at the boundary slots (0, the limits of the 6 / 7 bit fields,
+  each of the last 32 slots) in every operand role, with constant operands (lowered inline), run
+  time operands (the generic path) and malformed ones (flipped and non-canonical bits). The vector
+  file lies between guard pages (`harness::GuardedVectorFile`), so an access outside of it faults,
+  and canaries catch writes into the slack of a page. Bulk / masked transfers with every slot count
+  up to the end and beyond, transfers at the edges of guest memory regions with every mask pattern.
+* *Divergence:* every operation with every aliasing of its operands, each with the operands in
+  memory, cached and dirty, or evicted; every scalar register (including `dst == src`) for the
+  operations with scalar operands; faults (access violations, division by zero, the instruction
+  meter at checkpoints and at `lddw`) in the middle of vector code leave the vector file written
+  back.
+* *Alignment:* misaligned vector files (offsets 1, 8, 16, 31; under Rosetta 2 an aligned load planted
+  in the JIT went unnoticed, so this is only checked on real hardware), and in debug builds the JIT checks
+  RSP before every call into Rust (`test rsp, 15; jz; ud2`), so run the suites in debug builds too.
+* The tests must notice planted bugs: an off by one slot count, broken templates, a missing write
+  back or flush, an aligned load from the vector file, the stack parity bug all make them fail.
 
 ## Intrinsic call form (SIMD-0645 style, no new opcode)
 
