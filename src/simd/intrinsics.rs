@@ -88,6 +88,34 @@ pub const NAMES_256: [&str; SUBOP_COUNT as usize] = [
     "sol_avx512_compress256",
     "sol_avx512_expand256",
     "sol_avx2_mont16x16",
+    "sol_avx2_sll16x16",
+    "sol_avx2_srl16x16",
+    "sol_avx2_sra16x16",
+    "sol_avx2_sra32x8",
+    "sol_avx512_sllv16x16",
+    "sol_avx512_srlv16x16",
+    "sol_avx512_srav16x16",
+    "sol_avx2_srav32x8",
+    "sol_avx512_srav64x4",
+    "sol_avx512_ror64x4",
+    "sol_avx2_unpacklo256",
+    "sol_avx2_unpackhi256",
+    "sol_avx2_packss256",
+    "sol_avx2_packus256",
+    "sol_avx2_zext256",
+    "sol_avx2_sext256",
+    "sol_avx512_popcnt256",
+    "sol_avx512_lzcnt256",
+    "sol_avx512_permb256",
+    "sol_avx512_permi2b256",
+    "sol_avx512_multishift256",
+    "sol_avx512_gf2p8affine256",
+    "sol_avx512_gf2p8mul256",
+    "sol_avx512_aesenc256",
+    "sol_avx512_aesenclast256",
+    "sol_avx512_aesdec256",
+    "sol_avx512_aesdeclast256",
+    "sol_avx512_clmul256",
 ];
 
 /// Function names of the 512 bit forms (slot pairs, AVX-512F/BW), indexed by sub-operation
@@ -148,6 +176,34 @@ pub const NAMES_512: [Option<&str>; SUBOP_COUNT as usize] = [
     Some("sol_avx512_compress512"),
     Some("sol_avx512_expand512"),
     Some("sol_avx512_mont16x32"),
+    Some("sol_avx512_sll16x32"),
+    Some("sol_avx512_srl16x32"),
+    Some("sol_avx512_sra16x32"),
+    Some("sol_avx512_sra32x16"),
+    Some("sol_avx512_sllv16x32"),
+    Some("sol_avx512_srlv16x32"),
+    Some("sol_avx512_srav16x32"),
+    Some("sol_avx512_srav32x16"),
+    Some("sol_avx512_srav64x8"),
+    Some("sol_avx512_ror64x8"),
+    Some("sol_avx512_unpacklo512"),
+    Some("sol_avx512_unpackhi512"),
+    Some("sol_avx512_packss512"),
+    Some("sol_avx512_packus512"),
+    Some("sol_avx512_zext512"),
+    Some("sol_avx512_sext512"),
+    Some("sol_avx512_popcnt512"),
+    Some("sol_avx512_lzcnt512"),
+    Some("sol_avx512_permb512"),
+    Some("sol_avx512_permi2b512"),
+    Some("sol_avx512_multishift512"),
+    Some("sol_avx512_gf2p8affine512"),
+    Some("sol_avx512_gf2p8mul512"),
+    Some("sol_avx512_aesenc512"),
+    Some("sol_avx512_aesenclast512"),
+    Some("sol_avx512_aesdec512"),
+    Some("sol_avx512_aesdeclast512"),
+    Some("sol_avx512_clmul512"),
 ];
 
 /// Register holding the packed operands
@@ -202,6 +258,8 @@ pub fn hashes() -> Vec<(u32, u8, bool)> {
 /// blendd / blendw /      bits 0..6 vd   bits 7..13 va   bits 14..20 vb   bits 21..28 imm8 (slots < 128)
 /// ternlog
 /// mont16                 bits 0..6 vd   bits 7..13 va   bits 14..20 w   bits 21..27 q   (slots < 128)
+/// unpack / pack /        bits 0..6 vd   bits 7..13 va   bits 14..20 vb   bits 21..28 imm8 (slots < 128)
+/// gf2p8affine / clmul
 /// ```
 pub fn pack(op: &VecInsn) -> u64 {
     let (vd, va, vb, imm) = (op.vd as u64, op.va as u64, op.vb as u64, op.off as u16 as u64);
@@ -212,7 +270,11 @@ pub fn pack(op: &VecInsn) -> u64 {
         VINS64 => vd | imm << 8,
         VEXT64 => va | imm << 8,
         VMOVMSK8 => va,
-        VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 => vd | va << 8 | (imm & 0xff) << 16,
+        VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 | VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64
+        | VPOPCNT | VLZCNT | VZEXT | VSEXT => vd | va << 8 | (imm & 0xff) << 16,
+        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL => {
+            (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21
+        }
         VCMP => va | vb << 8 | (imm & 0xff) << 16,
         VBLENDM => vd | va << 8 | vb << 16 | (imm & 3) << 24,
         VCOMPRESS | VEXPAND => vd | va << 8 | (imm & 3) << 16,
@@ -237,7 +299,12 @@ pub fn unpack(subop: u8, wide: bool, packed: u64) -> Option<VecInsn> {
         VINS64 => (vd, off) = (byte(0), byte(8) as i16),
         VEXT64 => (va, off) = (byte(0), byte(8) as i16),
         VMOVMSK8 => va = byte(0),
-        VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
+        VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 | VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64
+        | VPOPCNT | VLZCNT | VZEXT | VSEXT => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
+        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL => {
+            let field = |shift: u32| ((packed >> shift) & 0x7f) as u8;
+            (vd, va, vb, off) = (field(0), field(7), field(14), byte(21) as i16);
+        }
         VCMP => (va, vb, off) = (byte(0), byte(8), byte(16) as i16),
         VBLENDM => (vd, va, vb, off) = (byte(0), byte(8), byte(16), byte(24) as i16),
         VCOMPRESS | VEXPAND => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
@@ -320,8 +387,10 @@ pub fn register<C: ContextObject>(loader: &mut BuiltinProgram<C>) -> Result<(), 
         };
     }
     register!(false: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55);
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+        56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83);
     register!(true: 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55);
+        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+        56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83);
     Ok(())
 }

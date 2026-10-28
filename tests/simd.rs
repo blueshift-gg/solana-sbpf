@@ -374,6 +374,26 @@ fn op_cases() -> Vec<(&'static str, Body)> {
             }
         })));
     }
+    for wide in [false, true] {
+        cases.push(("ext_ops", Box::new(move |a| {
+            use solana_sbpf::simd::*;
+            let (d, x, y) = if wide { (0, 2, 4) } else { (0, 1, 2) };
+            for (subop, off) in [(VSLL16, 3i16), (VSRL16, 15), (VSRA16, 7), (VSRA32, 31), (VROR64, 13), (VPOPCNT, 0), (VPOPCNT, 1),
+                (VPOPCNT, 2), (VPOPCNT, 3), (VLZCNT, 2), (VLZCNT, 3), (VZEXT, 1 << 2), (VSEXT, 3 << 2), (VZEXT, 1 | 3 << 2), (VSEXT, 2 | 3 << 2)] {
+                a.vop_full(subop, wide, d, x, 0, 0, 0, off);
+                a.vop_full(subop, wide, 6, 6, 0, 0, 0, off);
+            }
+            for (subop, off) in [(VSLLV16, 0i16), (VSRLV16, 0), (VSRAV16, 0), (VSRAV32, 0), (VUNPCKLO, 1), (VUNPCKHI, 3), (VPACKSS, 0),
+                (VPACKUS, 1), (VPERMB, 0), (VMULTISHIFT, 0), (VGF2P8AFFINE, 0x63), (VGF2P8MUL, 0), (VAESENC, 0), (VAESENCLAST, 0),
+                (VAESDEC, 0), (VAESDECLAST, 0), (VCLMUL, 0x11), (VPERMI2B, 0)] {
+                a.vop_full(subop, wide, d, x, y, 0, 0, off);
+                a.vop_full(subop, wide, 8, 8, y, 0, 0, off);
+            }
+            if !solana_sbpf::simd::harness::running_under_rosetta() {
+                a.vop_full(VSRAV64, wide, 10, x, y, 0, 0, 0);
+            }
+        })));
+    }
     cases.push(("wide_bcast", Box::new(|a| {
         a.lddw(3, 0x8765_4321_0fed_cba9);
         a.wide(solana_sbpf::simd::VBCAST32, 2, 0, 0, 3, 0);
@@ -635,7 +655,7 @@ fn wide_ops_reference() {
     use solana_sbpf::simd::{self, intrinsics::NAMES_512, VecInsn};
     let input = random_input(41);
     for subop in 0..simd::SUBOP_COUNT {
-        if NAMES_512[subop as usize].is_none() || matches!(subop, simd::VMOVMSK8 | simd::VBCAST32 | simd::VBCAST64 | simd::VTRANSPOSE64 | simd::VPERMT2D | simd::VCOMPRESSLT16 | simd::VMONT16 | simd::VCMP | simd::VBLENDM | simd::VCOMPRESS | simd::VEXPAND) {
+        if NAMES_512[subop as usize].is_none() || subop >= simd::VSLL16 || matches!(subop, simd::VMOVMSK8 | simd::VBCAST32 | simd::VBCAST64 | simd::VTRANSPOSE64 | simd::VPERMT2D | simd::VCOMPRESSLT16 | simd::VMONT16 | simd::VCMP | simd::VBLENDM | simd::VCOMPRESS | simd::VEXPAND) {
             continue;
         }
         let off = match subop {
@@ -963,8 +983,8 @@ fn detached_and_disabled_and_malformed() {
     }
     // Malformed encodings are rejected by the verifier
     for (imm, dst, src, off) in [
-        (0x7f << 18, 0u8, 0u8, 0i16), // unknown sub-operation
-        (1 << 25, 0, 0, 0),           // reserved bit
+        (0x3f << 18 | 1 << 25, 0u8, 0u8, 0i16), // unknown sub-operation (127)
+        (1 << 26, 0, 0, 0),           // reserved bit
         ((0x06 << 18) as i32, 0, 0, 32), // rotation >= 32
         ((0x10 << 18) as i32, 0, 0, 32), // shift >= 32
         ((0x02 << 18) as i32, 3, 0, 0), // dst register of an op without scalar result
@@ -1496,4 +1516,523 @@ fn avx2_templates_cover_the_avx512_operations() {
     runner.jit_compile().unwrap();
     let stats = runner.executable.get_compiled_program().unwrap().simd_stats;
     assert_eq!(stats.intrinsic_slow_paths, 2, "{stats:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exhaustive / systematic tests: an operation runs over a stream of records (a, b, d operands and
+// a mask) in one loop; the interpreter must match an independent model written here, and every
+// lowering of the host (default JIT, forced reference, AVX2 only on AVX-512 hosts) must match the
+// interpreter bit for bit, CUs included.
+
+/// Runs `subop` (width `wide`, immediate `off`) over `records` (each a ++ b ++ d ++ u64 mask),
+/// returns per record the result vector ++ the scalar result (u64)
+fn stream_op(subop: u8, wide: bool, off: i16, records: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use solana_sbpf::simd::{uses_src, writes_dst};
+    let h = 1 + wide as u8;
+    let n = 32 * h as usize;
+    let mut a = Asm::new(VecMode::Call);
+    a.mov64(6, 1);
+    a.lddw(7, ebpf::MM_HEAP_START);
+    a.mov64_imm(8, records.len() as i64);
+    let top = a.new_label();
+    a.bind(top);
+    a.vload_n(0, 3 * h, 6, 0);
+    a.ldxdw(3, 6, 3 * n as i16);
+    a.mov64_imm(4, 0);
+    let (src, dst) = (if uses_src(subop) { 3 } else { 0 }, if writes_dst(subop) { 4 } else { 0 });
+    a.vop_full(subop, wide, 2 * h, 0, h, dst, src, off);
+    a.vstore_n(7, 0, 2 * h, h);
+    a.stxdw(7, n as i16, 4);
+    a.add64_imm(6, 3 * n as i64 + 8);
+    a.add64_imm(7, n as i64 + 8);
+    a.sub64_imm(8, 1);
+    a.jne_imm(8, 0, top);
+    a.mov64_imm(0, 0);
+    a.exit();
+    let program = a.finish();
+    let input: Vec<u8> = records.iter().flatten().copied().collect();
+    let heap_size = records.len() * (n + 8) + 64;
+    let run = |engine: Engine, strategy, avx512: bool, reference: bool| {
+        let mut c = config(strategy);
+        c.simd_avx512 = avx512;
+        c.simd_force_reference = reference;
+        let mut runner = Runner::new(&program, &input, heap_size, c).unwrap();
+        runner.budget = 1 << 32;
+        if engine == Engine::Jit {
+            runner.jit_compile().unwrap();
+        }
+        let (cus, result) = runner.run(engine);
+        assert!(result.is_ok(), "{} {result:?}", solana_sbpf::simd::mnemonic(subop, wide));
+        (runner.heap()[..records.len() * (n + 8)].to_vec(), cus)
+    };
+    let (expected, cus) = run(Engine::Interpreter, SimdJitStrategy::Direct, true, false);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut tiers = vec![(SimdJitStrategy::RegisterCached, true, false), (SimdJitStrategy::Direct, true, false), (SimdJitStrategy::Direct, true, true)];
+        if std::is_x86_feature_detected!("avx512f") {
+            tiers.push((SimdJitStrategy::RegisterCached, false, false));
+        }
+        for (strategy, avx512, reference) in tiers {
+            let (got, jit_cus) = run(Engine::Jit, strategy, avx512, reference);
+            assert!(got == expected, "{} off {off:#x}: {strategy:?} avx512={avx512} reference={reference} differs from the interpreter", solana_sbpf::simd::mnemonic(subop, wide));
+            assert_eq!(jit_cus, cus);
+        }
+    }
+    expected.chunks(n + 8).map(|c| c.to_vec()).collect()
+}
+
+/// Records from operand generators (`a`, `b`, `d` get the record index and the operand size)
+fn records(count: usize, n: usize, f: &dyn Fn(usize, usize) -> (Vec<u8>, Vec<u8>, Vec<u8>, u64)) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|i| {
+            let (a, b, d, m) = f(i, n);
+            assert!(a.len() == n && b.len() == n && d.len() == n);
+            [a, b, d, m.to_le_bytes().to_vec()].concat()
+        })
+        .collect()
+}
+
+fn rng(seed: u64) -> impl FnMut() -> u64 {
+    let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    }
+}
+
+fn rand_bytes(r: &mut dyn FnMut() -> u64, n: usize) -> Vec<u8> {
+    (0..n).map(|_| r() as u8).collect()
+}
+
+/// Values worth hitting in lanes of `size` bytes, mixed with random ones
+fn edge_lanes(r: &mut dyn FnMut() -> u64, n: usize, size: usize) -> Vec<u8> {
+    let bits = 8 * size as u32;
+    let max = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let edges = [0, 1, 2, max, max >> 1, (max >> 1) + 1, 15, 16, 31, 32, 33, 63, 64, 65, 0x55 * (max / 0xff), r() & max];
+    (0..n / size).flat_map(|_| {
+        let v = if r() % 3 == 0 { r() & max } else { edges[(r() % edges.len() as u64) as usize] };
+        v.to_le_bytes()[..size].to_vec()
+    }).collect()
+}
+
+fn lanes(x: &[u8], size: usize) -> Vec<u64> {
+    x.chunks(size).map(|c| c.iter().rev().fold(0u64, |v, b| v << 8 | *b as u64)).collect()
+}
+
+fn sext(v: u64, size: usize) -> i64 {
+    ((v << (64 - 8 * size)) as i64) >> (64 - 8 * size)
+}
+
+fn model_gf_mul(a: u8, b: u8) -> u8 {
+    // Schoolbook carry-less product, then reduction modulo 0x11b
+    let mut p = 0u16;
+    for i in 0..8 {
+        if (b >> i) & 1 != 0 {
+            p ^= (a as u16) << i;
+        }
+    }
+    for i in (8..15).rev() {
+        if (p >> i) & 1 != 0 {
+            p ^= 0x11b << (i - 8);
+        }
+    }
+    p as u8
+}
+
+#[test]
+fn exhaustive_byte_ops() {
+    use solana_sbpf::simd::*;
+    for wide in [false, true] {
+        let n = 32 * (1 + wide as usize);
+        // gf2p8mul: every pair of bytes
+        let pairs = 65536 / n;
+        let recs = records(pairs, n, &|i, n| {
+            let a: Vec<u8> = (0..n).map(|k| ((i * n + k) >> 8) as u8).collect();
+            let b: Vec<u8> = (0..n).map(|k| (i * n + k) as u8).collect();
+            (a, b, vec![0; n], 0)
+        });
+        let out = stream_op(VGF2P8MUL, wide, 0, &recs);
+        for (rec, o) in recs.iter().zip(&out) {
+            for k in 0..n {
+                assert_eq!(o[k], model_gf_mul(rec[k], rec[n + k]), "gf2p8mul {:#x} {:#x}", rec[k], rec[n + k]);
+            }
+        }
+        // gf2p8affine: every byte under the identity, the AES affine matrix and random matrices
+        for (matrix, imm) in [(0x0102_0408_1020_4080u64, 0i16), (0xf1e3_c78f_1f3e_7cf8, 0x63), (0x8040_2010_0804_0201, 0xff), (0x1234_5678_9abc_def0, 0x5a)] {
+            let recs = records(256 / n * 1, n, &|i, n| {
+                let a: Vec<u8> = (0..n).map(|k| (i * n + k) as u8).collect();
+                (a, matrix.to_le_bytes().repeat(n / 8), vec![0; n], 0)
+            });
+            let out = stream_op(VGF2P8AFFINE, wide, imm, &recs);
+            for (rec, o) in recs.iter().zip(&out) {
+                for k in 0..n {
+                    let m = matrix.to_le_bytes();
+                    let expected = (0..8).fold(0u8, |r, bit| r | (((m[7 - bit] & rec[k]).count_ones() as u8 & 1) ^ ((imm as u8 >> bit) & 1)) << bit);
+                    assert_eq!(o[k], expected, "gf2p8affine {matrix:#x} {imm:#x} x={:#x}", rec[k]);
+                }
+            }
+        }
+        // permb / permi2b: every index value, multishift: every control byte
+        let mut r = rng(5 + wide as u64);
+        let recs = records(256 / n * 2, n, &|i, n| {
+            let mut r = rng(i as u64 + 99);
+            ((0..n).map(|_| r() as u8).collect(), (0..n).map(|k| (i * n + k) as u8).collect(), (0..n).map(|k| ((i * n + k) as u8).rotate_left(3)).collect(), 0)
+        });
+        let _ = r();
+        let out = stream_op(VPERMB, wide, 0, &recs);
+        for (rec, o) in recs.iter().zip(&out) {
+            for k in 0..n {
+                assert_eq!(o[k], rec[rec[n + k] as usize % n], "permb");
+            }
+        }
+        let out = stream_op(VPERMI2B, wide, 0, &recs);
+        for (rec, o) in recs.iter().zip(&out) {
+            for k in 0..n {
+                let j = rec[2 * n + k] as usize % (2 * n);
+                assert_eq!(o[k], if j < n { rec[j] } else { rec[n + j - n] }, "permi2b");
+            }
+        }
+        let out = stream_op(VMULTISHIFT, wide, 0, &recs);
+        for (rec, o) in recs.iter().zip(&out) {
+            for k in 0..n {
+                let q = u64::from_le_bytes(rec[k & !7..(k & !7) + 8].try_into().unwrap());
+                let c = rec[n + k] as u32 % 64;
+                assert_eq!(o[k], ((q >> c) | if c == 0 { 0 } else { q << (64 - c) }) as u8, "multishift");
+            }
+        }
+        // popcnt: every byte and every u16; edge and random u32 / u64
+        for size in 0..4usize {
+            let count = match size { 0 => 256 / n, 1 => 65536 * 2 / n, _ => 64 };
+            let recs = records(count, n, &|i, n| {
+                let a: Vec<u8> = match size {
+                    0 => (0..n).map(|k| (i * n + k) as u8).collect(),
+                    1 => (0..n / 2).flat_map(|k| ((i * n / 2 + k) as u16).to_le_bytes()).collect(),
+                    _ => { let mut r = rng(i as u64); edge_lanes(&mut r, n, 1 << size) }
+                };
+                (a, vec![0; n], vec![0; n], 0)
+            });
+            let out = stream_op(VPOPCNT, wide, size as i16, &recs);
+            for (rec, o) in recs.iter().zip(&out) {
+                let (x, y) = (lanes(&rec[..n], 1 << size), lanes(&o[..n], 1 << size));
+                for k in 0..x.len() {
+                    assert_eq!(y[k], x[k].count_ones() as u64, "popcnt size {size}");
+                }
+            }
+        }
+        // lzcnt: every leading zero count
+        for size in [2usize, 3] {
+            let bits = 8 << size;
+            let recs = records(bits + 8, n, &|i, n| {
+                let mut r = rng(i as u64 * 7);
+                let a: Vec<u8> = (0..n / (1 << size)).flat_map(|k| {
+                    let lz = (i + k) % (bits + 1);
+                    let v = if lz == bits { 0 } else { (1u64 << (bits - 1 - lz)) | (r() & ((1u64 << (bits - 1 - lz)) - 1)) };
+                    v.to_le_bytes()[..1 << size].to_vec()
+                }).collect();
+                (a, vec![0; n], vec![0; n], 0)
+            });
+            let out = stream_op(VLZCNT, wide, size as i16, &recs);
+            for (rec, o) in recs.iter().zip(&out) {
+                let (x, y) = (lanes(&rec[..n], 1 << size), lanes(&o[..n], 1 << size));
+                for k in 0..x.len() {
+                    assert_eq!(y[k], (x[k].leading_zeros() - (64 - bits as u32)) as u64, "lzcnt size {size}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exhaustive_shifts_and_widths() {
+    use solana_sbpf::simd::*;
+    let rosetta = solana_sbpf::simd::harness::running_under_rosetta();
+    for wide in [false, true] {
+        let n = 32 * (1 + wide as usize);
+        let data = |seed: u64, size: usize| records(24, n, &|i, n| {
+            let mut r = rng(seed * 1000 + i as u64);
+            (edge_lanes(&mut r, n, size), edge_lanes(&mut r, n, size), edge_lanes(&mut r, n, size), r())
+        });
+        // Immediate shifts and rotates: every count
+        for (subop, size, counts) in [(VSLL16, 2, 16), (VSRL16, 2, 16), (VSRA16, 2, 16), (VSRA32, 4, 32), (VROR64, 8, 64)] {
+            let recs = data(subop as u64, size);
+            for c in 0..counts {
+                let out = stream_op(subop, wide, c as i16, &recs);
+                for (rec, o) in recs.iter().zip(&out) {
+                    let (x, y) = (lanes(&rec[..n], size), lanes(&o[..n], size));
+                    for k in 0..x.len() {
+                        let bits = 8 * size as u32;
+                        let mask = if bits == 64 { u64::MAX } else { (1 << bits) - 1 };
+                        let e = match subop {
+                            VSLL16 => (x[k] << c) & mask,
+                            VSRL16 => x[k] >> c,
+                            VSRA16 | VSRA32 => (sext(x[k], size) >> c) as u64 & mask,
+                            _ => x[k].rotate_right(c),
+                        };
+                        assert_eq!(y[k], e, "{} count {c}", mnemonic(subop, wide));
+                    }
+                }
+            }
+        }
+        // Variable shifts: counts 0..=70 and huge ones in every lane
+        for (subop, size) in [(VSLLV16, 2), (VSRLV16, 2), (VSRAV16, 2), (VSRAV32, 4), (VSRAV64, 8)] {
+            let recs = records(48, n, &|i, n| {
+                let mut r = rng(i as u64 + 31 * subop as u64);
+                let counts: Vec<u8> = (0..n / size).flat_map(|k| {
+                    let c: u64 = match (i + k) % 4 {
+                        // Rosetta 2 gets vpsrlvq wrong for counts above 63 with small low bits
+                        3 if !(rosetta && size == 8) => r(),
+                        _ => ((i * 3 + k) % 71) as u64,
+                    };
+                    c.to_le_bytes()[..size].to_vec()
+                }).collect();
+                (edge_lanes(&mut r, n, size), counts, vec![0; n], 0)
+            });
+            let out = stream_op(subop, wide, 0, &recs);
+            for (rec, o) in recs.iter().zip(&out) {
+                let (x, c, y) = (lanes(&rec[..n], size), lanes(&rec[n..2 * n], size), lanes(&o[..n], size));
+                let bits = 8 * size as u64;
+                let mask = if bits == 64 { u64::MAX } else { (1 << bits) - 1 };
+                for k in 0..x.len() {
+                    let e = match subop {
+                        VSLLV16 => if c[k] >= bits { 0 } else { (x[k] << c[k]) & mask },
+                        VSRLV16 => if c[k] >= bits { 0 } else { x[k] >> c[k] },
+                        _ => (sext(x[k], size) >> c[k].min(bits - 1)) as u64 & mask,
+                    };
+                    assert_eq!(y[k], e, "{} x {:#x} count {}", mnemonic(subop, wide), x[k], c[k]);
+                }
+            }
+        }
+        // Unpacks: every lane size
+        for size in 0..4usize {
+            let recs = data(77 + size as u64, 1 << size);
+            for subop in [VUNPCKLO, VUNPCKHI] {
+                let out = stream_op(subop, wide, size as i16, &recs);
+                for (rec, o) in recs.iter().zip(&out) {
+                    let s = 1 << size;
+                    let mut e = Vec::new();
+                    for lane in 0..n / 16 {
+                        let base = 16 * lane + if subop == VUNPCKHI { 8 } else { 0 };
+                        for k in 0..8 / s {
+                            e.extend_from_slice(&rec[base + s * k..base + s * (k + 1)]);
+                            e.extend_from_slice(&rec[n + base + s * k..n + base + s * (k + 1)]);
+                        }
+                    }
+                    assert_eq!(o[..n], e[..], "{} size {size}", mnemonic(subop, wide));
+                }
+            }
+        }
+        // Packs: every i16 for 16 -> 8, edge i32 for 32 -> 16
+        for (size, count) in [(2usize, 65536 * 2 / n / 2), (4, 64)] {
+            let recs = records(count, n, &|i, n| {
+                let mut r = rng(i as u64 + 5);
+                if size == 2 {
+                    let a: Vec<u8> = (0..n / 2).flat_map(|k| ((i * n + k) as u16).to_le_bytes()).collect();
+                    let b: Vec<u8> = (0..n / 2).flat_map(|k| ((i * n + n / 2 + k) as u16).to_le_bytes()).collect();
+                    (a, b, vec![0; n], 0)
+                } else {
+                    (edge_lanes(&mut r, n, 4), edge_lanes(&mut r, n, 4), vec![0; n], 0)
+                }
+            });
+            for subop in [VPACKSS, VPACKUS] {
+                let out = stream_op(subop, wide, (size / 4) as i16, &recs);
+                for (rec, o) in recs.iter().zip(&out) {
+                    let narrow = size / 2;
+                    let (lo, hi) = if subop == VPACKSS { (-(1i64 << (8 * narrow - 1)), (1i64 << (8 * narrow - 1)) - 1) } else { (0, (1i64 << (8 * narrow)) - 1) };
+                    let mut e = Vec::new();
+                    for lane in 0..n / 16 {
+                        for src in [&rec[..n], &rec[n..2 * n]] {
+                            for v in lanes(&src[16 * lane..16 * lane + 16], size) {
+                                e.extend_from_slice(&(sext(v, size).clamp(lo, hi) as u64).to_le_bytes()[..narrow]);
+                            }
+                        }
+                    }
+                    assert_eq!(o[..n], e[..], "{} size {size}", mnemonic(subop, wide));
+                }
+            }
+        }
+        // Zero / sign extension: all six widenings, every byte / u16
+        for (from, to) in [(0usize, 1usize), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
+            let recs = records(65536 * 2 / n / 4, n, &|i, n| {
+                let a: Vec<u8> = (0..n / 2).flat_map(|k| ((i * n / 2 + k) as u16).to_le_bytes()).collect();
+                let mut r = rng(i as u64);
+                (if from == 2 { edge_lanes(&mut r, n, 4) } else { a }, vec![0; n], vec![0; n], 0)
+            });
+            for subop in [VZEXT, VSEXT] {
+                let out = stream_op(subop, wide, (from | to << 2) as i16, &recs);
+                for (rec, o) in recs.iter().zip(&out) {
+                    let (fs, ts) = (1usize << from, 1usize << to);
+                    let src = lanes(&rec[..n * fs / ts], fs);
+                    let e: Vec<u8> = src.iter().flat_map(|v| {
+                        let w = if subop == VSEXT { sext(*v, fs) as u64 } else { *v };
+                        w.to_le_bytes()[..ts].to_vec()
+                    }).collect();
+                    assert_eq!(o[..n], e[..], "{} {from}->{to}", mnemonic(subop, wide));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exhaustive_masks_and_compress() {
+    use solana_sbpf::simd::*;
+    for wide in [false, true] {
+        let n = 32 * (1 + wide as usize);
+        // compress / expand: every mask of the u32 / u64 lanes of a 256 bit operand, random masks
+        // otherwise (and for 8 / 16 bit lanes)
+        for size in 0..4usize {
+            let lanes_n = n >> size;
+            let every_mask = lanes_n <= 16;
+            let count = if every_mask { 1 << lanes_n } else { 128 };
+            let recs = records(count, n, &|i, n| {
+                let mut r = rng(i as u64 + 1);
+                let mask = if every_mask { i as u64 } else { r() };
+                (rand_bytes(&mut r, n), rand_bytes(&mut r, n), vec![0; n], mask)
+            });
+            for subop in [VCOMPRESS, VEXPAND, VBLENDM] {
+                let out = stream_op(subop, wide, size as i16, &recs);
+                for (rec, o) in recs.iter().zip(&out) {
+                    let s = 1 << size;
+                    let mask = u64::from_le_bytes(rec[3 * n..3 * n + 8].try_into().unwrap());
+                    let (a, b) = (lanes(&rec[..n], s), lanes(&rec[n..2 * n], s));
+                    let bit = |k: usize| (mask >> k) & 1 != 0;
+                    let kept: Vec<u64> = (0..a.len()).filter(|&k| bit(k)).map(|k| a[k]).collect();
+                    let mut j = 0;
+                    let e: Vec<u64> = (0..a.len()).map(|k| match subop {
+                        VCOMPRESS => kept.get(k).copied().unwrap_or(0),
+                        VEXPAND => if bit(k) { j += 1; a[j - 1] } else { 0 },
+                        _ => if bit(k) { a[k] } else { b[k] },
+                    }).collect();
+                    assert_eq!(lanes(&o[..n], s), e, "{} size {size} mask {mask:#x}", mnemonic(subop, wide));
+                    if subop == VCOMPRESS {
+                        assert_eq!(u64::from_le_bytes(o[n..n + 8].try_into().unwrap()), kept.len() as u64);
+                    }
+                }
+            }
+        }
+        // cmp: every size x predicate x signedness on edge values with many equal lanes
+        for size in 0..4usize {
+            let recs = records(32, n, &|i, n| {
+                let mut r = rng(i as u64 + 1000);
+                let a = edge_lanes(&mut r, n, 1 << size);
+                let mut b = edge_lanes(&mut r, n, 1 << size);
+                for k in (0..n).step_by(3 << size) {
+                    b[k..k + (1 << size)].copy_from_slice(&a[k..k + (1 << size)].to_vec());
+                }
+                (a, b, vec![0; n], 0)
+            });
+            for pred in 0..16i16 {
+                let out = stream_op(VCMP, wide, pred | (size as i16) << 4, &recs);
+                for (rec, o) in recs.iter().zip(&out) {
+                    let s = 1 << size;
+                    let (a, b) = (lanes(&rec[..n], s), lanes(&rec[n..2 * n], s));
+                    let mut mask = 0u64;
+                    for k in 0..a.len() {
+                        let ord = if pred & 8 != 0 { a[k].cmp(&b[k]) } else { sext(a[k], s).cmp(&sext(b[k], s)) };
+                        let t = [ord.is_eq(), ord.is_lt(), ord.is_le(), false, ord.is_ne(), ord.is_ge(), ord.is_gt(), true][(pred & 7) as usize];
+                        mask |= (t as u64) << k;
+                    }
+                    assert_eq!(u64::from_le_bytes(o[n..n + 8].try_into().unwrap()), mask, "cmp size {size} pred {pred}");
+                }
+            }
+        }
+    }
+}
+
+/// AES rounds: the FIPS-197 C.1 example (AES-128) encrypted with aesenc / aesenclast and decrypted
+/// with aesdec / aesdeclast (equivalent inverse cipher) in every 128 bit lane; random rounds and
+/// carry-less products through every lowering
+#[test]
+fn aes_and_clmul() {
+    use solana_sbpf::simd::*;
+    // Test side AES helpers (S-box by its definition)
+    fn mul(a: u8, b: u8) -> u8 { model_gf_mul(a, b) }
+    let inv = |x: u8| if x == 0 { 0 } else { (1..=255u8).find(|y| mul(x, *y) == 1).unwrap() };
+    let sbox: Vec<u8> = (0..=255u8).map(|x| { let v = inv(x); v ^ v.rotate_left(1) ^ v.rotate_left(2) ^ v.rotate_left(3) ^ v.rotate_left(4) ^ 0x63 }).collect();
+    let key: Vec<u8> = (0..16).collect();
+    let pt: Vec<u8> = (0..16).map(|i| (i * 0x11) as u8).collect();
+    let ct = [0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a];
+    let mut rk: Vec<Vec<u8>> = vec![key.clone()];
+    let mut rcon = 1u8;
+    for _ in 0..10 {
+        let p = rk.last().unwrap().clone();
+        let mut t = [sbox[p[13] as usize] ^ rcon, sbox[p[14] as usize], sbox[p[15] as usize], sbox[p[12] as usize]];
+        rcon = mul(rcon, 2);
+        let mut k = vec![0u8; 16];
+        for w in 0..4 {
+            for b in 0..4 {
+                k[4 * w + b] = p[4 * w + b] ^ t[b];
+                t[b] = k[4 * w + b];
+            }
+        }
+        rk.push(k);
+    }
+    let inv_mix = |c: &[u8]| -> Vec<u8> {
+        (0..16).map(|i| { let (r, col) = (i % 4, i / 4); (0..4).fold(0, |acc, k| acc ^ mul([14, 11, 13, 9][(k + 4 - r) % 4], c[k + 4 * col])) }).collect()
+    };
+    for wide in [false, true] {
+        let lanes = 2 * (1 + wide as usize);
+        let rep = |x: &[u8]| x.repeat(lanes);
+        let h = 1 + wide as u8;
+        let mut a = Asm::new(VecMode::Call);
+        a.mov64(6, 1);
+        a.vload_n(0, h, 6, 0); // state
+        for (round, k) in rk.iter().enumerate() {
+            a.vload_n(2 * h, h, 6, 32 * h as i16 * (1 + round as i16));
+            let subop = match round { 0 => VXOR, 10 => VAESENCLAST, _ => VAESENC };
+            a.vop_full(subop, wide, 0, 0, 2 * h, 0, 0, 0);
+            let _ = k;
+        }
+        // Decryption of the result: state ^ rk10, aesdec with InvMixColumns(rk9..rk1), aesdeclast rk0
+        let dk_base = 32 * h as i16 * 12;
+        for round in 0..11i16 {
+            a.vload_n(2 * h, h, 6, dk_base + 32 * h as i16 * round);
+            let subop = match round { 0 => VXOR, 10 => VAESDECLAST, _ => VAESDEC };
+            a.vop_full(subop, wide, 4 * h, if round == 0 { 0 } else { 4 * h }, 2 * h, 0, 0, 0);
+        }
+        a.lddw(7, ebpf::MM_HEAP_START);
+        a.vstore_n(7, 0, 0, h);
+        a.vstore_n(7, 64 * h as i16, 4 * h, h);
+        a.mov64_imm(0, 0);
+        a.exit();
+        let mut input = rep(&pt);
+        for k in &rk {
+            input.extend(rep(k));
+        }
+        input.extend(rep(&rk[10]));
+        for r in (1..10).rev() {
+            input.extend(rep(&inv_mix(&rk[r])));
+        }
+        input.extend(rep(&rk[0]));
+        let program = a.finish();
+        for (engine, strategy) in engines() {
+            let mut runner = Runner::new(&program, &input, 0x2000, config(strategy)).unwrap();
+            if engine == Engine::Jit {
+                runner.jit_compile().unwrap();
+            }
+            let (_, result) = runner.run(engine);
+            assert!(result.is_ok());
+            assert_eq!(runner.heap()[..32 * h as usize], rep(&ct)[..], "AES-128 encryption {engine:?} {strategy:?}");
+            assert_eq!(runner.heap()[64 * h as usize..96 * h as usize], rep(&pt)[..], "AES-128 decryption {engine:?} {strategy:?}");
+        }
+        // Random rounds and products through every lowering
+        let n = 32 * h as usize;
+        let recs = records(64, n, &|i, n| { let mut r = rng(i as u64 + 3); (rand_bytes(&mut r, n), rand_bytes(&mut r, n), vec![0; n], 0) });
+        for subop in [VAESENC, VAESENCLAST, VAESDEC, VAESDECLAST] {
+            stream_op(subop, wide, 0, &recs);
+        }
+        for imm in [0x00i16, 0x01, 0x10, 0x11] {
+            let out = stream_op(VCLMUL, wide, imm, &recs);
+            for (rec, o) in recs.iter().zip(&out) {
+                for lane in 0..n / 16 {
+                    let q = |x: &[u8], k: usize| u64::from_le_bytes(x[16 * lane + 8 * k..16 * lane + 8 * k + 8].try_into().unwrap());
+                    let (x, y) = (q(&rec[..n], imm as usize & 1), q(&rec[n..2 * n], (imm as usize >> 4) & 1));
+                    let p = (0..64).filter(|i| (y >> i) & 1 != 0).fold(0u128, |r, i| r ^ (x as u128) << i);
+                    assert_eq!(o[16 * lane..16 * lane + 16], p.to_le_bytes(), "clmul {imm:#x}");
+                }
+            }
+        }
+    }
 }

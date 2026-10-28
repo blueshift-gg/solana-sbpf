@@ -14,9 +14,10 @@
 //! imm = bits  0.. 5  vd   destination slot
 //!       bits  6..11  va   first source slot
 //!       bits 12..17  vb   second source slot (slot count - 1 of vload/vstore)
-//!       bits 18..23  sub-operation
+//!       bits 18..23  sub-operation (low 6 bits)
 //!       bit  24      512 bit operation on slot pairs
-//!       bits 25..31  reserved, must be zero
+//!       bit  25      sub-operation (bit 6)
+//!       bits 26..31  reserved, must be zero
 //! ```
 //!
 //! The vector file (256 slots of 32 bytes) is private state of the VM, like the scalar registers.
@@ -167,8 +168,71 @@ pub const VEXPAND: u8 = 0x36;
 /// with `a = v[va]`, `w = v[vb]`, `w' = v[vb + 2]` (w q^-1 mod 2^16), `q = v[off]` (4 AVX2
 /// instructions: vpmullw, vpmulhw, vpmulhw, vpsubw)
 pub const VMONT16: u8 = 0x37;
+/// u16 lanes shifted by the immediate `off` (0..16): left / logical right / arithmetic right
+pub const VSLL16: u8 = 0x38;
+#[allow(missing_docs)]
+pub const VSRL16: u8 = 0x39;
+#[allow(missing_docs)]
+pub const VSRA16: u8 = 0x3a;
+/// i32 lanes shifted arithmetically right by the immediate `off` (0..32)
+pub const VSRA32: u8 = 0x3b;
+/// u16 lanes shifted by the lanes of `v[vb]`: left / logical right (0 above 15), arithmetic right
+/// (sign fill above 15)
+pub const VSLLV16: u8 = 0x3c;
+#[allow(missing_docs)]
+pub const VSRLV16: u8 = 0x3d;
+#[allow(missing_docs)]
+pub const VSRAV16: u8 = 0x3e;
+/// i32 / i64 lanes shifted arithmetically right by the lanes of `v[vb]` (sign fill above 31 / 63)
+pub const VSRAV32: u8 = 0x3f;
+#[allow(missing_docs)]
+pub const VSRAV64: u8 = 0x40;
+/// u64 lanes rotated right by the immediate `off` (0..64)
+pub const VROR64: u8 = 0x41;
+/// Per 128 bit lane, the low (high) halves of `v[va]` and `v[vb]` interleaved, lanes of `8 << off`
+/// bits (vpunpckl* / vpunpckh*)
+pub const VUNPCKLO: u8 = 0x42;
+#[allow(missing_docs)]
+pub const VUNPCKHI: u8 = 0x43;
+/// Per 128 bit lane, the lanes of `v[va]` then `v[vb]` narrowed with signed (unsigned) saturation:
+/// `off` 0 i16 -> i8 (u8), 1 i32 -> i16 (u16) (vpackss* / vpackus*)
+pub const VPACKSS: u8 = 0x44;
+#[allow(missing_docs)]
+pub const VPACKUS: u8 = 0x45;
+/// The low lanes of `v[va]` zero (sign) extended to fill `v[vd]`; `off` = source lane size (0..3,
+/// log2 bytes) | destination lane size << 2, destination larger (vpmovzx* / vpmovsx*)
+pub const VZEXT: u8 = 0x46;
+#[allow(missing_docs)]
+pub const VSEXT: u8 = 0x47;
+/// Per lane population count, lanes of `8 << off` bits
+pub const VPOPCNT: u8 = 0x48;
+/// Per lane count of leading zeros, lanes of `8 << off` bits (`off` 2 or 3)
+pub const VLZCNT: u8 = 0x49;
+/// `v[vd].u8[i] = v[va].u8[v[vb].u8[i] & (n - 1)]` over all `n` bytes (vpermb)
+pub const VPERMB: u8 = 0x4a;
+/// `v[vd].u8[i] = (v[va] ++ v[vb]).u8[v[vd].u8[i] & (2 n - 1)]` (vpermi2b)
+pub const VPERMI2B: u8 = 0x4b;
+/// `v[vd].u8[8 q + j] = v[va].u64[q].rotate_right(v[vb].u8[8 q + j] & 63) as u8` (vpmultishiftqb)
+pub const VMULTISHIFT: u8 = 0x4c;
+/// Per byte affine transformation over GF(2): bit `i` of the result = parity(A.u8[7 - i] & x) ^ bit
+/// `i` of `off`, with x = a byte of `v[va]` and A the u64 of `v[vb]` holding it (gf2p8affineqb)
+pub const VGF2P8AFFINE: u8 = 0x4d;
+/// Per byte product in GF(2^8) modulo x^8 + x^4 + x^3 + x + 1 (gf2p8mulb)
+pub const VGF2P8MUL: u8 = 0x4e;
+/// One AES round per 128 bit lane on the state `v[va]` with the round key `v[vb]` (aesenc,
+/// aesenclast, aesdec, aesdeclast)
+pub const VAESENC: u8 = 0x4f;
+#[allow(missing_docs)]
+pub const VAESENCLAST: u8 = 0x50;
+#[allow(missing_docs)]
+pub const VAESDEC: u8 = 0x51;
+#[allow(missing_docs)]
+pub const VAESDECLAST: u8 = 0x52;
+/// Per 128 bit lane, the carry-less product of u64 `off & 1` of `v[va]` and u64 `(off >> 4) & 1` of
+/// `v[vb]` (pclmulqdq)
+pub const VCLMUL: u8 = 0x53;
 /// Number of defined sub-operations
-pub const SUBOP_COUNT: u8 = 0x38;
+pub const SUBOP_COUNT: u8 = 0x54;
 
 /// 512 bit flag in the immediate
 pub const WIDE: u32 = 1 << 24;
@@ -227,7 +291,15 @@ pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
         VROR32 | VSRL32 | VSLL32 => (0..32).contains(&op.off),
         VSHUFD | VBLENDD | VTERNLOG | VBLENDW => (0..256).contains(&op.off),
         VINS64 | VEXT64 => (0..4).contains(&op.off),
-        VSLL64 | VSRL64 | VSRA64 => (0..64).contains(&op.off),
+        VSLL64 | VSRL64 | VSRA64 | VROR64 => (0..64).contains(&op.off),
+        VSLL16 | VSRL16 | VSRA16 => (0..16).contains(&op.off),
+        VSRA32 => (0..32).contains(&op.off),
+        VUNPCKLO | VUNPCKHI | VPOPCNT => (0..4).contains(&op.off),
+        VPACKSS | VPACKUS => (0..2).contains(&op.off),
+        VZEXT | VSEXT => (0..16).contains(&op.off) && (op.off & 3) < 3 && (op.off >> 2) > (op.off & 3),
+        VLZCNT => (2..4).contains(&op.off),
+        VGF2P8AFFINE => (0..256).contains(&op.off),
+        VCLMUL => op.off & !0x11 == 0,
         VCMP => (0..64).contains(&op.off),
         VBLENDM | VCOMPRESS | VEXPAND => (0..4).contains(&op.off),
         VMONT16 => (0..ebpf::VECTOR_SLOTS as i16 - op.halves() as i16 + 1).contains(&op.off) && op.vb as usize + 2 + op.halves() <= ebpf::VECTOR_SLOTS,
@@ -260,14 +332,14 @@ impl VecInsn {
             return None;
         }
         let imm = insn.imm as u32;
-        if imm >> 25 != 0 {
+        if imm >> 26 != 0 {
             return None;
         }
         let op = Self {
             vd: (imm & 63) as u8,
             va: ((imm >> 6) & 63) as u8,
             vb: ((imm >> 12) & 63) as u8,
-            subop: ((imm >> 18) & 63) as u8,
+            subop: ((imm >> 18) & 63) as u8 | ((imm >> 25) & 1) as u8 * 64,
             wide: imm & WIDE != 0,
             dst: insn.dst,
             src: insn.src,
@@ -283,6 +355,7 @@ impl VecInsn {
             | ((self.va as u32 & 63) << 6)
             | ((self.vb as u32 & 63) << 12)
             | ((self.subop as u32 & 63) << 18)
+            | ((self.subop as u32 >> 6) & 1) << 25
             | if self.wide { WIDE } else { 0 };
         ebpf::Insn {
             ptr: 0,
@@ -351,7 +424,7 @@ pub(crate) extern "C" fn jit_interpret(vector_base: *mut u8, encoded: u64, scala
         vd: encoded as u8,
         va: (encoded >> 8) as u8,
         vb: (encoded >> 16) as u8,
-        subop: (encoded >> 24) as u8 & 63,
+        subop: (encoded >> 24) as u8 & 127,
         wide: (encoded >> 31) & 1 != 0,
         dst: 0,
         src: 1,
@@ -487,6 +560,166 @@ pub fn compute(op: &VecInsn, a: &Lanes, b: &Lanes) -> Lanes {
     out
 }
 
+/// Lanes of `size` bytes as u64 (little-endian)
+fn lanes_of(x: &[u8], size: usize) -> Vec<u64> {
+    x.chunks(size).map(|c| c.iter().rev().fold(0u64, |v, b| v << 8 | *b as u64)).collect()
+}
+
+/// Inverse of [lanes_of]
+fn from_lanes(lanes: &[u64], size: usize) -> Vec<u8> {
+    lanes.iter().flat_map(|v| (0..size).map(move |k| (v >> (8 * k)) as u8)).collect()
+}
+
+/// Product in GF(2^8) modulo x^8 + x^4 + x^3 + x + 1
+pub fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut r = 0u8;
+    while b != 0 {
+        if b & 1 != 0 {
+            r ^= a;
+        }
+        a = (a << 1) ^ if a & 0x80 != 0 { 0x1b } else { 0 };
+        b >>= 1;
+    }
+    r
+}
+
+/// The AES S-box (`inverse`: its inverse), from the multiplicative inverse and the affine map
+pub fn aes_sbox(x: u8, inverse: bool) -> u8 {
+    let affine = |v: u8| v ^ v.rotate_left(1) ^ v.rotate_left(2) ^ v.rotate_left(3) ^ v.rotate_left(4) ^ 0x63;
+    let inv = |v: u8| if v == 0 { 0 } else { (1..=255u8).find(|y| gf_mul(v, *y) == 1).unwrap() };
+    if inverse {
+        (0..=255u8).find(|y| affine(inv(*y)) == x).unwrap()
+    } else {
+        affine(inv(x))
+    }
+}
+
+fn aes_tables() -> &'static ([u8; 256], [u8; 256]) {
+    static TABLES: std::sync::OnceLock<([u8; 256], [u8; 256])> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| (std::array::from_fn(|i| aes_sbox(i as u8, false)), std::array::from_fn(|i| aes_sbox(i as u8, true))))
+}
+
+/// One AES round on a 16 byte state (column major: byte `r + 4 c` is row `r`, column `c`), as
+/// aesenc / aesenclast / aesdec / aesdeclast
+pub fn aes_round(state: &[u8], key: &[u8], decrypt: bool, last: bool) -> [u8; 16] {
+    let (sbox, inv_sbox) = aes_tables();
+    // (Inv)ShiftRows
+    let shifted: [u8; 16] = std::array::from_fn(|i| {
+        let (r, c) = (i % 4, i / 4);
+        let from = if decrypt { (c + 4 - r) % 4 } else { (c + r) % 4 };
+        state[r + 4 * from]
+    });
+    // (Inv)SubBytes
+    let subbed: [u8; 16] = std::array::from_fn(|i| if decrypt { inv_sbox[shifted[i] as usize] } else { sbox[shifted[i] as usize] });
+    // (Inv)MixColumns
+    let coefficients: [u8; 4] = if decrypt { [14, 11, 13, 9] } else { [2, 3, 1, 1] };
+    let mixed: [u8; 16] = if last {
+        subbed
+    } else {
+        std::array::from_fn(|i| {
+            let (r, c) = (i % 4, i / 4);
+            (0..4).fold(0, |acc, k| acc ^ gf_mul(coefficients[(k + 4 - r) % 4], subbed[k + 4 * c]))
+        })
+    };
+    std::array::from_fn(|i| mixed[i] ^ key[i])
+}
+
+/// Carry-less product of two u64
+pub fn clmul(a: u64, b: u64) -> u128 {
+    (0..64).filter(|i| (b >> i) & 1 != 0).fold(0u128, |r, i| r ^ (a as u128) << i)
+}
+
+/// Reference semantics of the operations from VSLL16 on, on whole operands as bytes (`d` the old
+/// destination, read by vpermi2b)
+fn compute_bytes(op: &VecInsn, a: &[u8], b: &[u8], d: &[u8]) -> Vec<u8> {
+    use std::convert::TryInto;
+    let n = a.len();
+    let off = op.off as u32;
+    let lanewise = |size: usize, f: &dyn Fn(u64, u64) -> u64| -> Vec<u8> {
+        let (x, y) = (lanes_of(a, size), lanes_of(b, size));
+        let mask = if size == 8 { u64::MAX } else { (1u64 << (8 * size)) - 1 };
+        from_lanes(&x.iter().zip(&y).map(|(x, y)| f(*x, *y) & mask).collect::<Vec<_>>(), size)
+    };
+    let sext = |v: u64, size: usize| ((v << (64 - 8 * size)) as i64 >> (64 - 8 * size)) as u64;
+    match op.subop {
+        VSLL16 => lanewise(2, &|x, _| x << off),
+        VSRL16 => lanewise(2, &|x, _| x >> off),
+        VSRA16 => lanewise(2, &|x, _| (sext(x, 2) as i64 >> off) as u64),
+        VSRA32 => lanewise(4, &|x, _| (sext(x, 4) as i64 >> off) as u64),
+        VSLLV16 => lanewise(2, &|x, c| if c > 15 { 0 } else { x << c }),
+        VSRLV16 => lanewise(2, &|x, c| if c > 15 { 0 } else { x >> c }),
+        VSRAV16 => lanewise(2, &|x, c| (sext(x, 2) as i64 >> c.min(15)) as u64),
+        VSRAV32 => lanewise(4, &|x, c| (sext(x, 4) as i64 >> c.min(31)) as u64),
+        VSRAV64 => lanewise(8, &|x, c| (x as i64 >> c.min(63)) as u64),
+        VROR64 => lanewise(8, &|x, _| x.rotate_right(off)),
+        VUNPCKLO | VUNPCKHI => {
+            let size = 1usize << off;
+            let mut out = Vec::with_capacity(n);
+            for lane in 0..n / 16 {
+                let base = 16 * lane + if op.subop == VUNPCKHI { 8 } else { 0 };
+                for k in 0..8 / size {
+                    out.extend_from_slice(&a[base + size * k..base + size * (k + 1)]);
+                    out.extend_from_slice(&b[base + size * k..base + size * (k + 1)]);
+                }
+            }
+            out
+        }
+        VPACKSS | VPACKUS => {
+            let size = 2usize << off;
+            let narrow = size / 2;
+            let (lo, hi) = if op.subop == VPACKSS {
+                (-(1i64 << (8 * narrow - 1)), (1i64 << (8 * narrow - 1)) - 1)
+            } else {
+                (0, (1i64 << (8 * narrow)) - 1)
+            };
+            let mut out = Vec::with_capacity(n);
+            for lane in 0..n / 16 {
+                for src in [a, b] {
+                    for v in lanes_of(&src[16 * lane..16 * lane + 16], size) {
+                        let clamped = (sext(v, size) as i64).clamp(lo, hi) as u64;
+                        out.extend_from_slice(&from_lanes(&[clamped], narrow));
+                    }
+                }
+            }
+            out
+        }
+        VZEXT | VSEXT => {
+            let (from, to) = (1usize << (off & 3), 1usize << (off >> 2));
+            let lanes = lanes_of(&a[..n * from / to], from);
+            let widened: Vec<u64> = lanes.iter().map(|v| if op.subop == VSEXT { sext(*v, from) } else { *v }).collect();
+            from_lanes(&widened, to)
+        }
+        VPOPCNT => lanewise(1 << off, &|x, _| x.count_ones() as u64),
+        VLZCNT => {
+            let size = 1usize << off;
+            lanewise(size, &|x, _| (x.leading_zeros() - (64 - 8 * size as u32)) as u64)
+        }
+        VPERMB => (0..n).map(|i| a[b[i] as usize & (n - 1)]).collect(),
+        VPERMI2B => (0..n).map(|i| {
+            let j = d[i] as usize & (2 * n - 1);
+            if j < n { a[j] } else { b[j - n] }
+        }).collect(),
+        VMULTISHIFT => (0..n).map(|i| {
+            let q = u64::from_le_bytes(a[i & !7..(i & !7) + 8].try_into().unwrap());
+            q.rotate_right(b[i] as u32 & 63) as u8
+        }).collect(),
+        VGF2P8AFFINE => (0..n).map(|i| {
+            let matrix = &b[i & !7..(i & !7) + 8];
+            (0..8).fold(0u8, |r, bit| r | ((((matrix[7 - bit] & a[i]).count_ones() as u8) & 1) ^ ((off >> bit) & 1) as u8) << bit)
+        }).collect(),
+        VGF2P8MUL => (0..n).map(|i| gf_mul(a[i], b[i])).collect(),
+        VAESENC | VAESENCLAST | VAESDEC | VAESDECLAST => (0..n / 16).flat_map(|lane| {
+            let r = 16 * lane..16 * lane + 16;
+            aes_round(&a[r.clone()], &b[r], matches!(op.subop, VAESDEC | VAESDECLAST), matches!(op.subop, VAESENCLAST | VAESDECLAST))
+        }).collect(),
+        VCLMUL => (0..n / 16).flat_map(|lane| {
+            let q = |x: &[u8], k: u32| u64::from_le_bytes(x[16 * lane + 8 * k as usize..16 * lane + 8 * k as usize + 8].try_into().unwrap());
+            clmul(q(a, off & 1), q(b, (off >> 4) & 1)).to_le_bytes()
+        }).collect(),
+        _ => unreachable!(),
+    }
+}
+
 /// vpmadd52luq / vpmadd52huq on one half: `d += lo / hi 52 bits of lo52(a) * lo52(b)`
 fn madd52(op: &VecInsn, a: &Lanes, b: &Lanes, d: &Lanes) -> Lanes {
     let q = |x: &Lanes, i: usize| x[2 * i] as u64 | (x[2 * i + 1] as u64) << 32;
@@ -564,6 +797,14 @@ pub fn interpret(
 pub fn interpret_registers(op: &VecInsn, reg: &[u64], vector_base: *mut u8) -> Result<u64, EbpfError> {
     if vector_base.is_null() {
         return Err(EbpfError::UnsupportedInstruction);
+    }
+    if op.subop >= VSLL16 {
+        // Byte level reference of the later operations
+        let n = ebpf::VECTOR_WIDTH * op.halves();
+        let bytes = |s: u8| -> Vec<u8> { unsafe { std::slice::from_raw_parts(vector_base.add(s as usize * ebpf::VECTOR_WIDTH), n) }.to_vec() };
+        let out = compute_bytes(op, &bytes(op.va), &bytes(op.vb), &bytes(op.vd));
+        unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), vector_base.add(op.vd as usize * ebpf::VECTOR_WIDTH), n) };
+        return Ok(0);
     }
     let slot = |n: u8| unsafe { vector_base.add(n as usize * ebpf::VECTOR_WIDTH) };
     let read = |n: u8| read_lanes(slot(n));
@@ -761,6 +1002,8 @@ pub fn disassemble(insn: &ebpf::Insn) -> String {
         VCOMPRESS => format!("{name} r{}, v{vd}, v{va}, r{}, {}", op.dst, op.src, op.off),
         VEXPAND => format!("{name} v{vd}, v{va}, r{}, {}", op.src, op.off),
         VSLL64 | VSRL64 | VSRA64 => format!("{name} v{vd}, v{va}, {}", op.off),
+        VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64 | VPOPCNT | VLZCNT | VZEXT | VSEXT => format!("{name} v{vd}, v{va}, {:#x}", op.off),
+        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL => format!("{name} v{vd}, v{va}, v{vb}, {:#x}", op.off),
         VMONT16 => format!("{name} v{vd}, v{va}, v{vb}, q=v{}", op.off),
         VMOV => format!("{name} v{vd}, v{va}"),
         VROR32 | VSRL32 | VSLL32 => format!("{name} v{vd}, v{va}, {}", op.off),

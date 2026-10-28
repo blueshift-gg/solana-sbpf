@@ -29,9 +29,10 @@ off = memory offset (vload/vstore), 8 bit immediate (vror32x8, vshufd, vblendd, 
 imm = bits  0.. 5  vd   destination slot
       bits  6..11  va   first source slot
       bits 12..17  vb   second source slot (slot count - 1 of vload/vstore)
-      bits 18..23  sub-operation
+      bits 18..23  sub-operation (low 6 bits)
       bit  24      512 bit operation on slot pairs
-      bits 25..31  reserved (zero)
+      bit  25      sub-operation (bit 6)
+      bits 26..31  reserved (zero)
 ```
 
 Each `VOP` is exactly one well-defined VM operation. There's no sequence interpreter.
@@ -91,6 +92,19 @@ is the 256 bit operation on both halves unless noted. The intrinsic name (next s
 | 0x35 | `sol_avx512_compress256` | `sol_avx512_compress512` | masked lanes of `a` packed (rest 0), count in `dst` / r0 | `kmovq` + `vpcompress*` + `popcnt` (8 / 16 bit lanes: VBMI2) |
 | 0x36 | `sol_avx512_expand256` | `sol_avx512_expand512` | low lanes of `a` spread to the mask bits (rest 0) | `kmovq` + `vpexpand*` |
 | 0x37 | `sol_avx2_mont16x16` | `sol_avx512_mont16x32` | i16 Montgomery product `mulhi(a, w) - mulhi(mullo(a, w'), q)`, `w'` in slot `w + 2`, `q` in slot `off` | `vpmullw` + 2 `vpmulhw` + `vpsubw` |
+| 0x38..0x3b | `sol_avx2_sll16x16`, `srl16x16`, `sra16x16`, `sra32x8` | `..x32`, `..x16` | shift by imm | `vpsllw`, `vpsrlw`, `vpsraw`, `vpsrad` |
+| 0x3c..0x3e | `sol_avx512_sllv16x16`, `srlv16x16`, `srav16x16` | `..16x32` | per lane u16 shifts | `vpsllvw` / `vpsrlvw` / `vpsravw` (BW), reference call without |
+| 0x3f, 0x40 | `sol_avx2_srav32x8`, `sol_avx512_srav64x4` | `..x16`, `..x8` | per lane arithmetic shift (sign fill when too large) | `vpsravd`; `vpsravq` / 4 AVX2 instructions |
+| 0x41 | `sol_avx512_ror64x4` | `sol_avx512_ror64x8` | u64 rotate by imm | `vprorq` / 3 AVX2 instructions |
+| 0x42, 0x43 | `sol_avx2_unpacklo256`, `unpackhi256` | `sol_avx512_unpacklo512`, `..hi512` | interleave per 128 bit lane, lane size in `off` | `vpunpckl*` / `vpunpckh*` |
+| 0x44, 0x45 | `sol_avx2_packss256`, `packus256` | `..512` | saturating narrowing per 128 bit lane | `vpackss*` / `vpackus*` |
+| 0x46, 0x47 | `sol_avx2_zext256`, `sext256` | `..512` | widen the low lanes (all six size pairs) | `vpmovzx*` / `vpmovsx*` |
+| 0x48 | `sol_avx512_popcnt256` | `sol_avx512_popcnt512` | per lane population count | `vpopcnt*` (BITALG / VPOPCNTDQ) / nibble table + `vpmaddubsw` / `vpmaddwd` / `vpsadbw` |
+| 0x49 | `sol_avx512_lzcnt256` | `sol_avx512_lzcnt512` | per lane leading zeros (32 / 64 bit) | `vplzcnt*` (CD), reference call without |
+| 0x4a..0x4c | `sol_avx512_permb256`, `permi2b256`, `multishift256` | `..512` | byte permutations, bit field extraction | `vpermb`, `vpermi2b`, `vpmultishiftqb` (VBMI), reference call without |
+| 0x4d, 0x4e | `sol_avx512_gf2p8affine256`, `gf2p8mul256` | `..512` | GF(2) affine map / GF(2^8) product per byte | `vgf2p8affineqb`, `vgf2p8mulb` (GFNI), reference call without |
+| 0x4f..0x52 | `sol_avx512_aesenc256`, `aesenclast256`, `aesdec256`, `aesdeclast256` | `..512` | one AES round per 128 bit lane | `vaes*` (VAES, also the 256 bit VEX forms without AVX-512), reference call without |
+| 0x53 | `sol_avx512_clmul256` | `sol_avx512_clmul512` | carry-less 64 x 64 -> 128 per 128 bit lane | `vpclmulqdq` (VPCLMULQDQ, VEX forms too), reference call without |
 | 0x27 | `sol_avx512_compresslt16x16` | `sol_avx512_compresslt16x32` | u16 lanes of `a` below those of `b`, in order, packed into `d` (rest 0); count in `dst` / r0 | branchless scalar loop over the vector file / `vpcmpuw` + `vpcompressw` (VBMI2) + `kmovd` + `popcnt` |
 
 The BLAKE3 work needed the first 13; the rest came with the Falcon verifier (16 bit NTT arithmetic,
@@ -121,6 +135,14 @@ runs every operation through tier 3 and `Config::simd_avx512 = false` restricts 
 so the `tiers_agree` test compares all tiers of a host on random and edge value inputs (0, 1, -1,
 the extremes of every lane width, shift counts around 31 / 32 / 63 / 64).
 
+The `exhaustive_*` and `aes_and_clmul` tests run each operation over a stream of records in one loop
+and check the interpreter against an independent model and every tier against the interpreter:
+every byte pair (`gf2p8mul`), every byte / index / control value (`gf2p8affine`, `permb`,
+`permi2b`, `multishift`, `popcnt` of bytes), every u16 (`popcnt`, the 16 -> 8 packs, the
+widenings), every immediate shift count, variable counts 0..=70 and huge ones, every leading zero
+count, every mask of u32 / u64 `compress` / `expand` / `blendm` (both widths), every `cmp` lane size x
+predicate x signedness, and the FIPS-197 AES-128 example (encryption and decryption) in every lane.
+
 Rosetta 2 gets `vpsllvq` / `vpsrlvq` wrong for counts above 63 whose low bits are small (it shifts by
 the low bits instead of returning 0); the tests keep those counts in range when running under it.
 
@@ -135,7 +157,7 @@ mov64 r1, <packed operands>       ; compile time constant
 call  sol_avx2_add32x8            ; CALL_IMM, src = 0, imm = murmur32("sol_avx2_add32x8")
 ```
 
-* **Encoding:** one static call identifier per operation and width (105 of them, the names in the
+* **Encoding:** one static call identifier per operation and width (163 of them, the names in the
   table above). `dst`, `src` and `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF.
   The names say which ISA level each operation maps to: `sol_avx_` (moves), `sol_avx2_` (AVX2
   integer operations) and `sol_avx512_` (AVX-512 operations, and every 512 bit form). Every
