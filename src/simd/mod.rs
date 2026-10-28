@@ -426,7 +426,8 @@ fn compute_half(op: &VecInsn, a: &Lanes, b: &Lanes, d: &Lanes) -> Lanes {
 }
 
 /// Executes one vector instruction in the interpreter, returns the scalar result (vext64,
-/// vmovmsk8, 0 otherwise)
+/// vmovmsk8, 0 otherwise). Never inlined: it would bloat the interpreter's instruction loop.
+#[inline(never)]
 pub fn interpret(
     op: &VecInsn,
     reg: &[u64],
@@ -482,11 +483,19 @@ pub fn interpret(
         }
         _ => {}
     }
-    // Every source is read before the destination is written
     let halves = op.halves();
+    if !op.wide && !matches!(op.subop, VBCAST32 | VBCAST64 | VPERMI2D) {
+        // The common case: one 256 bit lane-wise operation
+        let (a, b) = (read(op.va), read(op.vb));
+        let out = if op.subop == VTERNLOG { compute_half(op, &a, &b, &read(op.vd)) } else { compute(op, &a, &b) };
+        write_lanes(slot(op.vd), &out);
+        return Ok(0);
+    }
+    // Every source is read before the destination is written
+    let reads_d = matches!(op.subop, VTERNLOG | VPERMI2D);
     let a: [Lanes; 2] = std::array::from_fn(|h| if h < halves { read(op.va + h as u8) } else { [0; 8] });
     let b: [Lanes; 2] = std::array::from_fn(|h| if h < halves { read(op.vb + h as u8) } else { [0; 8] });
-    let d: [Lanes; 2] = std::array::from_fn(|h| if h < halves { read(op.vd + h as u8) } else { [0; 8] });
+    let d: [Lanes; 2] = std::array::from_fn(|h| if h < halves && reads_d { read(op.vd + h as u8) } else { [0; 8] });
     let lanes = 8 * halves;
     let get = |x: &[Lanes; 2], i: usize| x[i / 8][i % 8];
     let out: [Lanes; 2] = match op.subop {

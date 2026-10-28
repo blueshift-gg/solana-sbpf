@@ -22,41 +22,65 @@ operation `0xe0`, which is otherwise unused. All operands are encoded statically
 
 ```text
 opc = 0xe7
-dst = vector file base register (memory mode only, must be 0 in slot mode)
-src = scalar register (address for vload/vstore, value for vbcast32)
-off = memory offset (vload/vstore) or 8 bit immediate (vror32x8, vshufd, vblendd)
+dst = scalar destination register (vext64, vmovmsk8), otherwise 0
+src = scalar source register (address of vload/vstore, value of vbcast / vins64)
+off = memory offset (vload/vstore), 8 bit immediate (vror32x8, vshufd, vblendd, ...) or lane
+      (vins64, vext64)
 imm = bits  0.. 5  vd   destination slot
       bits  6..11  va   first source slot
-      bits 12..17  vb   second source slot
+      bits 12..17  vb   second source slot (slot count - 1 of vload/vstore)
       bits 18..23  sub-operation
-      bit  24      memory mode
+      bit  24      512 bit operation on slot pairs
       bits 25..31  reserved (zero)
 ```
 
 Each `VOP` is exactly one well-defined VM operation. There's no sequence interpreter.
 
-| sub-op | mnemonic | semantics (8 little-endian u32 lanes) | AVX2 lowering |
-|---|---|---|---|
-| 0x00 | `vload256 vd, [rS+off]` | `v[d] = mem[r+off .. +32]` | `vmovdqu` |
-| 0x01 | `vstore256 [rS+off], va` | `mem[..] = v[a]` | `vmovdqu` |
-| 0x02 | `vadd32x8 vd, va, vb` | wrapping u32 add | `vpaddd` |
-| 0x03 | `vxor256` | xor | `vpxor` |
-| 0x04 | `vand256` | and | `vpand` |
-| 0x05 | `vor256` | or | `vpor` |
-| 0x06 | `vror32x8 vd, va, n` | `rotate_right(n)`, n in 0..32 | `vpshufb` for 8/16, else `vpsrld`+`vpslld`+`vpor` |
-| 0x07 | `vshufd vd, va, imm8` | pshufd within each 128 bit half | `vpshufd` |
-| 0x08 | `vtranspose8 vd` | transposes the 8x8 u32 matrix in `vd..vd+8` | 8×`vpunpck{l,h}dq`, 8×`vpunpck{l,h}qdq`, 8×`vperm2i128` |
-| 0x09 | `vbcast32 vd, rS` | `[rS as u32; 8]` | `vmovd` + `vpbroadcastd` |
-| 0x0a | `vmov vd, va` | copy | `vmovdqa` |
-| 0x0b | `vpermd vd, va, vb` | `v[d][i] = v[a][v[b][i] & 7]` | `vpermd` |
-| 0x0c | `vblendd vd, va, vb, imm8` | per-lane select | `vpblendd` |
+### Operations
 
-The plan's minimum set (`vload/vstore/vadd/vxor/vror/vand/vor`) wasn't enough for real BLAKE3, so
-four more ops were added:
-- **8-way kernel:** needs the transpose (message words of 8 chunks to lanes) and `vbcast32`
-  (counters, flags, IV).
-- **Single-state kernel:** needs `vshufd` (diagonalization) and `vpermd`/`vblendd` (in-register
-  message permutation).
+Lanes are little-endian. Every operation has a 256 bit form on one slot; most also have a 512 bit
+form on a **slot pair** `(v2k, v2k + 1)` (all slot operands even, low half in the even slot), which
+is the 256 bit operation on both halves unless noted. The intrinsic name (next section) is
+`sol_<isa>_<op>`, the prefix naming the ISA level that has the operation as one instruction.
+
+| sub-op | 256 bit name | 512 bit name | semantics | AVX2 / AVX-512 lowering |
+|---|---|---|---|---|
+| 0x00 | `sol_avx_load256` | | `v[vd + i] = mem[r + off + 32 i]`, `vb + 1` slots (at most 32) | one host call: translation + copy |
+| 0x01 | `sol_avx_store256` | | `mem[..] = v[va + i]`, `vb + 1` slots | one host call |
+| 0x02 | `sol_avx2_add32x8` | `sol_avx512_add32x16` | wrapping u32 add | `vpaddd` |
+| 0x03 | `sol_avx2_xor256` | `sol_avx512_xor512` | xor | `vpxor` / `vpxord` |
+| 0x04 | `sol_avx2_and256` | `sol_avx512_and512` | and | `vpand` / `vpandd` |
+| 0x05 | `sol_avx2_or256` | `sol_avx512_or512` | or | `vpor` / `vpord` |
+| 0x06 | `sol_avx512_ror32x8` | `sol_avx512_ror32x16` | u32 `rotate_right(off)` | `vpshufb` or 3 shifts / `vprord` |
+| 0x07 | `sol_avx2_shufd256` | `sol_avx512_shufd512` | pshufd per 128 bit lane | `vpshufd` |
+| 0x08 | `sol_avx2_transpose8x8` | | 8 x 8 u32 matrix in `vd..vd + 8` | 24 instructions |
+| 0x09 | `sol_avx2_bcast32x8` | `sol_avx512_bcast32x16` | `[r as u32; n]` | `vmovd` + `vpbroadcastd` / `vpbroadcastd zmm, r32` |
+| 0x0a | `sol_avx_mov256` | `sol_avx512_mov512` | copy | `vmovdqa` |
+| 0x0b | `sol_avx2_permd256` | `sol_avx512_permd512` | `v[d][i] = v[a][v[b][i] & (L - 1)]` over all `L` lanes (cross half for 512) | `vpermd`; 512 on AVX2: 2 `vpermd` + `vblendvps` per half |
+| 0x0c | `sol_avx2_blendd256` | `sol_avx512_blendd512` | u32 select by imm8 (per 256 bit half) | `vpblendd` / `vpblendmd` + opmask |
+| 0x0d | `sol_avx2_sub32x8` | `sol_avx512_sub32x16` | wrapping u32 sub | `vpsubd` |
+| 0x0e | `sol_avx2_mullo32x8` | `sol_avx512_mullo32x16` | low u32 product | `vpmulld` |
+| 0x0f | `sol_avx2_minu32x8` | `sol_avx512_minu32x16` | u32 minimum | `vpminud` |
+| 0x10, 0x11 | `sol_avx2_srl32x8`, `sll32x8` | `sol_avx512_srl32x16`, `sll32x16` | shift by imm8 | `vpsrld`, `vpslld` |
+| 0x12, 0x13 | `sol_avx2_sllv32x8`, `srlv32x8` | `..x16` | per lane shift, 0 above 31 | `vpsllvd`, `vpsrlvd` |
+| 0x14 | `sol_avx2_andn256` | `sol_avx512_andn512` | `!a & b` | `vpandn` |
+| 0x15 | `sol_avx512_rolv32x8` | `sol_avx512_rolv32x16` | u32 `rotate_left(b % 32)` | 7 instructions / `vprolvd` |
+| 0x16 | `sol_avx512_ternlog256` | `sol_avx512_ternlog512` | `d = f(d, a, b)`, truth table imm8 | 1 to 6 instructions / `vpternlogd` |
+| 0x17..0x19 | `sol_avx2_add16x16`, `sub16x16`, `mullo16x16` | `..16x32` | u16 lanes, wrapping | `vpaddw`, `vpsubw`, `vpmullw` |
+| 0x1a | `sol_avx2_mulhi16x16` | `sol_avx512_mulhi16x32` | high half of signed i16 products | `vpmulhw` |
+| 0x1b | `sol_avx2_minu16x16` | `sol_avx512_minu16x32` | u16 minimum | `vpminuw` |
+| 0x1c | `sol_avx2_madd16x16` | `sol_avx512_madd16x32` | i16 products summed in pairs into i32 | `vpmaddwd` |
+| 0x1d | `sol_avx2_blendw256` | `sol_avx512_blendw512` | u16 select by imm8 (per 128 bit lane) | `vpblendw` / `vpblendmw` + opmask |
+| 0x1e | `sol_avx_ins64` | | `v[vd].u64[off] = r` | `vmovq` + `vpbroadcastq` + `vpblendd` |
+| 0x1f | `sol_avx_ext64` | | `r = v[va].u64[off]` | `vmovq` / `vpextrq` (+ `vextracti128`), or a scalar load |
+| 0x20 | `sol_avx2_bcast64x4` | `sol_avx512_bcast64x8` | `[r; n]` | `vmovq` + `vpbroadcastq` / `vpbroadcastq zmm, r64` |
+| 0x21 | `sol_avx2_movmsk8x32` | `sol_avx512_movmsk8x64` | byte sign bits | `vpmovmskb` / `vpmovb2m` + `kmovq` |
+| 0x22 | `sol_avx512_permi2d256` | `sol_avx512_permi2d512` | `v[d][i] = (v[a] ++ v[b])[v[d][i] & (2 L - 1)]` | 4 / 9 instructions per half / `vpermi2d` |
+| 0x23 | `sol_avx512_rolv64x4` | `sol_avx512_rolv64x8` | u64 `rotate_left(b % 64)` | 7 instructions / `vprolvq` |
+| 0x24 | `sol_avx2_transpose4x4q` | `sol_avx512_transpose8x8q` | u64 matrix: rows `vd..vd + 4` / pairs `vd, vd + 2, .., vd + 14` | 8 / 32 instructions / 24 zmm instructions |
+
+The BLAKE3 work needed the first 13; the rest came with the Falcon verifier (16 bit NTT arithmetic,
+Keccak on 64 bit lanes) and the private vector file (lane moves).
 
 ## Intrinsic call form (SIMD-0645 style, no new opcode)
 
@@ -66,48 +90,34 @@ form used by compiled Rust programs (`simd-falcon/`).
 
 ```text
 mov64 r1, <packed operands>       ; compile time constant
-call  sol_vadd32x8                ; CALL_IMM, src = 0, imm = murmur32("sol_vadd32x8")
+call  sol_avx2_add32x8            ; CALL_IMM, src = 0, imm = murmur32("sol_avx2_add32x8")
 ```
 
-* **Encoding:** one static call identifier per operation, `sol_<mnemonic>` (30 of them).
-  `dst`, `src` and `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF. Besides the
-  BLAKE3 set there are ops for compiled programs such as the Falcon verifier:
-
-  | Operation | Semantics | AVX2 lowering |
-  |---|---|---|
-  | `sol_vsub32x8`, `sol_vmullo32x8`, `sol_vminu32x8` | u32 lanes | `vpsubd`, `vpmulld`, `vpminud` |
-  | `sol_vsrl32x8`, `sol_vsll32x8` | shift by imm8 | `vpsrld`, `vpslld` |
-  | `sol_vsllv32x8`, `sol_vsrlv32x8` | per lane shift, 0 above 31 | `vpsllvd`, `vpsrlvd` |
-  | `sol_vandn256` | `!a & b` | `vpandn` |
-  | `sol_vrolv32x8` | `a << b \| a >> (32 - b)`: rotate left by 0..=32, vpsllvd / vpsrlvd rules otherwise | 5 instructions (`vprolvd` on AVX-512) |
-  | `sol_vternlog256` | `d = f(d, a, b)`, truth table imm8 (vpternlogd) | 1 to 6 instructions (`vpternlogd` on AVX-512) |
-  | `sol_vadd16x16`, `sol_vsub16x16`, `sol_vmullo16x16` | u16 lanes, wrapping | `vpaddw`, `vpsubw`, `vpmullw` |
-  | `sol_vmulhi16x16` | high half of signed i16 products | `vpmulhw` |
-  | `sol_vminu16x16` | u16 minimum | `vpminuw` |
-  | `sol_vmadd16x16` | i16 products summed in pairs into i32 lanes | `vpmaddwd` |
-  | `sol_vblendw` | word blend, imm8 per 128 bit half | `vpblendw` |
-
-  `vternlog` is lowered as `g_lo(a, b) ^ (d & (g_lo ^ g_hi)(a, b))` with the two input functions
-  `g` of the truth table halves, each one or two instructions; aliased operands fold into a two
-  input function first.
-* **ABI:** `r1` holds the packed operands, `r2` the scalar operand (vload/vstore address, vbcast
-  value). A Rust wrapper `sol_vadd32x8(ops(V0, V0, V1))` compiles to exactly `mov64 r1, imm` +
-  `call`, and compilers reload `r1` before every call because it is caller saved.
-* **Packing:** 8 bit slot numbers (256 slots, 8 KiB region): `vd | va << 8 | vb << 16`, an imm8 in
-  bits 16..24 for one-source ops, a 16 bit offset in bits 8..24 for vload/vstore. `vblendd`,
-  `vblendw` and `vternlog` use 7 bit slots (`vd | va << 7 | vb << 14 | imm8 << 21`). Every value is
-  below `2^29`.
-* **Results:** `r0 = 0`, every other register unchanged, 1 CU for the `CALL_IMM`, so each vector
-  op costs 2 CUs including the `mov64`.
+* **Encoding:** one static call identifier per operation and width (67 of them, the names in the
+  table above). `dst`, `src` and `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF.
+  The names say which ISA level each operation maps to: `sol_avx_` (moves), `sol_avx2_` (AVX2
+  integer operations) and `sol_avx512_` (AVX-512 operations, and every 512 bit form). Every
+  operation runs on every host: the JIT lowers the AVX-512 ones to AVX2 sequences when the host
+  lacks AVX-512, with identical results.
+* **ABI:** `r1` holds the packed operands, `r2` the scalar operand (load/store address, bcast / ins64
+  value), `r0` receives the scalar result (`ext64`, `movmsk8`) or 0. A Rust wrapper
+  `sol_avx2_add32x8(ops(V0, V0, V1))` compiles to exactly `mov64 r1, imm` + `call`, and compilers
+  reload `r1` before every call because it is caller saved.
+* **Packing:** 8 bit slot numbers (256 slots): `vd | va << 8 | vb << 16`, an imm8 in bits 16..24 for
+  one-source ops, a 16 bit offset in bits 8..24 and the slot count - 1 in bits 24..29 for
+  load/store, the lane in bits 8..10 for ins64/ext64. `blendd`, `blendw` and `ternlog` use 7 bit
+  slots (`vd | va << 7 | vb << 14 | imm8 << 21`). Every value is below `2^29`.
+* **Results:** every other register unchanged, 1 CU for the `CALL_IMM`, so each vector op costs 2
+  CUs including the `mov64`, at either width.
 * **Execution:** every engine runs the reference semantics. The JIT's `codegen` hook checks a block
-  local constant tracker. If `r1` holds a valid constant it emits the AVX2 code of the opcode form,
-  register caching included, plus `mov eax, 0`. Otherwise it emits a regular syscall to the
-  reference implementation. Results and CUs are identical either way.
-* **Loads from .rodata:** the tracker also follows `lddw` and `add64 imm`. A `vload256` whose
-  address in `r2` is a known constant inside the read-only section (a twiddle table, say) is
-  translated at compile time: the section is immutable and always mapped at its address, so the JIT
-  emits a plain `vmovdqu` from the host address, with no runtime translation and no register cache
-  flush. Any other address takes the regular path.
+  local constant tracker. If `r1` holds a valid constant it emits the code of the opcode form,
+  register caching included. Otherwise it emits a regular syscall to the reference implementation.
+  Results and CUs are identical either way.
+* **Loads from .rodata:** the tracker also follows `lddw` and `add64 imm`. A `load256` whose
+  address is a known constant inside the read-only section (a twiddle table, say) is translated at
+  compile time: the section is immutable and always mapped at its address, so the JIT emits plain
+  `vmovdqu`s from the host address into cached registers, with no runtime translation and no
+  register cache flush.
 * **Compatibility:** a runtime that doesn't know the identifiers rejects the program at deployment
   (`LocalVerifier`, `InvalidSyscall`), and an unregistered call fails with `UnsupportedInstruction`.
 
@@ -121,109 +131,103 @@ Both engines throw `UnsupportedInstruction` for such a target; the JIT marks tho
 table. Compiled code only ever targets function entries, so this never triggers in practice, and the
 register cache stays on for programs with `callx`.
 
-## Vector memory region
+## Vector file
 
-* `MM_VECTOR_START = 0x6 << 32`. `0x5 << 32` stays reserved for the static-sysvars proposal.
-* 256 slots × 32 bytes = 8 KiB. Slot `vN` is at `0x600000000 + 32*N`. The opcode form addresses
-  slots 0..64 (6 bit fields), the intrinsic call form all 256.
-* The embedder owns a `simd::VectorMemory`, maps it with `region()` like stack and heap, and attaches
-  it with `EbpfVm::set_vector_memory`. `execute_program` zeroes it on every invocation.
-* It's ordinary mapped memory, so normal scalar loads and stores work on it with the usual bounds and
-  permission checks (tested). If it isn't attached, slot-mode ops fail with `UnsupportedInstruction`
-  in both engines. They never fault the host.
+* 256 slots x 32 bytes = 8 KiB of **private VM state**, like the scalar registers. It is not
+  mapped into the guest address space (the former region at `0x6 << 32` is gone): guest loads and
+  stores can't reach it, and nothing about it is part of the memory ABI.
+* Data moves in and out only through the vector operations: `load256` / `store256` copy up to 32
+  consecutive slots from / to guest memory with **one** translation, `ins64` / `ext64` move 64 bit
+  lanes from / to scalar registers, the broadcasts and `movmsk8` produce vectors and masks.
+* The VM allocates the file the first time it runs a program with vector instructions
+  (`SimdAnalysis::vector_instructions`) and zeroes it on every invocation. An embedder may attach
+  its own buffer with `EbpfVm::set_vector_memory` instead (the test harness does, to inspect the
+  slots).
+* The opcode form addresses slots 0..64 (6 bit fields), the intrinsic call form all 256.
 
-**Slot mode** vs **memory mode** (imm bit 24) run *the same program*. Only the location of the vector
-file differs:
-* **Slot mode:** the vector file is the dedicated region. Its host address is known, so the JIT
-  addresses it directly and can cache slots in YMM registers.
-* **Memory mode:** the vector file is at `r[dst]` in ordinary VM memory (heap in the benchmarks).
-  Every operand is translated and bounds-checked through `MemoryMapping` at runtime, which is how
-  every other sBPF memory access in this JIT works. This is benchmark variant **C**. It tells us
-  whether the dedicated region earns its keep.
+Why private: a mapped region costs an entry in every memory mapping, makes every guest pointer a
+potential alias of the vector registers (the JIT had to write back and drop its register cache
+around every scalar load and store), and fixes a host buffer layout in the ABI. The CPU itself
+moves data between general purpose and vector registers with `vmovq` / `vpinsrq` / `vpextrq` /
+`vpbroadcastq` for single values and through memory for bulk data, which is exactly the split here.
+Measured on the same Falcon verifier (the algorithm before the 512 bit rework), mapped region vs
+private file: CUs +0.8% (buffers instead of scalar stores into slots), interpreter 13% faster
+(native arm64, 617 vs 539 µs), JIT about 6% slower (x86 under Rosetta, 110 vs 117 µs): every
+load/store is a host call which flushes the register cache, where the region let scalar code write
+into slots directly.
 
 ## Interpreter (reference semantics)
 
-`simd::interpret` is the reference. Lanes are little-endian u32, with Rust `wrapping_add` and
-`rotate_right`.
+`simd::interpret` is the reference. Lanes are little-endian, with Rust wrapping arithmetic and
+rotates.
 
-**Translation order:** operands that need translation (memory addresses, and every slot in memory
-mode) go through `simd::translate_operands` in a fixed order: sources first, then the destination.
-The JIT calls the same function (`jit_translate_operands`, an `extern "C"` shim), so the reported
-error for an instruction with several bad operands is identical in both engines.
-
-**Two-pass translation:** the access violation handler can replace regions, which would invalidate
-host pointers translated earlier. So the first pass may run the handler and the second pass only
-re-resolves addresses. That leaves all host pointers valid at the same time.
+**Translation:** load/store translate their guest range once through
+`MemoryMapping::map_with_access_violation_handler`, then copy. The JIT calls the same function
+(`jit_transfer`, an `extern "C"` shim), so errors are identical in both engines.
 
 **Read-before-write:** all sources are read before the destination is written, so overlapping and
-aliasing operands are well defined.
+aliasing operands (including slot pairs) are well defined.
 
 ## Metering
 
-Every vector instruction costs **1 CU**, the same as any other sBPF instruction. It's provisional,
+Every vector instruction costs **1 CU**, the same as any other sBPF instruction, at either width
+and for any slot count of load/store. It's provisional,
 but explicit and identical in both engines. The tests assert that interpreter and JIT CU counts are
 equal for every program, including runs that exhaust the meter in the middle of vector code. CU
 counts aren't used as evidence of speed.
 
-## AVX2 JIT
+## JIT (AVX2 and AVX-512)
 
 ### Encoding
 
-`x86::VexInstruction` is a new 2/3-byte VEX encoder. It supports register, `[base+disp]` and
-RIP-relative operands. The existing emitter had no VEX support. The `vpshufb` byte masks for the
-8- and 16-bit rotations are emitted once into the text section, after the subroutines, and read
-RIP-relative.
+`x86::VexInstruction` (2/3-byte VEX) and `x86::EvexInstruction` (EVEX, registers up to 31, opmasks,
+compressed disp8) encoders, with register, `[base+disp]` and RIP-relative operands. Their output is
+checked against `llvm-mc` in a unit test. Constants (shuffle masks, the opmask tables of the 512 bit
+blends) are emitted once into the text section after the subroutines and read RIP-relative.
 
-### Host feature check
+### Host features
 
 `JitCompiler::new` returns `EbpfError::SimdHostUnsupported` if the program contains vector ops and
-the host has no AVX2. `Config::simd_assume_avx2` skips the check. It exists only for Rosetta 2, which
-executes AVX2 but hides it from CPUID: the bench harness sets it automatically when
-`sysctl.proc_translated == 1`. No host-dependent semantics: the JIT either emits AVX2 or refuses to
-compile. It never switches to a different implementation.
+the host has no AVX2. `Config::simd_assume_avx2` skips the check (only for Rosetta 2, which executes
+AVX2 but hides it from CPUID). With `Config::simd_avx512` (default on) the JIT uses AVX-512 when
+the host has AVX-512 F, BW and VL; `simd_force_avx512` generates AVX-512 code on any host for
+inspection. The semantics never depend on the host, only the instructions do.
 
-### Strategy A: direct, memory-backed (`SimdJitStrategy::Direct`)
+### Strategy A: direct (`SimdJitStrategy::Direct`)
 
-Every op loads its operands from the slot memory and stores the result back:
-
-```asm
-mov     r11, [rdi + vector_base]   ; once per run of vector instructions
-vmovdqu ymm0, [r11 + 32*a]
-vpaddd  ymm0, ymm0, [r11 + 32*b]
-vmovdqu [r11 + 32*d], ymm0
-```
-
-In memory mode, the addresses are first translated by one host call per instruction (up to three
-operands), and the host pointers are read back from `EbpfVm::simd_scratch`.
+The register cache below, written back and emptied after every vector instruction: every operand
+comes from the vector file in memory and every result goes back to it.
 
 ### Strategy B: basic-block-local register cache (`SimdJitStrategy::RegisterCached`)
 
 `SimdJitState` tracks `{reg, dirty}` per slot over 15 YMM registers (`ymm15` is scratch), with LRU
-eviction. The guarantees:
+eviction. With AVX-512 a second cache holds **slot pairs** in `zmm16..zmm30` (`zmm31` is scratch)
+for the 512 bit operations; a slot is cached at one width only, an operation of the other width
+writes it back and drops it first. Without AVX-512, 512 bit operations run as two 256 bit halves in
+the YMM cache (the cross half permutations with temporaries, so operands may alias).
 
 * **Block boundaries.**
   - Block starts are jump targets, internal call targets and the entry point, from a pre-scan.
-  - At a block start the cache is written back and emptied *before* the pc offset is recorded. The
-    fall-through path pays for the write-back, and jumps arrive with an empty cache.
+  - At a block start the caches are written back and emptied *before* the pc offset is recorded.
+    The fall-through path pays for the write-back, and jumps arrive with empty caches.
   - Every branch, call, exit, syscall and scalar memory access (all of which call host code that
-    clobbers YMM) writes back dirty slots and invalidates first. The same goes for any other
-    instruction that may throw, such as division.
-  - Pure scalar ALU instructions leave the cache alone.
-* **Aliasing.** Scalar loads and stores might hit the vector region through any dynamic address, so
-  they always see coherent memory (write-back first). They also invalidate, so later reads see
-  partial writes; a test covers this.
-* **Memory operands of vector ops.** `vload`/`vstore` and all memory-mode ops are translated through
-  a host call. The cache is flushed and invalidated before them.
+    clobbers vector registers) writes back dirty slots and invalidates first. The same goes for any
+    other instruction that may throw, such as division.
+  - Pure scalar ALU instructions leave the caches alone.
+* **load / store** call the host once (translation + copy); the caches are flushed and invalidated
+  before them. Loads from `.rodata` at known addresses go straight into cached registers.
 * **Exceptional exits.**
   - Meter checkpoints write back dirty slots but keep the registers.
   - Memory faults and calls are preceded by a full flush.
-  - So the vector region is up to date at every point where the program can stop.
+  - So the vector file is up to date at every point where the program can stop.
 * **Sources.** A source that isn't cached is used directly as a memory operand
-  (`vpaddd ymm, ymm, [r11+disp]`) and doesn't take a register.
-* **`vtranspose8`.** It flushes, then transposes in registers and leaves the eight results resident
-  and dirty.
-* **`callx`.** It can enter any instruction, so programs containing `callx` fall back to
-  `Direct`. They also stop tracking R11 across instructions.
+  (`vpaddd ymm, ymm, [r11+disp]`, full vector EVEX memory operands for zmm) and doesn't take a
+  register.
+* **Transposes.** They flush, then transpose in registers and leave the results resident and dirty.
+* **AVX-512 single instructions.** With AVX-512 the 256 bit `ternlog`, `rolv32`, `rolv64`, `ror32`
+  and `permi2d` also become one EVEX instruction on the YMM registers.
+* **`callx`.** It may not enter a run of vector code (see above), so the caches stay on for programs
+  with `callx`.
 * **AVX-SSE transitions.** `vzeroupper` is emitted before every call into host code and on JIT exit.
 
 ### Bugs found while building it
@@ -267,10 +271,10 @@ All variants match `blake3::hash` byte for byte at every test size, from 0 bytes
 
 | file | content |
 |---|---|
-| `src/simd/mod.rs` | encoding, decoding, reference semantics, operand translation, `VectorMemory` |
-| `src/simd_jit.rs` | AVX2 lowering, register cache, intrinsic constant tracking, statistics (child module of `jit`) |
+| `src/simd/mod.rs` | encoding, decoding, reference semantics, load/store, `VectorMemory` |
+| `src/simd_jit.rs` | AVX2 / AVX-512 lowering, register caches, intrinsic constant tracking, statistics (child module of `jit`) |
 | `src/simd/intrinsics.rs` | static call (SIMD-0645 style) form: identifiers, operand packing, builtins |
-| `src/x86.rs` | `VexInstruction` encoder |
+| `src/x86.rs` | `VexInstruction` and `EvexInstruction` encoders |
 | `src/simd/asm.rs` | macro assembler for the generated programs |
 | `src/simd/blake3_program.rs` | BLAKE3 hash / compression / microbench program generators |
 | `src/simd/harness.rs` | self contained runner used by tests and benches |
