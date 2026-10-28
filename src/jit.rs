@@ -168,7 +168,9 @@ const ANCHOR_SIMD_BLENDW_MASKS: usize = 38;
 const ANCHOR_SIMD_C31: usize = 39;
 #[cfg(feature = "simd-experiment")]
 const ANCHOR_SIMD_C63Q: usize = 40;
-const ANCHOR_COUNT: usize = 41; // Update me when adding or removing anchors
+#[cfg(feature = "simd-experiment")]
+const ANCHOR_SIMD_TABLES: usize = 41;
+const ANCHOR_COUNT: usize = 42; // Update me when adding or removing anchors
 
 #[cfg(feature = "simd-experiment")]
 #[path = "simd_jit.rs"]
@@ -347,7 +349,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         #[cfg(feature = "simd-experiment")]
         if simd.enabled {
             // Vector instructions (transposes, translations) and cache flushes need more room
-            code_length_estimate += 1024 * vector_instructions + 160 * pc;
+            // Plus the constants and tables after the subroutines (simd_jit::TAB_END and the masks)
+            code_length_estimate += 1024 * vector_instructions + 160 * pc + simd_jit::CONSTANTS_SIZE;
         }
         // Relative jump destinations limit the maximum output size
         debug_assert!(code_length_estimate < (i32::MAX as usize));

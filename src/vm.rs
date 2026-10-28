@@ -158,6 +158,10 @@ pub struct Config {
     /// running it faults with an illegal instruction)
     #[cfg(feature = "simd-experiment")]
     pub simd_force_avx512: bool,
+    /// Run every vector operation (but load / store) through the reference implementation in the
+    /// JIT: one host call each. Slow; for comparing the lowerings of a host against the reference.
+    #[cfg(feature = "simd-experiment")]
+    pub simd_force_reference: bool,
 }
 
 /// JIT lowering strategy for the experimental vector instructions
@@ -205,6 +209,8 @@ impl Default for Config {
             simd_avx512: true,
             #[cfg(feature = "simd-experiment")]
             simd_force_avx512: false,
+            #[cfg(feature = "simd-experiment")]
+            simd_force_reference: false,
         }
     }
 }

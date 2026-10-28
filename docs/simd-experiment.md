@@ -99,11 +99,27 @@ Keccak on 64 bit lanes, vectorized rejection sampling) and the private vector fi
 JIT emits a branchless loop of 5 scalar instructions per lane.
 
 Masks are scalar bitmasks (bit `i` = lane `i`) passed in `src` / r2 and returned in `dst` / r0, so mask
-logic is ordinary scalar ALU code and there is no mask register file in the VM. Operations without a
-native lowering on the host (`sra64`, `mullo64`, `madd52*`, the mask operations without AVX-512, and
-those whose AVX-512 extension is missing: DQ, IFMA, VBMI2 for 8 / 16 bit compress / expand) run the
-reference implementation through one host call (counted as `intrinsic_slow_paths`): correct
-everywhere, slow without the extension.
+logic is ordinary scalar ALU code and there is no mask register file in the VM.
+
+**Lowering tiers.** The JIT picks per operation and per host feature (AVX-512 F / BW / VL, DQ,
+IFMA and VBMI2 are detected separately):
+
+1. AVX-512: one instruction or a short sequence (`kmovq` + `vpcompressb` + `popcnt`, ...).
+2. AVX2 templates for the AVX-512 operations, written after LLVM's lowerings or better known idioms:
+   `sra64` (`vpsrad` / `vpsrlq` / `vpshufd` + `vpblendd`, 3 to 4 instructions), `mullo64` (3
+   `vpmuludq`, 8 instructions), `madd52lo/hi` (26 bit limbs, 4 `vpmuludq`, about 16 instructions),
+   `cmp` (`vpcmpgt` / `vpcmpeq`, sign flips for unsigned, `vpmovmskb` / `vmovmskps` / `vmovmskpd`,
+   `vpacksswb` + `vpermq` for 16 bit lanes), `blendm` (mask expanded to a vector, `vpblendvb`), u32 /
+   u64 `compress` / `expand` (`vpermd` with indices from a table indexed by the mask, no BMI2 since
+   `pext` is microcoded on Zen 1 / 2). 512 bit forms run as two halves.
+3. A host call to the reference implementation (`intrinsic_slow_paths` in the statistics): 8 / 16
+   bit and 512 bit `compress` / `expand` without AVX-512 (VBMI2).
+
+Every tier must give the reference results bit for bit (integer operations only, semantics fixed
+per operation, never per host), and CUs never depend on the tier. `Config::simd_force_reference`
+runs every operation through tier 3 and `Config::simd_avx512 = false` restricts the JIT to AVX2,
+so the `tiers_agree` test compares all tiers of a host on random and edge value inputs (0, 1, -1,
+the extremes of every lane width, shift counts around 31 / 32 / 63 / 64).
 
 Rosetta 2 gets `vpsllvq` / `vpsrlvq` wrong for counts above 63 whose low bits are small (it shifts by
 the low bits instead of returning 0); the tests keep those counts in range when running under it.

@@ -21,6 +21,27 @@ const SCRATCH_ZMM: u8 = 31;
 /// Opmask register used by blends and vmovmsk8
 const KMASK: u8 = 1;
 
+// Layout of the constant tables (ANCHOR_SIMD_TABLES) of the AVX2 lowerings of the AVX-512 operations
+/// Sign bit of every lane, 32 bytes per lane size (8, 16, 32, 64 bit)
+const TAB_SIGN: usize = 0;
+/// Bit `i` in lane `i` (lane `i % 8` for bytes), 32 bytes per lane size
+const TAB_BITS: usize = 128;
+/// vpshufb indices spreading mask byte `i / 8` to byte lane `i`
+const TAB_BSHUF: usize = 256;
+/// Lane indices as u32: 0..8, then 0, 0, 1, 1, .. (u64 lanes)
+const TAB_IOTA: usize = 288;
+/// 2^26 - 1 and 2^52 - 1 in every u64 lane
+const TAB_M26: usize = 352;
+const TAB_M52: usize = 384;
+/// vpermd indices (u8) per mask: compress / expand of u32 lanes (256 entries), u64 lanes (16)
+const TAB_C32: usize = 416;
+const TAB_E32: usize = TAB_C32 + 2048;
+const TAB_C64: usize = TAB_E32 + 2048;
+const TAB_E64: usize = TAB_C64 + 128;
+const TAB_END: usize = TAB_E64 + 128;
+/// Upper bound of all constants emitted after the subroutines (shuffle masks, opmask tables, tables)
+pub(super) const CONSTANTS_SIZE: usize = TAB_END + 4096;
+
 /// Host YMM registers available to the register cache (ymm15 is reserved as scratch)
 const CACHE_REGS: usize = 15;
 const SCRATCH_YMM: u8 = 15;
@@ -112,6 +133,8 @@ pub struct SimdJitState {
     pinned: [bool; CACHE_REGS],
     /// AVX-512 lowering (512 bit operations in ZMM registers, AVX-512VL single instructions)
     pub(super) avx512: bool,
+    /// Every operation through the reference implementation (Config::simd_force_reference)
+    force_reference: bool,
     /// AVX512_VBMI2 (vpcompressw) in addition
     vbmi2: bool,
     /// AVX512DQ (vpmullq) and AVX512_IFMA (vpmadd52*) in addition
@@ -146,6 +169,7 @@ impl SimdJitState {
             clock: 0,
             pinned: [false; CACHE_REGS],
             avx512: false,
+            force_reference: false,
             vbmi2: false,
             dq: false,
             ifma: false,
@@ -191,6 +215,7 @@ impl SimdJitState {
                 && std::arch::is_x86_feature_detected!("avx512f")
                 && std::arch::is_x86_feature_detected!("avx512bw")
                 && std::arch::is_x86_feature_detected!("avx512vl"));
+        state.force_reference = config.simd_force_reference;
         let (avx512, force) = (state.avx512, config.simd_force_avx512);
         let feature = |detected: bool| avx512 && (force || detected);
         state.vbmi2 = feature(std::arch::is_x86_feature_detected!("avx512vbmi2"));
@@ -277,6 +302,66 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         for _ in 0..4 {
             self.emit::<u64>(63);
         }
+        self.set_anchor(ANCHOR_SIMD_TABLES);
+        let start = self.offset_in_text_section;
+        let lane = |jit: &mut Self, size: u32, v: u64| match size {
+            0 => jit.emit::<u8>(v as u8),
+            1 => jit.emit::<u16>(v as u16),
+            2 => jit.emit::<u32>(v as u32),
+            _ => jit.emit::<u64>(v),
+        };
+        for size in 0..4u32 {
+            for _ in 0..32 >> size {
+                lane(self, size, 1u64 << (8 * (1 << size) - 1));
+            }
+        }
+        for size in 0..4u32 {
+            for i in 0..32 >> size {
+                lane(self, size, if size == 0 { 1u64 << (i % 8) } else { 1u64 << i });
+            }
+        }
+        for i in 0..32u8 {
+            self.emit::<u8>(i / 8 % 2 + 2 * (i / 16));
+        }
+        for i in 0..8u32 {
+            self.emit::<u32>(i);
+        }
+        for i in 0..8u32 {
+            self.emit::<u32>(i / 2);
+        }
+        for m in [(1u64 << 26) - 1, (1u64 << 52) - 1] {
+            for _ in 0..4 {
+                self.emit::<u64>(m);
+            }
+        }
+        // u32 lanes: compress (indices of the set bits) and expand (rank of each set bit)
+        for expand in [false, true] {
+            for m in 0..256u32 {
+                let idx: Vec<u8> = if expand {
+                    (0..8).map(|i| if (m >> i) & 1 != 0 { (m & ((1 << i) - 1)).count_ones() as u8 } else { 0 }).collect()
+                } else {
+                    let set: Vec<u8> = (0..8).filter(|i| (m >> i) & 1 != 0).collect();
+                    (0..8).map(|i| set.get(i).copied().unwrap_or(0)).collect()
+                };
+                idx.iter().for_each(|b| self.emit::<u8>(*b));
+            }
+        }
+        // u64 lanes as pairs of u32 indices
+        for expand in [false, true] {
+            for m in 0..16u32 {
+                let lanes: Vec<u8> = if expand {
+                    (0..4).map(|i| if (m >> i) & 1 != 0 { (m & ((1 << i) - 1)).count_ones() as u8 } else { 0 }).collect()
+                } else {
+                    let set: Vec<u8> = (0..4).filter(|i| (m >> i) & 1 != 0).collect();
+                    (0..4).map(|i| set.get(i).copied().unwrap_or(0)).collect()
+                };
+                lanes.iter().for_each(|l| {
+                    self.emit::<u8>(2 * l);
+                    self.emit::<u8>(2 * l + 1);
+                });
+            }
+        }
+        debug_assert_eq!(self.offset_in_text_section - start, TAB_END);
         if self.simd.avx512 {
             // Opmasks of the 512 bit blends: the imm8 repeated for every 8 lanes
             self.set_anchor(ANCHOR_SIMD_BLENDD_MASKS);
@@ -800,6 +885,19 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         let op = *op;
         self.simd.stats.vector_instructions += 1;
+        if self.simd.force_reference && !matches!(op.subop, VLOAD | VSTORE) {
+            self.emit_simd_fallback(&op);
+            return Ok(());
+        }
+        if self.simd.avx512 && !self.simd_avx512_native(&op) && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64) {
+            // The AVX2 lowering on an AVX-512 host (an extension is missing): YMM cache only
+            let (slots, count) = Self::simd_operand_slots(&op);
+            for &slot in &slots[..count] {
+                for s in slot..slot + op.halves() as u8 {
+                    self.simd_drop_pair(s / 2);
+                }
+            }
+        }
         if self.simd.avx512 && self.simd_avx512_native(&op) && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64) {
             // A slot is cached at one width only
             let (slots, count) = Self::simd_operand_slots(&op);
@@ -830,8 +928,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VTRANSPOSE8 | VTRANSPOSE64 => self.emit_simd_fixed(&op),
             VPERMI2D | VPERMT2D => self.emit_simd_cross(&op),
             VCOMPRESSLT16 => self.emit_simd_compress_scalar(&op),
-            // No AVX2 equivalent (or a missing AVX-512 extension): the reference implementation
-            VSRA64 | VMULLO64 | VMADD52LO | VMADD52HI | VCMP | VBLENDM | VCOMPRESS | VEXPAND => self.emit_simd_fallback(&op),
+            // AVX2 templates for 32 / 64 bit lanes; 8 / 16 bit lanes and the 512 bit forms through the
+            // reference implementation
+            VCOMPRESS | VEXPAND if op.wide || op.off < 2 => self.emit_simd_fallback(&op),
+            VCMP | VBLENDM if op.wide => self.emit_simd_mask_split(&op),
             VPERMD if op.wide => self.emit_simd_cross(&op),
             VMOVMSK8 if op.wide => self.emit_simd_movmsk_wide(&op),
             _ if op.wide => {
@@ -1200,6 +1300,18 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     _ => V::alu38w(0x45, rd, ra, b),
                 });
             }
+            VSRA64 if !self.simd.avx512 => self.emit_simd_sra64_avx2(op),
+            VMULLO64 if !self.simd.dq => self.emit_simd_mullo64_avx2(op),
+            VMADD52LO | VMADD52HI if !self.simd.ifma => self.emit_simd_madd52_avx2(op),
+            VCMP if !self.simd.avx512 => {
+                let dst = REGISTER_MAP[op.dst as usize];
+                self.emit_simd_cmp_avx2(op.va, op.vb, op.off, dst);
+            }
+            VBLENDM if !self.simd.avx512 => {
+                let m = REGISTER_MAP[op.src as usize];
+                self.emit_simd_blendm_avx2(op.vd, op.va, op.vb, op.off as u8, m);
+            }
+            VCOMPRESS | VEXPAND if !self.simd.avx512 || (op.off < 2 && !self.simd.vbmi2) => self.emit_simd_compress_avx2(op),
             VSLL64 | VSRL64 | VSRA64 => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
@@ -1826,5 +1938,255 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             dst,
         );
         self.simd.r11 = R11::Unknown;
+    }
+
+    /// RIP relative operand into the constant tables
+    fn simd_table(&self, offset: usize) -> VexRm {
+        VexRm::Rip(unsafe { self.anchors[ANCHOR_SIMD_TABLES].add(offset) })
+    }
+
+    /// A pinned temporary YMM register (not bound to a slot)
+    fn simd_temp(&mut self) -> u8 {
+        let reg = self.simd_allocate();
+        self.simd_pin(reg);
+        reg
+    }
+
+    /// A pinned register holding `slot`
+    fn simd_pinned(&mut self, slot: u8) -> u8 {
+        let reg = self.simd_ensure_reg(slot);
+        self.simd_pin(reg);
+        reg
+    }
+
+    /// sra64 without AVX-512: the high u32 halves shift arithmetically, the low ones come from a
+    /// logical shift (n < 32) or from the high halves (n >= 32)
+    fn emit_simd_sra64_avx2(&mut self, op: &VecInsn) {
+        let n = op.off as u8;
+        let ra = self.simd_pinned(op.va);
+        if n == 0 {
+            let rd = self.simd_destination(op.vd);
+            if rd != ra {
+                self.emit_vex(V::mov(rd, ra));
+            }
+        } else if n < 32 {
+            self.emit_vex(V::psrad(SCRATCH_YMM, ra, n));
+            let rd = self.simd_destination(op.vd);
+            self.emit_vex(V::psrlq(rd, ra, n));
+            self.emit_vex(V::pblendd(rd, rd, VexRm::Reg(SCRATCH_YMM), 0xaa));
+        } else {
+            self.emit_vex(V::psrad(SCRATCH_YMM, ra, n - 32));
+            self.emit_vex(V::pshufd(SCRATCH_YMM, VexRm::Reg(SCRATCH_YMM), 0xf5));
+            let t = self.simd_temp();
+            self.emit_vex(V::psrad(t, ra, 31));
+            let rd = self.simd_destination(op.vd);
+            self.emit_vex(V::pblendd(rd, SCRATCH_YMM, VexRm::Reg(t), 0xaa));
+        }
+    }
+
+    /// mullo64 without AVX512DQ: lo(a) lo(b) + (hi(a) lo(b) + lo(a) hi(b)) << 32 (LLVM's lowering)
+    fn emit_simd_mullo64_avx2(&mut self, op: &VecInsn) {
+        let (ra, rb) = (self.simd_pinned(op.va), self.simd_pinned(op.vb));
+        let (s, t) = (SCRATCH_YMM, self.simd_temp());
+        self.emit_vex(V::psrlq(s, rb, 32));
+        self.emit_vex(V::alu(0xf4, s, s, VexRm::Reg(ra)));
+        self.emit_vex(V::psrlq(t, ra, 32));
+        self.emit_vex(V::alu(0xf4, t, t, VexRm::Reg(rb)));
+        self.emit_vex(V::alu(0xd4, s, s, VexRm::Reg(t)));
+        self.emit_vex(V::psllq(s, s, 32));
+        let rd = self.simd_destination(op.vd);
+        self.emit_vex(V::alu(0xf4, rd, ra, VexRm::Reg(rb)));
+        self.emit_vex(V::alu(0xd4, rd, rd, VexRm::Reg(s)));
+    }
+
+    /// madd52 without AVX512_IFMA, from 26 bit limbs: p = a1 b1 2^52 + (a1 b0 + a0 b1) 2^26 + a0 b0,
+    /// lo = (a0 b0 + mid << 26) mod 2^52, hi = a1 b1 + ((mid + (a0 b0 >> 26)) >> 26)
+    fn emit_simd_madd52_avx2(&mut self, op: &VecInsn) {
+        let (ra, rb) = (self.simd_pinned(op.va), self.simd_pinned(op.vb));
+        let rd = self.simd_pinned(op.vd);
+        let (a0, a1, b0, b1, p, m) = (self.simd_temp(), self.simd_temp(), self.simd_temp(), self.simd_temp(), self.simd_temp(), self.simd_temp());
+        let (s, m26, m52) = (SCRATCH_YMM, self.simd_table(TAB_M26), self.simd_table(TAB_M52));
+        let r = VexRm::Reg;
+        self.emit_vex(V::alu(VPAND, a0, ra, m26));
+        self.emit_vex(V::psrlq(a1, ra, 26));
+        self.emit_vex(V::alu(VPAND, a1, a1, m26));
+        self.emit_vex(V::alu(VPAND, b0, rb, m26));
+        self.emit_vex(V::psrlq(b1, rb, 26));
+        self.emit_vex(V::alu(VPAND, b1, b1, m26));
+        self.emit_vex(V::alu(0xf4, p, a0, r(b0)));
+        self.emit_vex(V::alu(0xf4, m, a1, r(b0)));
+        self.emit_vex(V::alu(0xf4, s, a0, r(b1)));
+        self.emit_vex(V::alu(0xd4, m, m, r(s)));
+        if op.subop == simd::VMADD52LO {
+            self.emit_vex(V::psllq(m, m, 26));
+            self.emit_vex(V::alu(0xd4, p, p, r(m)));
+            self.emit_vex(V::alu(VPAND, p, p, m52));
+        } else {
+            self.emit_vex(V::psrlq(s, p, 26));
+            self.emit_vex(V::alu(0xd4, m, m, r(s)));
+            self.emit_vex(V::psrlq(m, m, 26));
+            self.emit_vex(V::alu(0xf4, p, a1, r(b1)));
+            self.emit_vex(V::alu(0xd4, p, p, r(m)));
+        }
+        let rd2 = self.simd_destination(op.vd);
+        debug_assert_eq!(rd, rd2);
+        self.emit_vex(V::alu(0xd4, rd2, rd2, r(p)));
+    }
+
+    /// cmp without AVX-512 into the scalar register `target`: vpcmpgt / vpcmpeq (unsigned through
+    /// flipped sign bits), a byte / u32 / u64 sign mask, inverted for le / ne / ge
+    fn emit_simd_cmp_avx2(&mut self, va: u8, vb: u8, off: i16, target: X86Register) {
+        let (size, pred, unsigned) = ((off >> 4) as usize, off & 7, off & 8 != 0);
+        let lanes = 32u32 >> size;
+        let lane_mask = if lanes == 32 { u32::MAX as i64 } else { (1i64 << lanes) - 1 };
+        if pred == 3 || pred == 7 {
+            self.emit_ins(X86Instruction::load_immediate(target, if pred == 7 { lane_mask } else { 0 }));
+            return;
+        }
+        let (mut x, mut y) = (self.simd_pinned(va), self.simd_pinned(vb));
+        if unsigned {
+            let (tx, sign) = (self.simd_temp(), self.simd_table(TAB_SIGN + 32 * size));
+            self.emit_vex(V::alu(VPXOR, tx, x, sign));
+            self.emit_vex(V::alu(VPXOR, SCRATCH_YMM, y, sign));
+            (x, y) = (tx, SCRATCH_YMM);
+        }
+        let r = self.simd_temp();
+        let (eq, gt) = match size {
+            0 => (V::alu(0x74, r, x, VexRm::Reg(y)), V::alu(0x64, r, x, VexRm::Reg(y))),
+            1 => (V::alu(0x75, r, x, VexRm::Reg(y)), V::alu(0x65, r, x, VexRm::Reg(y))),
+            2 => (V::alu(0x76, r, x, VexRm::Reg(y)), V::alu(0x66, r, x, VexRm::Reg(y))),
+            _ => (V::alu38(0x29, r, x, VexRm::Reg(y)), V::alu38(0x37, r, x, VexRm::Reg(y))),
+        };
+        // eq / ne: x == y, lt / ge: y > x, le / gt: x > y
+        let swapped = |mut i: V| {
+            if let VexRm::Reg(yy) = i.rm {
+                i.rm = VexRm::Reg(i.vvvv);
+                i.vvvv = yy;
+            }
+            i
+        };
+        self.emit_vex(match pred {
+            0 | 4 => eq,
+            1 | 5 => swapped(gt),
+            _ => gt,
+        });
+        match size {
+            0 => self.emit_vex(V::pmovmskb(target, r)),
+            1 => {
+                self.emit_vex(V::alu(0x63, r, r, VexRm::Reg(r)));
+                self.emit_vex(V::permq(r, r, 0xd8));
+                self.emit_vex(V::pmovmskb(target, r));
+                self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, target, 0xffff, None));
+            }
+            _ => self.emit_vex(V::movmskps(target, r, size == 3)),
+        }
+        if matches!(pred, 2 | 4 | 5) {
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 6, target, lane_mask, None));
+        }
+    }
+
+    /// ymm15 = all ones in the lanes whose bit is set in the scalar register `m`
+    fn emit_simd_mask_vector(&mut self, size: u8, m: X86Register) {
+        let (s, bits) = (SCRATCH_YMM, self.simd_table(TAB_BITS + 32 * size as usize));
+        match size {
+            0 => {
+                self.emit_vex(V::movd_from_gpr(s, m));
+                self.emit_vex(V::pbroadcastd(s, s));
+                self.emit_vex(V::pshufb(s, s, self.simd_table(TAB_BSHUF)));
+            }
+            1 => {
+                self.emit_vex(V::movd_from_gpr(s, m));
+                self.emit_vex(V::pbroadcastw(s, s));
+            }
+            2 => {
+                self.emit_vex(V::movd_from_gpr(s, m));
+                self.emit_vex(V::pbroadcastd(s, s));
+            }
+            _ => {
+                self.emit_vex(V::movq_from_gpr(s, m));
+                self.emit_vex(V::pbroadcastq(s, s));
+            }
+        }
+        self.emit_vex(V::alu(VPAND, s, s, bits));
+        self.emit_vex(match size {
+            0 => V::alu(0x74, s, s, bits),
+            1 => V::alu(0x75, s, s, bits),
+            2 => V::alu(0x76, s, s, bits),
+            _ => V::alu38(0x29, s, s, bits),
+        });
+    }
+
+    /// blendm without AVX-512: the mask expanded to a vector, then vpblendvb
+    fn emit_simd_blendm_avx2(&mut self, vd: u8, va: u8, vb: u8, size: u8, m: X86Register) {
+        self.emit_simd_mask_vector(size, m);
+        if m == REGISTER_SCRATCH {
+            self.simd.r11 = R11::Unknown;
+        }
+        let (ra, rb) = (self.simd_pinned(va), self.simd_pinned(vb));
+        let rd = self.simd_destination(vd);
+        self.emit_vex(V::pblendvb(rd, rb, ra, SCRATCH_YMM));
+    }
+
+    /// 512 bit cmp / blendm without AVX-512: two halves, the high half's mask in r11
+    fn emit_simd_mask_split(&mut self, op: &VecInsn) {
+        self.simd_ensure_base();
+        self.simd.pinned = [false; CACHE_REGS];
+        if op.subop == simd::VCMP {
+            let dst = REGISTER_MAP[op.dst as usize];
+            let lanes = (32u32 >> (op.off >> 4)) as i64;
+            self.emit_simd_cmp_avx2(op.va, op.vb, op.off, dst);
+            self.simd.pinned = [false; CACHE_REGS];
+            self.emit_simd_cmp_avx2(op.va + 1, op.vb + 1, op.off, REGISTER_SCRATCH);
+            self.simd.r11 = R11::Unknown;
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, REGISTER_SCRATCH, lanes, None));
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, REGISTER_SCRATCH, dst, None));
+        } else {
+            let (m, size) = (REGISTER_MAP[op.src as usize], op.off as u8);
+            self.emit_simd_blendm_avx2(op.vd, op.va, op.vb, size, m);
+            self.simd.pinned = [false; CACHE_REGS];
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, m, REGISTER_SCRATCH));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, REGISTER_SCRATCH, (32 >> size) as i64, None));
+            self.emit_simd_blendm_avx2(op.vd + 1, op.va + 1, op.vb + 1, size, REGISTER_SCRATCH);
+        }
+        self.simd.pinned = [false; CACHE_REGS];
+    }
+
+    /// compress / expand of u32 / u64 lanes without AVX-512: vpermd indices from a table indexed by
+    /// the mask, then the unused lanes are zeroed
+    fn emit_simd_compress_avx2(&mut self, op: &VecInsn) {
+        let (size, src) = (op.off as u8, REGISTER_MAP[op.src as usize]);
+        let (lanes, table) = match (size, op.subop == simd::VEXPAND) {
+            (2, false) => (8, TAB_C32),
+            (2, true) => (8, TAB_E32),
+            (_, false) => (4, TAB_C64),
+            _ => (4, TAB_E64),
+        };
+        // ymm15 = the 8 u32 indices at table + 8 * (mask & lanes)
+        let t = [REGISTER_MAP[1], REGISTER_MAP[2], REGISTER_MAP[3]].iter().copied().find(|r| *r != src && *r != REGISTER_MAP[op.dst as usize]).unwrap();
+        self.emit_ins(X86Instruction::push(t, None));
+        self.emit_ins(X86Instruction::mov(OperandSize::S32, src, t));
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, t, (1i64 << lanes) - 1, None));
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, t, 3, None));
+        let base = unsafe { self.anchors[ANCHOR_SIMD_TABLES].add(table) } as i64;
+        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, base));
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, t, REGISTER_SCRATCH, None));
+        self.emit_ins(X86Instruction::pop(t));
+        self.emit_vex(V::pmovzxbd(SCRATCH_YMM, REGISTER_SCRATCH, 0));
+        self.simd.r11 = R11::Unknown;
+        let ra = self.simd_pinned(op.va);
+        let rd = self.simd_destination(op.vd);
+        self.emit_vex(V::permd(rd, SCRATCH_YMM, VexRm::Reg(ra)));
+        if op.subop == simd::VCOMPRESS {
+            // Lanes from the count on are zero
+            self.emit_simd_lane_count(op, lanes);
+            self.emit_vex(V::movd_from_gpr(SCRATCH_YMM, REGISTER_MAP[op.dst as usize]));
+            self.emit_vex(V::pbroadcastd(SCRATCH_YMM, SCRATCH_YMM));
+            let iota = self.simd_table(TAB_IOTA + if size == 2 { 0 } else { 32 });
+            self.emit_vex(V::alu(0x66, SCRATCH_YMM, SCRATCH_YMM, iota));
+        } else {
+            // Lanes whose bit is clear are zero
+            self.emit_simd_mask_vector(size, src);
+        }
+        self.emit_vex(V::alu(VPAND, rd, rd, VexRm::Reg(SCRATCH_YMM)));
     }
 }

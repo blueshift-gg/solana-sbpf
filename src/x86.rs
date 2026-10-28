@@ -927,6 +927,30 @@ impl VexInstruction {
     pub const fn alu38w(opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
         Self { w: true, ..Self::ymm(1, 2, opcode, dst, src1, src2, None) }
     }
+    /// vpsrad ymm, ymm, imm8
+    pub const fn psrad(dst: u8, src: u8, imm: u8) -> Self {
+        Self::ymm(1, 1, 0x72, 4, dst, VexRm::Reg(src), Some(imm))
+    }
+    /// vmovmskps r32, ymm (`pd`: vmovmskpd)
+    pub const fn movmskps(dst: X86Register, src: u8, pd: bool) -> Self {
+        Self::ymm(pd as u8, 1, 0x50, dst as u8, 0, VexRm::Reg(src), None)
+    }
+    /// vpermq ymm, ymm, imm8
+    pub const fn permq(dst: u8, src: u8, imm: u8) -> Self {
+        Self { w: true, ..Self::ymm(1, 3, 0x00, dst, 0, VexRm::Reg(src), Some(imm)) }
+    }
+    /// vpblendvb ymm, ymm, ymm, ymm(mask): picks src2 where the mask byte's sign bit is set
+    pub const fn pblendvb(dst: u8, src1: u8, src2: u8, mask: u8) -> Self {
+        Self::ymm(1, 3, 0x4c, dst, src1, VexRm::Reg(src2), Some(mask << 4))
+    }
+    /// vpbroadcastw ymm, xmm
+    pub const fn pbroadcastw(dst: u8, src: u8) -> Self {
+        Self::ymm(1, 2, 0x79, dst, 0, VexRm::Reg(src), None)
+    }
+    /// vpmovzxbd ymm, m64
+    pub const fn pmovzxbd(dst: u8, base: X86Register, disp: i32) -> Self {
+        Self::ymm(1, 2, 0x31, dst, 0, VexRm::Mem(base, disp), None)
+    }
     /// vpsllq ymm, ymm, imm8
     pub const fn psllq(dst: u8, src: u8, imm: u8) -> Self {
         Self::ymm(1, 1, 0x73, 6, dst, VexRm::Reg(src), Some(imm))
@@ -1376,6 +1400,16 @@ mod evex_tests {
             (V::psllq(1, 2, 7), "c5 f5 73 f2 07"),                     // vpsllq ymm1, ymm2, 7
             (V::alu(0xd4, 1, 2, VexRm::Reg(3)), "c5 ed d4 cb"),        // vpaddq ymm1, ymm2, ymm3
             (V::alu(0xf4, 1, 2, VexRm::Reg(3)), "c5 ed f4 cb"),        // vpmuludq ymm1, ymm2, ymm3
+            (V::psrad(1, 2, 31), "c5 f5 72 e2 1f"),                    // vpsrad ymm1, ymm2, 31
+            (V::movmskps(RAX, 3, false), "c5 fc 50 c3"),               // vmovmskps eax, ymm3
+            (V::movmskps(R9, 14, true), "c4 41 7d 50 ce"),             // vmovmskpd r9d, ymm14
+            (V::permq(1, 2, 0xd8), "c4 e3 fd 00 ca d8"),               // vpermq ymm1, ymm2, 0xd8
+            (V::pblendvb(1, 2, 3, 15), "c4 e3 6d 4c cb f0"),           // vpblendvb ymm1, ymm2, ymm3, ymm15
+            (V::pbroadcastw(15, 15), "c4 42 7d 79 ff"),                // vpbroadcastw ymm15, xmm15
+            (V::pmovzxbd(15, R11, 0), "c4 42 7d 31 3b"),               // vpmovzxbd ymm15, qword ptr [r11]
+            (V::alu38(0x37, 1, 2, VexRm::Reg(3)), "c4 e2 6d 37 cb"),   // vpcmpgtq ymm1, ymm2, ymm3
+            (V::alu38(0x29, 1, 2, VexRm::Reg(3)), "c4 e2 6d 29 cb"),   // vpcmpeqq ymm1, ymm2, ymm3
+            (V::alu(0x63, 1, 1, VexRm::Reg(1)), "c5 f5 63 c9"),        // vpacksswb ymm1, ymm1, ymm1
             (V::movq_from_gpr(15, R9), "c4 41 f9 6e f9"),              // vmovq xmm15, r9
             (V::movq_to_gpr(RAX, 3), "c4 e1 f9 7e d8"),                // vmovq rax, xmm3
             (V::pextrq(R10, 15, 1), "c4 43 f9 16 fa 01"),              // vpextrq r10, xmm15, 1

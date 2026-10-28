@@ -361,6 +361,19 @@ fn op_cases() -> Vec<(&'static str, Body)> {
             a.vadd(1, 1, 0);
         })));
     }
+    for wide in [false, true] {
+        cases.push(("sra64_all_counts", Box::new(move |a| {
+            for n in [0i16, 1, 7, 31, 32, 33, 47, 63] {
+                a.vop_full(solana_sbpf::simd::VSRA64, wide, 2 * (n as u8 % 4), 8, 0, 0, 0, n);
+            }
+            for size in [2i16, 3] {
+                a.lddw(3, 0x0000_0000_0000_00b5);
+                a.vop_full(solana_sbpf::simd::VCOMPRESS, false, 9, 10, 0, 4, 3, size);
+                a.vop_full(solana_sbpf::simd::VEXPAND, false, 11, 10, 0, 0, 3, size);
+                a.vins64(13, 4, size - 2);
+            }
+        })));
+    }
     cases.push(("wide_bcast", Box::new(|a| {
         a.lddw(3, 0x8765_4321_0fed_cba9);
         a.wide(solana_sbpf::simd::VBCAST32, 2, 0, 0, 3, 0);
@@ -1396,3 +1409,91 @@ fn avx512_lowering() {
     }
 }
 
+
+/// Inputs with edge values in every lane width: 0, 1, -1, the minimum and maximum of each width,
+/// and shift counts around 31 / 32 / 63 / 64
+fn edge_input(variant: u64) -> Vec<u8> {
+    let patterns: [u64; 12] = [
+        0, 1, u64::MAX, 0x8000_0000_0000_0000, 0x7fff_ffff_ffff_ffff, 0x8000_0000_8000_0000,
+        0x7fff_ffff_7fff_ffff, 0x8000_8000_8000_8000, 0x8080_8080_8080_8080, 31 | 32 << 32, 63 | 64 << 32, 64,
+    ];
+    let mut data = random_input(variant);
+    for (i, chunk) in data.chunks_mut(8).enumerate() {
+        if (i as u64 + variant) % 3 != 0 {
+            chunk.copy_from_slice(&patterns[(i * 7 + variant as usize) % patterns.len()].to_le_bytes());
+        }
+    }
+    data
+}
+
+/// Every lowering on this host gives the same results and CUs as the interpreter: the default JIT
+/// (AVX-512, or the AVX2 templates), the JIT restricted to AVX2 and the JIT running every operation
+/// through the reference implementation, on random and edge value inputs
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn tiers_agree() {
+    let host_avx512 = std::is_x86_feature_detected!("avx512f");
+    let in_range = solana_sbpf::simd::harness::running_under_rosetta();
+    let mut inputs: Vec<Vec<u8>> = (0..3).map(random_input).collect();
+    inputs.extend((0..4).map(edge_input));
+    for (k, input) in inputs.iter().enumerate() {
+        for (name, body) in op_cases() {
+            // Rosetta 2 gets vpsllvq / vpsrlvq wrong for some counts above 63
+            if in_range && k >= 3 && name.starts_with("int64") {
+                continue;
+            }
+            for mode in [VecMode::Slot, VecMode::Call] {
+                let program = op_program(mode, &*body);
+                let (expected, cus) = run_op(&program, input, Engine::Interpreter, SimdJitStrategy::Direct);
+                let mut tiers = vec![("default", true, false), ("reference", true, true)];
+                if host_avx512 {
+                    tiers.push(("avx2", false, false));
+                }
+                for (tier, avx512, reference) in tiers {
+                    for strategy in [SimdJitStrategy::Direct, SimdJitStrategy::RegisterCached] {
+                        let mut c = config(strategy);
+                        c.simd_avx512 = avx512;
+                        c.simd_force_reference = reference;
+                        let mut runner = Runner::new(&program, input, 0x2000, c).unwrap();
+                        runner.jit_compile().unwrap();
+                        let (jit_cus, result) = runner.run(Engine::Jit);
+                        assert!(result.is_ok(), "{name} {tier} {result:?}");
+                        assert!(runner.heap()[..16 * 32] == expected[..], "{name} {mode:?} {tier} {strategy:?} input {k}");
+                        assert_eq!(jit_cus, cus, "{name} {tier}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Without AVX-512, only 8 / 16 bit and 512 bit compress / expand take the host call
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx2_templates_cover_the_avx512_operations() {
+    use solana_sbpf::simd::*;
+    let mut a = Asm::new(VecMode::Slot);
+    a.lddw(3, 0xa5);
+    for wide in [false, true] {
+        for subop in [VSRA64, VMULLO64, VMADD52LO, VMADD52HI] {
+            a.vop_full(subop, wide, 0, 2, 4, 0, 0, if subop == VSRA64 { 40 } else { 0 });
+        }
+        for size in 0..4i16 {
+            a.vop_full(VCMP, wide, 0, 2, 4, 5, 0, 1 | size << 4);
+            a.vop_full(VBLENDM, wide, 0, 2, 4, 0, 3, size);
+        }
+    }
+    for size in [2i16, 3] {
+        a.vop_full(VCOMPRESS, false, 0, 2, 0, 5, 3, size);
+        a.vop_full(VEXPAND, false, 0, 2, 0, 0, 3, size);
+    }
+    a.vop_full(VCOMPRESS, false, 0, 2, 0, 5, 3, 1); // 16 bit: host call
+    a.vop_full(VEXPAND, true, 0, 2, 0, 0, 3, 2); // 512 bit: host call
+    a.exit();
+    let mut c = config(SimdJitStrategy::RegisterCached);
+    c.simd_avx512 = false;
+    let runner = Runner::new(&a.finish(), &random_input(1), 0x2000, c).unwrap();
+    runner.jit_compile().unwrap();
+    let stats = runner.executable.get_compiled_program().unwrap().simd_stats;
+    assert_eq!(stats.intrinsic_slow_paths, 2, "{stats:?}");
+}
