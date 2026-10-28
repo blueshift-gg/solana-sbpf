@@ -83,8 +83,7 @@ pub const VSLLV32: u8 = 0x12;
 pub const VSRLV32: u8 = 0x13;
 /// `v[vd] = !v[va] & v[vb]` (vpandn)
 pub const VANDN: u8 = 0x14;
-/// `v[vd][i] = v[va][i] << v[vb][i] | v[va][i] >> (32 - v[vb][i])` (variable rotate left for
-/// counts in 0..=32, shifts follow vpsllvd / vpsrlvd for other counts)
+/// `v[vd][i] = v[va][i].rotate_left(v[vb][i] % 32)` (vprolvd)
 pub const VROLV32: u8 = 0x15;
 /// `v[vd] = f(v[vd], v[va], v[vb])` bitwise, `f` given by the truth table `off` indexed by
 /// `d << 2 | a << 1 | b` (vpternlogd)
@@ -350,11 +349,7 @@ pub fn compute(op: &VecInsn, a: &Lanes, b: &Lanes) -> Lanes {
         VSLLV32 => (0..8).for_each(|i| out[i] = if b[i] > 31 { 0 } else { a[i] << b[i] }),
         VSRLV32 => (0..8).for_each(|i| out[i] = if b[i] > 31 { 0 } else { a[i] >> b[i] }),
         VANDN => (0..8).for_each(|i| out[i] = !a[i] & b[i]),
-        VROLV32 => (0..8).for_each(|i| {
-            let shl = |x: u32, n: u32| if n > 31 { 0 } else { x << n };
-            let shr = |x: u32, n: u32| if n > 31 { 0 } else { x >> n };
-            out[i] = shl(a[i], b[i]) | shr(a[i], 32u32.wrapping_sub(b[i]));
-        }),
+        VROLV32 => (0..8).for_each(|i| out[i] = a[i].rotate_left(b[i] % 32)),
         VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VBLENDW => {
             let (a, b) = (words(a), words(b));
             let mut w = [0u16; 16];

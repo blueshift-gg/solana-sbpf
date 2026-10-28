@@ -1063,3 +1063,72 @@ fn falcon_programs() {
         }
     }
 }
+
+fn falcon_input() -> Vec<u8> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("simd-falcon/fixtures");
+    let bytes = std::fs::read(dir.join("sigs.bin")).unwrap();
+    let len = u16::from_le_bytes([bytes[666], bytes[667]]) as usize;
+    let mut v = vec![0u8; 8];
+    v.extend_from_slice(&((666 + len) as u64).to_le_bytes());
+    v.extend_from_slice(&bytes[..666]);
+    v.extend_from_slice(&bytes[668..668 + len]);
+    v.extend_from_slice(&[7; 32]);
+    v
+}
+
+/// AVX-512 code generation (forced, so it is also exercised on hosts without AVX-512) never runs
+/// out of registers or text space; on AVX-512 hosts the result must match the AVX2 lowering
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx512_lowering() {
+    let host_avx512 = std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("avx512bw")
+        && std::is_x86_feature_detected!("avx512vl");
+    let cfg = |strategy, avx512: bool| {
+        let mut c = config(strategy);
+        c.simd_avx512 = avx512;
+        c.simd_force_avx512 = avx512;
+        c
+    };
+    let mut programs: Vec<(String, Vec<u8>, Vec<u8>, bool)> = Vec::new();
+    for seed in 0..2 {
+        let input = random_input(seed);
+        for (name, body) in op_cases() {
+            for mode in [VecMode::Slot, VecMode::Call] {
+                programs.push((format!("{name} {mode:?} {seed}"), op_program(mode, &*body), input.clone(), false));
+            }
+        }
+    }
+    for kernel in [Kernel::Simd1, Kernel::Simd8] {
+        programs.push((format!("blake3 {kernel:?}"), blake3_program::hash_program(kernel, VecMode::Call), blake3_program::build_input(&test_data(5000, 1)), false));
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("simd-falcon/fixtures");
+    programs.push(("falcon".into(), std::fs::read(dir.join("falcon_simd.so")).unwrap(), falcon_input(), true));
+    for (name, program, input, elf) in &programs {
+        for strategy in [SimdJitStrategy::Direct, SimdJitStrategy::RegisterCached] {
+            let mut results = Vec::new();
+            for avx512 in [false, true] {
+                let mut runner = if *elf {
+                    Runner::from_elf(program, input, 32 * 1024, cfg(strategy, avx512)).unwrap()
+                } else {
+                    Runner::new(program, input, HEAP_SIZE, cfg(strategy, avx512)).unwrap()
+                };
+                runner.budget = 2_000_000;
+                runner.jit_compile().unwrap_or_else(|e| panic!("{name} {strategy:?} avx512={avx512}: {e:?}"));
+                // AVX512_DUMP_DIR=... writes the machine code for inspection (e.g. llvm-objdump)
+                if let (Ok(dir), true) = (std::env::var("AVX512_DUMP_DIR"), avx512 && strategy == SimdJitStrategy::RegisterCached) {
+                    let file = name.replace(' ', "_");
+                    std::fs::write(format!("{dir}/{file}.bin"), runner.executable.get_compiled_program().unwrap().text_section()).unwrap();
+                }
+                if avx512 && !host_avx512 {
+                    continue;
+                }
+                let (cus, result) = runner.run(Engine::Jit);
+                results.push((format!("{result:?}"), cus, runner.heap().to_vec(), runner.vector.as_slice().to_vec()));
+            }
+            if results.len() == 2 {
+                assert!(results[0] == results[1], "{name} {strategy:?}: AVX-512 differs from AVX2");
+            }
+        }
+    }
+}

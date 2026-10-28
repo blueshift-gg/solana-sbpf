@@ -150,6 +150,14 @@ pub struct Config {
     /// advertise it via CPUID.
     #[cfg(feature = "simd-experiment")]
     pub simd_assume_avx2: bool,
+    /// Let the JIT use AVX-512 (F, BW, VL) if the host supports it: 512 bit operations in ZMM
+    /// registers, the AVX-512 operations in one instruction. Otherwise everything is lowered to AVX2.
+    #[cfg(feature = "simd-experiment")]
+    pub simd_avx512: bool,
+    /// Generate AVX-512 code even if the host doesn't support it (to inspect the generated code,
+    /// running it faults with an illegal instruction)
+    #[cfg(feature = "simd-experiment")]
+    pub simd_force_avx512: bool,
 }
 
 /// JIT lowering strategy for the experimental vector instructions
@@ -158,7 +166,7 @@ pub struct Config {
 pub enum SimdJitStrategy {
     /// Every operation loads its operands from and stores its result to memory
     Direct,
-    /// Slots of the dedicated vector region are cached in host YMM registers within basic blocks
+    /// Slots of the vector file are cached in host registers within basic blocks
     RegisterCached,
 }
 
@@ -193,6 +201,10 @@ impl Default for Config {
             simd_jit_strategy: SimdJitStrategy::RegisterCached,
             #[cfg(feature = "simd-experiment")]
             simd_assume_avx2: false,
+            #[cfg(feature = "simd-experiment")]
+            simd_avx512: true,
+            #[cfg(feature = "simd-experiment")]
+            simd_force_avx512: false,
         }
     }
 }

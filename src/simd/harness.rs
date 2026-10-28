@@ -120,6 +120,8 @@ pub fn config(strategy: SimdJitStrategy) -> Config {
         simd_jit_strategy: strategy,
         simd_assume_avx2: running_under_rosetta()
             || std::env::var("SBPF_SIMD_ASSUME_AVX2").is_ok_and(|v| v == "1"),
+        // SBPF_SIMD_AVX512=0 restricts the JIT to AVX2 (to compare both on one host)
+        simd_avx512: !std::env::var("SBPF_SIMD_AVX512").is_ok_and(|v| v == "0"),
         ..Config::default()
     }
 }

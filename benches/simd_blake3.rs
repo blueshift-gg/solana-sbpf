@@ -46,7 +46,6 @@ const fn v(
 use Engine::*;
 use Kernel::*;
 use SimdJitStrategy::*;
-const MEM: VecMode = VecMode::Memory(9);
 const SLOT: VecMode = VecMode::Slot;
 const CALL: VecMode = VecMode::Call;
 
@@ -55,12 +54,10 @@ const VARIANTS: &[Variant] = &[
     v("A0_scalar_interp", "scalar sBPF, interpreter", Scalar, SLOT, Interpreter, Direct),
     v("B_simd8_interp", "B: SIMD 8-way, interpreter", Simd8, SLOT, Interpreter, Direct),
     v("B1_simd1_interp", "SIMD 1-state, interpreter", Simd1, SLOT, Interpreter, Direct),
-    v("C_simd8_mem_jit", "C: SIMD 8-way, ordinary memory, JIT", Simd8, MEM, Jit, Direct),
-    v("D_simd8_slot_direct", "D: SIMD 8-way, vector region, JIT uncached", Simd8, SLOT, Jit, Direct),
-    v("E_simd8_slot_cached", "E: SIMD 8-way, vector region, JIT reg-cached", Simd8, SLOT, Jit, RegisterCached),
-    v("C1_simd1_mem_jit", "SIMD 1-state, ordinary memory, JIT", Simd1, MEM, Jit, Direct),
-    v("D1_simd1_slot_direct", "SIMD 1-state, vector region, JIT uncached", Simd1, SLOT, Jit, Direct),
-    v("E1_simd1_slot_cached", "SIMD 1-state, vector region, JIT reg-cached", Simd1, SLOT, Jit, RegisterCached),
+    v("D_simd8_slot_direct", "D: SIMD 8-way, vector file, JIT uncached", Simd8, SLOT, Jit, Direct),
+    v("E_simd8_slot_cached", "E: SIMD 8-way, vector file, JIT reg-cached", Simd8, SLOT, Jit, RegisterCached),
+    v("D1_simd1_slot_direct", "SIMD 1-state, vector file, JIT uncached", Simd1, SLOT, Jit, Direct),
+    v("E1_simd1_slot_cached", "SIMD 1-state, vector file, JIT reg-cached", Simd1, SLOT, Jit, RegisterCached),
     v("G_simd8_call_cached", "G: SIMD 8-way, intrinsic calls, JIT reg-cached", Simd8, CALL, Jit, RegisterCached),
     v("G1_simd1_call_cached", "SIMD 1-state, intrinsic calls, JIT reg-cached", Simd1, CALL, Jit, RegisterCached),
     v("H_simd8_call_direct", "H: SIMD 8-way, intrinsic calls, JIT uncached", Simd8, CALL, Jit, Direct),
@@ -255,8 +252,6 @@ fn main() {
         (Scalar, SLOT, Interpreter, Direct, "A0_scalar_interp", "scalar, interpreter", 1),
         (Simd1, SLOT, Interpreter, Direct, "B1_simd1_interp", "SIMD 1-state, interpreter", 1),
         (Simd8, SLOT, Interpreter, Direct, "B_simd8_interp", "SIMD 8-way, interpreter", 8),
-        (Simd1, MEM, Jit, Direct, "C1_simd1_mem_jit", "SIMD 1-state, ordinary memory, JIT", 1),
-        (Simd8, MEM, Jit, Direct, "C_simd8_mem_jit", "SIMD 8-way, ordinary memory, JIT", 8),
         (Simd1, SLOT, Jit, Direct, "D1_simd1_slot_direct", "SIMD 1-state, region, JIT uncached", 1),
         (Simd8, SLOT, Jit, Direct, "D_simd8_slot_direct", "SIMD 8-way, region, JIT uncached", 8),
         (Simd1, SLOT, Jit, RegisterCached, "E1_simd1_slot_cached", "SIMD 1-state, region, JIT cached", 1),
@@ -318,7 +313,6 @@ fn main() {
     for repeat in [1usize, 4, 16, 64] {
         for (mode, engine, strategy, id) in [
             (SLOT, Interpreter, Direct, "interp"),
-            (MEM, Jit, Direct, "C_mem"),
             (SLOT, Jit, Direct, "D_direct"),
             (SLOT, Jit, RegisterCached, "E_cached"),
             (CALL, Jit, Direct, "H_call_direct"),
