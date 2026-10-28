@@ -163,8 +163,12 @@ pub const VCOMPRESS: u8 = 0x35;
 /// `v[vd][i] = r[src] bit i ? v[va][k++] : 0` (the low lanes of `v[va]` spread to the set bits),
 /// lanes of `8 << off` bits (vpexpand*)
 pub const VEXPAND: u8 = 0x36;
+/// Signed 16 bit Montgomery product: `v[vd] = mulhi(a, w) - mulhi(mullo(a, w'), q)` per i16 lane
+/// with `a = v[va]`, `w = v[vb]`, `w' = v[vb + 2]` (w q^-1 mod 2^16), `q = v[off]` (4 AVX2
+/// instructions: vpmullw, vpmulhw, vpmulhw, vpsubw)
+pub const VMONT16: u8 = 0x37;
 /// Number of defined sub-operations
-pub const SUBOP_COUNT: u8 = 0x37;
+pub const SUBOP_COUNT: u8 = 0x38;
 
 /// 512 bit flag in the immediate
 pub const WIDE: u32 = 1 << 24;
@@ -226,6 +230,7 @@ pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
         VSLL64 | VSRL64 | VSRA64 => (0..64).contains(&op.off),
         VCMP => (0..64).contains(&op.off),
         VBLENDM | VCOMPRESS | VEXPAND => (0..4).contains(&op.off),
+        VMONT16 => (0..ebpf::VECTOR_SLOTS as i16 - op.halves() as i16 + 1).contains(&op.off) && op.vb as usize + 2 + op.halves() <= ebpf::VECTOR_SLOTS,
         _ => op.off == 0,
     };
     if !off_ok {
@@ -242,7 +247,7 @@ pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
         }
         _ => {}
     }
-    if op.wide && (!has_wide_form(op.subop) || (op.vd | op.va | op.vb) & 1 != 0) {
+    if op.wide && (!has_wide_form(op.subop) || (op.vd | op.va | op.vb) & 1 != 0 || (op.subop == VMONT16 && op.off & 1 != 0)) {
         return None;
     }
     Some(())
@@ -645,6 +650,23 @@ pub fn interpret_registers(op: &VecInsn, reg: &[u64], vector_base: *mut u8) -> R
             }
             return Ok(0);
         }
+        VMONT16 => {
+            let w16 = |s: u8, i: usize| unsafe { std::ptr::read_unaligned(slot(s).add(2 * i).cast::<i16>()) } as i32;
+            let n = 16 * op.halves();
+            let out: Vec<i16> = (0..n)
+                .map(|i| {
+                    let (a, half) = (w16(op.va, i), (i / 16) as u8);
+                    let (w, wp, q) = (w16(op.vb + half, i % 16), w16(op.vb + 2 + half, i % 16), w16(op.off as u8 + half, i % 16));
+                    let hi = |x: i32, y: i32| ((x * y) >> 16) as i16 as i32;
+                    let t = ((a * wp) as i16) as i32;
+                    (hi(a, w) - hi(t, q)) as i16
+                })
+                .collect();
+            for (i, v) in out.iter().enumerate() {
+                unsafe { std::ptr::write_unaligned(slot(op.vd).add(2 * i).cast::<i16>(), *v) };
+            }
+            return Ok(0);
+        }
         VCOMPRESSLT16 => {
             let n = 16 * op.halves();
             let word = |s: u8, i: usize| unsafe { std::ptr::read_unaligned(slot(s).add(2 * i).cast::<u16>()) };
@@ -739,6 +761,7 @@ pub fn disassemble(insn: &ebpf::Insn) -> String {
         VCOMPRESS => format!("{name} r{}, v{vd}, v{va}, r{}, {}", op.dst, op.src, op.off),
         VEXPAND => format!("{name} v{vd}, v{va}, r{}, {}", op.src, op.off),
         VSLL64 | VSRL64 | VSRA64 => format!("{name} v{vd}, v{va}, {}", op.off),
+        VMONT16 => format!("{name} v{vd}, v{va}, v{vb}, q=v{}", op.off),
         VMOV => format!("{name} v{vd}, v{va}"),
         VROR32 | VSRL32 | VSLL32 => format!("{name} v{vd}, v{va}, {}", op.off),
         VSHUFD => format!("{name} v{vd}, v{va}, {:#x}", op.off),

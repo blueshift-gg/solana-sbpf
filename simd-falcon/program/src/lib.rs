@@ -51,6 +51,14 @@ struct Candidates([u16; N + 68]);
 
 impl shake::Sponge for VectorSponge<'_> {
     #[inline(always)]
+    fn absorb_block(&mut self, block: &[u8; shake::RATE]) {
+        iv::load(generated::K_IN, 4, block.as_ptr().cast());
+        let lane16 = unsafe { (block.as_ptr().add(128) as *const u64).read_unaligned() };
+        iv::ins64(generated::K_BLK_C, lane16, 0);
+        generated::keccak_absorb_block();
+        generated::keccak_f();
+    }
+    #[inline(always)]
     fn set_input(&mut self, lane: usize, value: u64) {
         self.input.0[8 * (lane / 5) + lane % 5] = value;
     }

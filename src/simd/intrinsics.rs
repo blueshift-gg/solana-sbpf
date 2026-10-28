@@ -87,6 +87,7 @@ pub const NAMES_256: [&str; SUBOP_COUNT as usize] = [
     "sol_avx512_blendm256",
     "sol_avx512_compress256",
     "sol_avx512_expand256",
+    "sol_avx2_mont16x16",
 ];
 
 /// Function names of the 512 bit forms (slot pairs, AVX-512F/BW), indexed by sub-operation
@@ -146,6 +147,7 @@ pub const NAMES_512: [Option<&str>; SUBOP_COUNT as usize] = [
     Some("sol_avx512_blendm512"),
     Some("sol_avx512_compress512"),
     Some("sol_avx512_expand512"),
+    Some("sol_avx512_mont16x32"),
 ];
 
 /// Register holding the packed operands
@@ -199,6 +201,7 @@ pub fn hashes() -> Vec<(u32, u8, bool)> {
 /// mov                    bits 0..7 vd   bits 8..15 va
 /// blendd / blendw /      bits 0..6 vd   bits 7..13 va   bits 14..20 vb   bits 21..28 imm8 (slots < 128)
 /// ternlog
+/// mont16                 bits 0..6 vd   bits 7..13 va   bits 14..20 w   bits 21..27 q   (slots < 128)
 /// ```
 pub fn pack(op: &VecInsn) -> u64 {
     let (vd, va, vb, imm) = (op.vd as u64, op.va as u64, op.vb as u64, op.off as u16 as u64);
@@ -214,6 +217,7 @@ pub fn pack(op: &VecInsn) -> u64 {
         VBLENDM => vd | va << 8 | vb << 16 | (imm & 3) << 24,
         VCOMPRESS | VEXPAND => vd | va << 8 | (imm & 3) << 16,
         VBLENDD | VBLENDW | VTERNLOG => (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21,
+        VMONT16 => (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0x7f) << 21,
         VMOV => vd | va << 8,
         _ => vd | va << 8 | vb << 16,
     }
@@ -240,6 +244,10 @@ pub fn unpack(subop: u8, wide: bool, packed: u64) -> Option<VecInsn> {
         VBLENDD | VBLENDW | VTERNLOG => {
             let field = |shift: u32| ((packed >> shift) & 0x7f) as u8;
             (vd, va, vb, off) = (field(0), field(7), field(14), byte(21) as i16);
+        }
+        VMONT16 => {
+            let field = |shift: u32| ((packed >> shift) & 0x7f) as u8;
+            (vd, va, vb, off) = (field(0), field(7), field(14), field(21) as i16);
         }
         VMOV => (vd, va) = (byte(0), byte(8)),
         _ => (vd, va, vb) = (byte(0), byte(8), byte(16)),
@@ -312,8 +320,8 @@ pub fn register<C: ContextObject>(loader: &mut BuiltinProgram<C>) -> Result<(), 
         };
     }
     register!(false: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54);
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55);
     register!(true: 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54);
+        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55);
     Ok(())
 }

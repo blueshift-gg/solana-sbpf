@@ -60,6 +60,10 @@ define_syscall!(fn sol_avx512_blendw512(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_ror32x16(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_shufb512(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_compresslt16x32(ops: u64) -> u64);
+define_syscall!(fn sol_avx2_mont16x16(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_permt2d512(ops: u64) -> u64);
+define_syscall!(fn sol_avx_ins64(ops: u64, value: u64) -> u64);
+define_syscall!(fn sol_avx512_mont16x32(ops: u64) -> u64);
 
 /// `n` consecutive slots from `src` (one translation)
 #[inline(always)]
@@ -218,4 +222,25 @@ pub fn shufb512(d: u8, a: u8, idx: u8) {
 #[inline(always)]
 pub fn compresslt16x32(d: u8, a: u8, b: u8) -> u64 {
     unsafe { sol_avx512_compresslt16x32(ops3(d, a, b)) }
+}
+/// Montgomery product of i16 lanes: `d = mulhi(a, w) - mulhi(mullo(a, w'), q)`, `w'` in slot `w + 2`,
+/// `q` in slot `q` (slots below 128), 512 bit form if `wide`
+#[inline(always)]
+pub fn mont16(wide: bool, d: u8, a: u8, w: u8, q: u8) {
+    let ops = d as u64 | (a as u64) << 7 | (w as u64) << 14 | (q as u64) << 21;
+    if wide {
+        unsafe { sol_avx512_mont16x32(ops) };
+    } else {
+        unsafe { sol_avx2_mont16x16(ops) };
+    }
+}
+/// `d[i] = (d ++ b)[idx[i] & 31]` over the 16 u32 lanes of the pairs (the first table is overwritten)
+#[inline(always)]
+pub fn permt2d512(d: u8, idx: u8, b: u8) {
+    unsafe { sol_avx512_permt2d512(ops3(d, idx, b)) };
+}
+/// u64 lane `lane` of slot `d` = `value`
+#[inline(always)]
+pub fn ins64(d: u8, value: u64, lane: u8) {
+    unsafe { sol_avx_ins64(d as u64 | (lane as u64) << 8, value) };
 }

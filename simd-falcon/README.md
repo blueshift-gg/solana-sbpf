@@ -17,12 +17,13 @@ Blueshift's example program, with Firedancer's verifier structure (`fd_falcon.c`
   64 bit lanes, one state row per slot pair. Theta with `ternlog512` / `permd512` / `rolv64x8`, rho
   with `rolv64x8`, pi as one lane permutation per row (which yields the column layout), chi in place
   with `ternlog512`, and `transpose8x8q` back to rows: 30 vector ops per round. The rate goes in and
-  in with one `load256` of 8 slots. Rejection sampling stays in vector registers: per rate row a
+  in without scalar byte work: a full block is one 4 slot `load256` plus `ins64` for lane 16, spread
+  over the rows with `permt2d512` / `permd512` (only the last, padded block goes through a buffer). Rejection sampling stays in vector registers: per rate row a
   `shufb512` byte swaps the big-endian samples, `compresslt16x32` keeps those below 5q in order and
   returns their number, and one store appends them to the candidates (unused lanes have threshold 0).
 * **NTT, pointwise product, norm:** Cooley-Tukey forward / Gentleman-Sande inverse NTT over
   Z/12289 like Firedancer, written the way current AVX2 NTTs (Kyber, Dilithium) are: 16 signed
-  16 bit coefficients per slot, Montgomery products from 16 bit multiplies (4 ops), lazy reduction
+  16 bit coefficients per slot, Montgomery products as one `mont16` op (4 AVX2 instructions), lazy reduction
   where a tracked bound requires it, levels 8 / 4 / 2 after an 8 x 8 transpose of coefficient pairs,
   level 1 inside the pairs. Everything runs on 512 bit slot pairs except the two levels between the
   slots of a pair and the transposes. The norm sums squares with `madd16`. Firedancer computes
@@ -44,12 +45,11 @@ tampered messages and signatures rejected, CUs identical between interpreter and
 
 | | Blueshift (scalar sBPF) | Vector intrinsics |
 |---|---|---|
-| CUs, median (min, max) | 182,764 (172,264, 254,225) | **26,332** (24,420, 39,190), 6.9x fewer |
-| Program size | 99 KiB | 86 KiB |
+| CUs, median (min, max) | 182,764 (172,264, 254,225) | **24,228** (22,598, 34,724), 7.5x fewer |
+| Program size | 99 KiB | 76 KiB |
 
-Where the CUs went before vectorized sampling (135 byte message, 30,758 CUs): Keccak-f 14.4k
-(10 permutations of 1,441), decompression 7.2k, the NTT / product / norm 4.5k, taking samples,
-absorbing and buffers 4.4k, the rest 0.2k.
+Where the CUs go (135 byte message, 25,735 CUs): Keccak-f 14.4k (10 permutations of 1,441), the
+signature decoder 7.2k, the NTT / product / norms 2.8k, sampling, absorbing and glue 1.2k.
 
 | Change | CUs (135 byte message) |
 |---|---|
@@ -64,6 +64,7 @@ absorbing and buffers 4.4k, the rest 0.2k.
 | NTT / product / norms on 512 bit slot pairs | 32,394 |
 | Decoder without a call in its loop, constant offset stores | 30,758 |
 | Rejection sampling with `shufb512` + `compresslt16x32` | 27,859 |
+| `mont16` (one op per Montgomery product), message blocks absorbed from vector loads | 25,735 |
 
 ## Reproduce
 

@@ -90,6 +90,7 @@ is the 256 bit operation on both halves unless noted. The intrinsic name (next s
 | 0x34 | `sol_avx512_blendm256` | `sol_avx512_blendm512` | `d = mask ? a : b`, mask in `src` / r2, lane size in `off` | `kmovq` + `vpblendm*` |
 | 0x35 | `sol_avx512_compress256` | `sol_avx512_compress512` | masked lanes of `a` packed (rest 0), count in `dst` / r0 | `kmovq` + `vpcompress*` + `popcnt` (8 / 16 bit lanes: VBMI2) |
 | 0x36 | `sol_avx512_expand256` | `sol_avx512_expand512` | low lanes of `a` spread to the mask bits (rest 0) | `kmovq` + `vpexpand*` |
+| 0x37 | `sol_avx2_mont16x16` | `sol_avx512_mont16x32` | i16 Montgomery product `mulhi(a, w) - mulhi(mullo(a, w'), q)`, `w'` in slot `w + 2`, `q` in slot `off` | `vpmullw` + 2 `vpmulhw` + `vpsubw` |
 | 0x27 | `sol_avx512_compresslt16x16` | `sol_avx512_compresslt16x32` | u16 lanes of `a` below those of `b`, in order, packed into `d` (rest 0); count in `dst` / r0 | branchless scalar loop over the vector file / `vpcmpuw` + `vpcompressw` (VBMI2) + `kmovd` + `popcnt` |
 
 The BLAKE3 work needed the first 13; the rest came with the Falcon verifier (16 bit NTT arithmetic,
@@ -118,7 +119,7 @@ mov64 r1, <packed operands>       ; compile time constant
 call  sol_avx2_add32x8            ; CALL_IMM, src = 0, imm = murmur32("sol_avx2_add32x8")
 ```
 
-* **Encoding:** one static call identifier per operation and width (103 of them, the names in the
+* **Encoding:** one static call identifier per operation and width (105 of them, the names in the
   table above). `dst`, `src` and `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF.
   The names say which ISA level each operation maps to: `sol_avx_` (moves), `sol_avx2_` (AVX2
   integer operations) and `sol_avx512_` (AVX-512 operations, and every 512 bit form). Every

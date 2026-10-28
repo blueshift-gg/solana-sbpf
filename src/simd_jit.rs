@@ -838,7 +838,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 // Lane-wise on the two halves. All slots are even, so the low half's result never
                 // overwrites a source of the high half.
                 for h in 0..2u8 {
-                    let half = VecInsn { wide: false, vd: op.vd + h, va: op.va + h, vb: op.vb + h, ..op };
+                    // mont16 also takes q from a slot (in `off`)
+                    let off = if op.subop == VMONT16 { op.off + h as i16 } else { op.off };
+                    let half = VecInsn { wide: false, vd: op.vd + h, va: op.va + h, vb: op.vb + h, off, ..op };
                     self.emit_simd_cached(&half);
                 }
             }
@@ -1171,6 +1173,20 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::permi2d(1, rd, ra, b));
             }
+            VMONT16 => {
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let w = self.simd_source(op.vb);
+                let wp = self.simd_source(op.vb + 2);
+                let q = self.simd_source(op.off as u8);
+                let t = self.simd_allocate();
+                self.simd_pin(t);
+                self.emit_vex(V::alu(VPMULLW, SCRATCH_YMM, ra, wp));
+                self.emit_vex(V::alu(VPMULHW, SCRATCH_YMM, SCRATCH_YMM, q));
+                self.emit_vex(V::alu(VPMULHW, t, ra, w));
+                let rd = self.simd_destination(op.vd);
+                self.emit_vex(V::alu(VPSUBW, rd, t, VexRm::Reg(SCRATCH_YMM)));
+            }
             VADD64 | VSUB64 | VMULU32 | VSLLV64 | VSRLV64 => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
@@ -1359,15 +1375,16 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     /// Slot operands of a vector operation (the first slot of each pair for 512 bit operations),
     /// for everything but vload / vstore / vtranspose8
-    fn simd_operand_slots(op: &VecInsn) -> ([u8; 3], usize) {
+    fn simd_operand_slots(op: &VecInsn) -> ([u8; 5], usize) {
         use crate::simd::*;
         match op.subop {
-            VBCAST32 | VBCAST64 | VINS64 => ([op.vd, 0, 0], 1),
-            VEXT64 | VMOVMSK8 => ([op.va, 0, 0], 1),
-            VCMP => ([op.va, op.vb, 0], 2),
-            VCOMPRESS | VEXPAND | VSLL64 | VSRL64 | VSRA64 => ([op.vd, op.va, 0], 2),
-            VMOV | VROR32 | VSHUFD | VSRL32 | VSLL32 => ([op.vd, op.va, 0], 2),
-            _ => ([op.vd, op.va, op.vb], 3),
+            VBCAST32 | VBCAST64 | VINS64 => ([op.vd, 0, 0, 0, 0], 1),
+            VEXT64 | VMOVMSK8 => ([op.va, 0, 0, 0, 0], 1),
+            VCMP => ([op.va, op.vb, 0, 0, 0], 2),
+            VCOMPRESS | VEXPAND | VSLL64 | VSRL64 | VSRA64 => ([op.vd, op.va, 0, 0, 0], 2),
+            VMOV | VROR32 | VSHUFD | VSRL32 | VSLL32 => ([op.vd, op.va, 0, 0, 0], 2),
+            VMONT16 => ([op.vd, op.va, op.vb, op.vb + 2, op.off as u8], 5),
+            _ => ([op.vd, op.va, op.vb, 0, 0], 3),
         }
     }
 
@@ -1552,6 +1569,20 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
                 let zd = self.simd_zdestination(pd);
                 self.emit_evex(if op.subop == VTERNLOG { E::pternlogd(2, zd, za, b, op.off as u8) } else { E::permi2d(2, zd, za, b) });
+            }
+            VMONT16 => {
+                let za = self.simd_zensure(pa);
+                self.simd_zpin(za);
+                let w = self.simd_zsource(pb);
+                let wp = self.simd_zsource(pb + 1);
+                let q = self.simd_zsource(op.off as u8 / 2);
+                let t = self.simd_zallocate();
+                self.simd_zpin(t);
+                self.emit_evex(E::alu(2, VPMULLW, SCRATCH_ZMM, za, wp));
+                self.emit_evex(E::alu(2, VPMULHW, SCRATCH_ZMM, SCRATCH_ZMM, q));
+                self.emit_evex(E::alu(2, VPMULHW, t, za, w));
+                let zd = self.simd_zdestination(pd);
+                self.emit_evex(E::alu(2, VPSUBW, zd, t, VexRm::Reg(SCRATCH_ZMM)));
             }
             VADD64 | VSUB64 | VMULU32 | VSLLV64 | VSRLV64 | VMULLO64 => {
                 let za = self.simd_zensure(pa);

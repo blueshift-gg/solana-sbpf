@@ -119,12 +119,16 @@ enum Op {
     Load(u8, &'static str, usize, u8),
     /// u64 lanes: d = a.rotate_left(b % 64)
     Rolv64(u8, u8, u8),
+    /// Montgomery product: d = mulhi(a, w) - mulhi(mullo(a, w'), q) with w' in slot w + 2, q in slot q
+    Mont(u8, u8, u8, u8),
     /// 512 bit form of a lane-wise op on the slot pairs (all slots even)
     W(&'static Op),
     /// 512 bit cross lane permutation of the 16 u32 lanes of the pairs: (dst, data, indices)
     PermdW(u8, u8, u8),
     /// Transposes the 8 x 8 u64 matrix of the 8 pairs from the slot
     TransposeQW(u8),
+    /// 512 bit two table permutation, first table overwritten: (table1 / dst, indices, table2)
+    PermT2W(u8, u8, u8),
 }
 
 /// The 512 bit form of a lane-wise op
@@ -145,6 +149,7 @@ fn shifted(op: Op, h: u8) -> Op {
         Minu16(d, a, b) => Minu16(d + h, a + h, b + h),
         Madd16(d, a, b) => Madd16(d + h, a + h, b + h),
         Rolv64(d, a, b) => Rolv64(d + h, a + h, b + h),
+        Mont(d, a, w, q) => Mont(d + h, a + h, w + h, q + h),
         Tern(d, a, b, imm) => Tern(d + h, a + h, b + h, imm),
         Blendw(d, a, b, m) => Blendw(d + h, a + h, b + h, m),
         Ror(d, a, n) => Ror(d + h, a + h, n),
@@ -255,12 +260,10 @@ impl Gen {
         w.abs()
     }
 
-    /// dst = mont(a, W) (dst may be a)
+    /// dst = mont(a, W) (dst may be a): one mont16 operation
     fn mont(&mut self, dst: u8, a: u8, w: u8, w_p: u8, w_abs: i64, width: Width) {
-        self.op(Op::Mullo16(T0, a, w_p), width);
-        self.op(Op::Mulhi16(T1, a, w), width);
-        self.op(Op::Mulhi16(T0, T0, QV), width);
-        self.op(Op::Sub16(dst, T1, T0), width);
+        assert_eq!(w_p, w + 2, "mont16 takes w' from the slot w + 2");
+        self.op(Op::Mont(dst, a, w, QV), width);
         let b = mont_bound(self.bound(a, width), w_abs);
         self.set_bound(dst, b, width);
     }
@@ -517,6 +520,16 @@ fn simulate(ops: &[Op], region: &mut [[u32; 8]; 256], tables: &dyn Fn(&str, usiz
                     region[d + r] = std::array::from_fn(|c| tile[c][r]);
                 }
             }
+            Op::Mont(d, a, w, q) => {
+                let wp = w + 2;
+                let word = |r: &[[u32; 8]; 256], s: u8, i: usize| (r[s as usize][i / 2] >> (16 * (i % 2))) as u16 as i16 as i32;
+                let out: [u16; 16] = std::array::from_fn(|i| {
+                    let x = word(region, a, i);
+                    let t = (x * word(region, wp, i)) as i16 as i32;
+                    (((x * word(region, w, i)) >> 16) - ((t * word(region, q, i)) >> 16)) as u16
+                });
+                region[d as usize] = std::array::from_fn(|i| out[2 * i] as u32 | (out[2 * i + 1] as u32) << 16);
+            }
             Op::Rolv64(d, a, b) => {
                 let q = |x: &[u32; 8], i: usize| x[2 * i] as u64 | (x[2 * i + 1] as u64) << 32;
                 let (x, y) = (region[a as usize], region[b as usize]);
@@ -535,6 +548,16 @@ fn simulate(ops: &[Op], region: &mut [[u32; 8]; 256], tables: &dyn Fn(&str, usiz
             Op::PermdW(d, a, idx) => {
                 let get = |r: &[[u32; 8]; 256], s: u8, i: usize| r[s as usize + i / 8][i % 8];
                 let out: [u32; 16] = std::array::from_fn(|i| get(region, a, (get(region, idx, i) & 15) as usize));
+                for i in 0..16 {
+                    region[d as usize + i / 8][i % 8] = out[i];
+                }
+            }
+            Op::PermT2W(d, idx, b) => {
+                let get = |r: &[[u32; 8]; 256], s: u8, i: usize| r[s as usize + i / 8][i % 8];
+                let out: [u32; 16] = std::array::from_fn(|i| {
+                    let j = (get(region, idx, i) & 31) as usize;
+                    if j < 16 { get(region, d, j) } else { get(region, b, j - 16) }
+                });
                 for i in 0..16 {
                     region[d as usize + i / 8][i % 8] = out[i];
                 }
@@ -736,12 +759,15 @@ fn emit_fn(s: &mut String, name: &str, ops: &[Op]) {
             Op::Transpose(d) => writeln!(s, "    transpose({d});"),
             Op::Load(d, t, row, n) => writeln!(s, "    load({d}, {n}, {t}.0[{row}].as_ptr());"),
             Op::Rolv64(d, a, b) => writeln!(s, "    rolv64(false, {d}, {a}, {b});"),
+            Op::Mont(d, a, w, q) => writeln!(s, "    mont16(false, {d}, {a}, {w}, {q});"),
             Op::PermdW(d, a, i) => writeln!(s, "    permd512({d}, {a}, {i});"),
             Op::TransposeQW(d) => writeln!(s, "    transpose8x8q({d});"),
+            Op::PermT2W(d, i, b) => writeln!(s, "    permt2d512({d}, {i}, {b});"),
             Op::W(inner) => match *inner {
                 Op::Xor(d, a, b) => writeln!(s, "    xor512({d}, {a}, {b});"),
                 Op::Tern(d, a, b, imm) => writeln!(s, "    tern512({d}, {a}, {b}, {imm});"),
                 Op::Rolv64(d, a, b) => writeln!(s, "    rolv64(true, {d}, {a}, {b});"),
+                Op::Mont(d, a, w, q) => writeln!(s, "    mont16(true, {d}, {a}, {w}, {q});"),
                 Op::Mov(d, a) => writeln!(s, "    mov512({d}, {a});"),
                 Op::Add(d, a, b) => writeln!(s, "    add32(true, {d}, {a}, {b});"),
                 Op::Add16(d, a, b) => writeln!(s, "    add16(true, {d}, {a}, {b});"),
@@ -811,6 +837,12 @@ const K_BSWAP: u8 = 108; // byte swap of every u16 (shufb indices)
 const K_TH_FULL: u8 = 110; // sampling thresholds: 5q in the 20 u16 of lanes 0..5, else 0
 const K_TH_LAST: u8 = 112; // 5q in the 8 u16 of lanes 0..2 (rate row 3), else 0
 const K_SMP: u8 = 114; // samples of one row
+// Direct absorb of a contiguous block: lanes 0..16 in K_IN..K_IN + 4 (pairs A, B), lane 16 in lane 0
+// of the pair K_BLK_C (whose other lanes stay zero)
+const K_BLK_C: u8 = 30;
+const K_AIDX1: u8 = 116; // row 1 <- lanes 5..10 of A ++ B
+const K_AIDX2: u8 = 118; // row 2 <- lanes 2..7 of B
+const K_AIDX3: u8 = 120; // row 3 <- lane 7 of B, lane 0 of C, zeros
 /// d ^ a ^ b
 const XOR3: u8 = 0x96;
 /// d ^ (!a & b)
@@ -903,6 +935,11 @@ fn keccak_table() -> Vec<[u32; 8]> {
         pairs.push(std::array::from_fn(|i| if i < lanes { q5 * 0x0001_0001_0001_0001 } else { 0 }));
     }
     assert_eq!(K_TABLE as usize + 2 * pairs.len(), K_SMP as usize);
+    pairs.push([0; 8]); // K_SMP
+    pairs.push(lane_permutation(&|x| if x < 5 { 5 + x } else { 0 }));
+    pairs.push(lane_permutation(&|x| if x < 5 { 2 + x } else { 0 }));
+    pairs.push(lane_permutation(&|x| match x { 0 => 7, 1 => 8, _ => 9 }));
+    assert_eq!(K_TABLE as usize + 2 * pairs.len(), K_AIDX3 as usize + 2);
     pairs.into_iter().flat_map(pair_rows).collect()
 }
 
@@ -913,6 +950,22 @@ fn keccak_init_ops() -> Vec<Op> {
 
 fn keccak_absorb_ops() -> Vec<Op> {
     (0..4).map(|y| w(Op::Xor(K_STATE + 2 * y, K_STATE + 2 * y, K_IN + 2 * y))).collect()
+}
+
+/// Absorbs a contiguous block (lanes 0..16 in pairs A = K_IN, B = K_IN + 2, lane 16 in C =
+/// K_BLK_C): row 0 is A itself, rows 1..4 come from two table / lane permutations
+fn keccak_absorb_block_ops() -> Vec<Op> {
+    let (a, b, c) = (K_IN, K_IN + 2, K_BLK_C);
+    let row = |y: u8| K_STATE + 2 * y;
+    vec![
+        w(Op::Xor(row(0), row(0), a)),
+        Op::PermT2W(a, K_AIDX1, b),
+        w(Op::Xor(row(1), row(1), a)),
+        Op::PermdW(K_T0, b, K_AIDX2),
+        w(Op::Xor(row(2), row(2), K_T0)),
+        Op::PermT2W(b, K_AIDX3, c),
+        w(Op::Xor(row(3), row(3), b)),
+    ]
 }
 
 fn keccak_f_ops() -> Vec<Op> {
@@ -986,6 +1039,7 @@ struct SimSponge<'a> {
     region: [[u32; 8]; 256],
     f: &'a [Op],
     absorb: &'a [Op],
+    absorb_block: &'a [Op],
     table: Vec<[u32; 8]>,
     out: Vec<u32>,
 }
@@ -998,6 +1052,19 @@ impl SimSponge<'_> {
 }
 
 impl shake::Sponge for SimSponge<'_> {
+    fn absorb_block(&mut self, block: &[u8; 136]) {
+        for i in 0..17 {
+            let v = u64::from_le_bytes(block[8 * i..8 * i + 8].try_into().unwrap());
+            if i < 16 {
+                lane_set(&mut self.region, K_IN + 2 * (i / 8) as u8, i % 8, v);
+            } else {
+                lane_set(&mut self.region, K_BLK_C, 0, v);
+            }
+        }
+        let (ab, f) = (self.absorb_block, self.f);
+        self.run(ab);
+        self.run(f);
+    }
     fn set_input(&mut self, lane: usize, value: u64) {
         lane_set(&mut self.region, K_IN + 2 * (lane / 5) as u8, lane % 5, value);
     }
@@ -1058,7 +1125,7 @@ fn shake256_ref(data: &[u8], out_len: usize) -> Vec<u8> {
     }
 }
 
-fn keccak_self_test(f: &[Op], absorb: &[Op], init: &[Op]) {
+fn keccak_self_test(f: &[Op], absorb: &[Op], absorb_block: &[Op], init: &[Op]) {
     assert_eq!(&shake256_ref(b"", 8), &[0x46, 0xb9, 0xdd, 0x2b, 0x0b, 0xa8, 0x8d, 0x13], "reference SHAKE256");
     let table = keccak_table();
     // The permutation alone, with garbage in the unused rows and lanes
@@ -1080,7 +1147,7 @@ fn keccak_self_test(f: &[Op], absorb: &[Op], init: &[Op]) {
     for msg_len in [0usize, 1, 7, 95, 96, 135, 136, 200, 271, 272, 1000] {
         let nonce: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(37)).collect();
         let msg: Vec<u8> = (0..msg_len).map(|i| (i as u8).wrapping_mul(13) ^ 0x5a).collect();
-        let mut sponge = SimSponge { region: [[0; 8]; 256], f, absorb, table: table.clone(), out: Vec::new() };
+        let mut sponge = SimSponge { region: [[0; 8]; 256], f, absorb, absorb_block, table: table.clone(), out: Vec::new() };
         sponge.run(init);
         shake::hash_to_point(&mut sponge, &nonce, &msg);
         let stream = shake256_ref(&[nonce.clone(), msg].concat(), 8 * 136 * 4);
@@ -1099,18 +1166,19 @@ fn main() {
     self_test(&ops, &tables, &checks, &psi_pos);
     let h = decode_pubkey(&std::fs::read(&pk_path).expect("pubkey fixture"));
     tables.insert("H_PREP", prepare(&h, &psi_pos));
-    let (k_init, k_absorb, k_f) = (keccak_init_ops(), keccak_absorb_ops(), keccak_f_ops());
-    keccak_self_test(&k_f, &k_absorb, &k_init);
+    let (k_init, k_absorb, k_absorb_block, k_f) = (keccak_init_ops(), keccak_absorb_ops(), keccak_absorb_block_ops(), keccak_f_ops());
+    keccak_self_test(&k_f, &k_absorb, &k_absorb_block, &k_init);
     let mut s = String::new();
     for (name, rows) in &tables {
         emit_table(&mut s, name, rows);
     }
     emit_table(&mut s, "KC", &keccak_table());
     writeln!(s, "pub const ACC1: u8 = {ACC1};\npub const C_SLOT: u8 = {C};\npub const P_SLOT: u8 = {P};").unwrap();
-    writeln!(s, "pub const K_IN: u8 = {K_IN};\npub const K_STATE: u8 = {K_STATE};").unwrap();
+    writeln!(s, "pub const K_IN: u8 = {K_IN};\npub const K_STATE: u8 = {K_STATE};\npub const K_BLK_C: u8 = {K_BLK_C};").unwrap();
     emit_fn(&mut s, "vector_core", &ops);
     emit_fn(&mut s, "keccak_init", &k_init);
     emit_fn(&mut s, "keccak_absorb", &k_absorb);
+    emit_fn(&mut s, "keccak_absorb_block", &k_absorb_block);
     emit_fn(&mut s, "keccak_f", &k_f);
     emit_take(&mut s);
     let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("vector_core.rs");

@@ -5,7 +5,9 @@
 
 /// Keccak state access, implemented with vector intrinsics in the program
 pub trait Sponge {
-    /// Writes rate lane `lane` into the absorb buffer
+    /// state ^= a whole block, then Keccak-f
+    fn absorb_block(&mut self, block: &[u8; RATE]);
+    /// Writes rate lane `lane` into the absorb buffer (the last, padded block)
     fn set_input(&mut self, lane: usize, value: u64);
     /// state ^= absorb buffer, then Keccak-f
     fn absorb_permute(&mut self);
@@ -20,7 +22,7 @@ pub trait Sponge {
 }
 
 pub const RATE_LANES: usize = 17;
-const RATE: usize = 8 * RATE_LANES;
+pub const RATE: usize = 8 * RATE_LANES;
 const FALCON_N: usize = 512;
 
 /// Bytes `[offset, offset + 8)` of `a || b` (zero beyond the end) as a little-endian lane
@@ -53,10 +55,18 @@ pub fn hash_to_point<S: Sponge>(s: &mut S, nonce: &[u8], message: &[u8]) {
     let total = nonce.len() + message.len();
     let mut pos = 0;
     while pos + RATE <= total {
-        for lane in 0..RATE_LANES {
-            s.set_input(lane, read_lane(nonce, message, pos + 8 * lane));
+        if pos >= nonce.len() {
+            // Straight from the message
+            let block: &[u8; RATE] = message[pos - nonce.len()..pos - nonce.len() + RATE].try_into().unwrap();
+            s.absorb_block(block);
+        } else {
+            // The block with (the rest of) the nonce is put together first
+            let mut block = [0u8; RATE];
+            let head = nonce.len() - pos;
+            block[..head].copy_from_slice(&nonce[pos..]);
+            block[head..].copy_from_slice(&message[..RATE - head]);
+            s.absorb_block(&block);
         }
-        s.absorb_permute();
         pos += RATE;
     }
     // Last (possibly empty) block with the SHAKE padding: 0x1f after the data, 0x80 in the last byte
