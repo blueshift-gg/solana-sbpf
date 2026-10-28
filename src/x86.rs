@@ -967,6 +967,34 @@ impl VexInstruction {
     pub const fn pbroadcastd(dst: u8, src: u8) -> Self {
         Self::ymm(1, 2, 0x58, dst, 0, VexRm::Reg(src), None)
     }
+    /// vpbroadcastq ymm, xmm
+    pub const fn pbroadcastq(dst: u8, src: u8) -> Self {
+        Self::ymm(1, 2, 0x59, dst, 0, VexRm::Reg(src), None)
+    }
+    /// vmovq xmm, r64
+    pub const fn movq_from_gpr(dst: u8, src: X86Register) -> Self {
+        Self { pp: 1, map: 1, w: true, l: false, opcode: 0x6e, reg: dst, vvvv: 0, rm: VexRm::Reg(src as u8), imm: None }
+    }
+    /// vmovq r64, xmm
+    pub const fn movq_to_gpr(dst: X86Register, src: u8) -> Self {
+        Self { pp: 1, map: 1, w: true, l: false, opcode: 0x7e, reg: src, vvvv: 0, rm: VexRm::Reg(dst as u8), imm: None }
+    }
+    /// vpextrq r64, xmm, imm8
+    pub const fn pextrq(dst: X86Register, src: u8, imm: u8) -> Self {
+        Self { pp: 1, map: 3, w: true, l: false, opcode: 0x16, reg: src, vvvv: 0, rm: VexRm::Reg(dst as u8), imm: Some(imm) }
+    }
+    /// vextracti128 xmm, ymm, imm8
+    pub const fn extracti128(dst: u8, src: u8, imm: u8) -> Self {
+        Self::ymm(1, 3, 0x39, src, 0, VexRm::Reg(dst), Some(imm))
+    }
+    /// vpmovmskb r32, ymm
+    pub const fn pmovmskb(dst: X86Register, src: u8) -> Self {
+        Self::ymm(1, 1, 0xd7, dst as u8, 0, VexRm::Reg(src), None)
+    }
+    /// vblendvps ymm, ymm, ymm/m256, ymm(mask): picks src2 where the mask lane's sign bit is set
+    pub const fn blendvps(dst: u8, src1: u8, src2: u8, mask: u8) -> Self {
+        Self::ymm(1, 3, 0x4a, dst, src1, VexRm::Reg(src2), Some(mask << 4))
+    }
 
     /// Encodes the instruction. `address` is the host address the instruction will be placed at
     /// (only needed for RIP relative operands).
@@ -1028,5 +1056,225 @@ impl VexInstruction {
             push(imm, &mut len);
         }
         (out, len)
+    }
+}
+
+#[cfg(feature = "simd-experiment")]
+impl VexInstruction {
+    /// kmovw k, m16 (pp 0, W0) / kmovd k, m32 (pp 1, W1)
+    pub const fn kmov_load(k: u8, dwords: bool, src: VexRm) -> Self {
+        Self { pp: dwords as u8, map: 1, w: dwords, l: false, opcode: 0x90, reg: k, vvvv: 0, rm: src, imm: None }
+    }
+    /// kmovq r64, k
+    pub const fn kmovq_to_gpr(dst: X86Register, k: u8) -> Self {
+        Self { pp: 3, map: 1, w: true, l: false, opcode: 0x93, reg: dst as u8, vvvv: 0, rm: VexRm::Reg(k), imm: None }
+    }
+}
+
+/// EVEX encoded (AVX-512) instruction. Register numbers go up to 31, `vl` is 1 (256 bit) or 2
+/// (512 bit). Memory operands must be full vectors (disp8 is scaled by the vector length).
+#[cfg(feature = "simd-experiment")]
+#[derive(Copy, Clone)]
+pub struct EvexInstruction {
+    /// Implied mandatory prefix: 0 = none, 1 = 66, 2 = F3, 3 = F2
+    pub pp: u8,
+    /// Opcode map: 1 = 0F, 2 = 0F38, 3 = 0F3A
+    pub map: u8,
+    /// EVEX.W
+    pub w: bool,
+    /// EVEX.L'L: 1 = 256 bit, 2 = 512 bit
+    pub vl: u8,
+    /// Opcode byte
+    pub opcode: u8,
+    /// ModRM.reg (register number or opcode extension)
+    pub reg: u8,
+    /// Additional source register (EVEX.V'vvvv), 0 if unused
+    pub vvvv: u8,
+    /// ModRM.rm operand
+    pub rm: VexRm,
+    /// Opmask register (EVEX.aaa), 0 for none
+    pub mask: u8,
+    /// Optional trailing 8 bit immediate
+    pub imm: Option<u8>,
+}
+
+#[cfg(feature = "simd-experiment")]
+impl EvexInstruction {
+    const fn op(pp: u8, map: u8, w: bool, vl: u8, opcode: u8, reg: u8, vvvv: u8, rm: VexRm, imm: Option<u8>) -> Self {
+        Self { pp, map, w, vl, opcode, reg, vvvv, rm, mask: 0, imm }
+    }
+
+    /// vmovdqu32 zmm, m512
+    pub const fn load(dst: u8, base: X86Register, disp: i32) -> Self {
+        Self::op(2, 1, false, 2, 0x6f, dst, 0, VexRm::Mem(base, disp), None)
+    }
+    /// vmovdqu32 m512, zmm
+    pub const fn store(src: u8, base: X86Register, disp: i32) -> Self {
+        Self::op(2, 1, false, 2, 0x7f, src, 0, VexRm::Mem(base, disp), None)
+    }
+    /// vmovdqa32 zmm, zmm
+    pub const fn mov(dst: u8, src: u8) -> Self {
+        Self::op(1, 1, false, 2, 0x6f, dst, 0, VexRm::Reg(src), None)
+    }
+    /// Three operand packed integer op of the 0F map (`vl` wide): vpaddd (0xfe), vpxord (0xef), ...
+    pub const fn alu(vl: u8, opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
+        Self::op(1, 1, false, vl, opcode, dst, src1, src2, None)
+    }
+    /// Three operand packed integer op of the 0F38 map: vpmulld (0x40), vprolvd (0x15), ...
+    pub const fn alu38(vl: u8, opcode: u8, dst: u8, src1: u8, src2: VexRm) -> Self {
+        Self::op(1, 2, false, vl, opcode, dst, src1, src2, None)
+    }
+    /// Shift / rotate by an immediate (opcode 0x72): /0 vprord, /1 vprold, /2 vpsrld, /6 vpslld
+    pub const fn shift_imm(vl: u8, ext: u8, dst: u8, src: u8, imm: u8) -> Self {
+        Self::op(1, 1, false, vl, 0x72, ext, dst, VexRm::Reg(src), Some(imm))
+    }
+    /// vpshufd zmm, zmm/m512, imm8
+    pub const fn pshufd(dst: u8, src: VexRm, imm: u8) -> Self {
+        Self::op(1, 1, false, 2, 0x70, dst, 0, src, Some(imm))
+    }
+    /// vpermd zmm, zmm(indices), zmm/m512(data)
+    pub const fn permd(dst: u8, indices: u8, data: VexRm) -> Self {
+        Self::op(1, 2, false, 2, 0x36, dst, indices, data, None)
+    }
+    /// vpermi2d: `dst` holds the indices and receives `(table1 ++ table2)[index]`
+    pub const fn permi2d(vl: u8, dst: u8, table1: u8, table2: VexRm) -> Self {
+        Self::op(1, 2, false, vl, 0x76, dst, table1, table2, None)
+    }
+    /// vpternlogd: `dst = f(dst, src1, src2)` for the truth table imm8 (index dst << 2 | src1 << 1 | src2)
+    pub const fn pternlogd(vl: u8, dst: u8, src1: u8, src2: VexRm, imm: u8) -> Self {
+        Self::op(1, 3, false, vl, 0x25, dst, src1, src2, Some(imm))
+    }
+    /// vpblendmd zmm {k}, zmm, zmm/m512: `k ? src2 : src1` per dword
+    pub const fn pblendmd(dst: u8, src1: u8, src2: VexRm, k: u8) -> Self {
+        Self { mask: k, ..Self::op(1, 2, false, 2, 0x64, dst, src1, src2, None) }
+    }
+    /// vpblendmw zmm {k}, zmm, zmm/m512: `k ? src2 : src1` per word
+    pub const fn pblendmw(dst: u8, src1: u8, src2: VexRm, k: u8) -> Self {
+        Self { mask: k, ..Self::op(1, 2, true, 2, 0x66, dst, src1, src2, None) }
+    }
+    /// vpbroadcastd zmm, r32
+    pub const fn pbroadcastd_gpr(dst: u8, src: X86Register) -> Self {
+        Self::op(1, 2, false, 2, 0x7c, dst, 0, VexRm::Reg(src as u8), None)
+    }
+    /// vpbroadcastq zmm, r64
+    pub const fn pbroadcastq_gpr(dst: u8, src: X86Register) -> Self {
+        Self::op(1, 2, true, 2, 0x7c, dst, 0, VexRm::Reg(src as u8), None)
+    }
+    /// vpmovb2m k, zmm (byte sign bits)
+    pub const fn pmovb2m(k: u8, src: u8) -> Self {
+        Self::op(2, 2, false, 2, 0x29, k, 0, VexRm::Reg(src), None)
+    }
+
+    /// Encodes the instruction
+    pub fn encode(&self) -> ([u8; 16], usize) {
+        let mut out = [0u8; 16];
+        let mut len = 0;
+        let mut push = |byte: u8, len: &mut usize| {
+            out[*len] = byte;
+            *len += 1;
+        };
+        let (b, x) = match self.rm {
+            VexRm::Reg(r) => ((r >> 3) & 1, (r >> 4) & 1),
+            VexRm::Mem(base, _) => (((base as u8) >> 3) & 1, 0),
+            VexRm::Rip(_) => unreachable!(),
+        };
+        let not = |bit: u8| (!bit) & 1;
+        push(0x62, &mut len);
+        push(not(self.reg >> 3) << 7 | not(x) << 6 | not(b) << 5 | not(self.reg >> 4) << 4 | self.map, &mut len);
+        push((self.w as u8) << 7 | ((!self.vvvv) & 0xf) << 3 | 1 << 2 | self.pp, &mut len);
+        push(self.vl << 5 | not(self.vvvv >> 4) << 3 | self.mask, &mut len);
+        push(self.opcode, &mut len);
+        let reg = (self.reg & 7) << 3;
+        match self.rm {
+            VexRm::Reg(r) => push(0xc0 | reg | (r & 7), &mut len),
+            VexRm::Mem(base, disp) => {
+                let base = (base as u8) & 7;
+                let n = 16i32 << self.vl;
+                let mode = if disp == 0 && base != 5 {
+                    0
+                } else if disp % n == 0 && (-128..=127).contains(&(disp / n)) {
+                    1
+                } else {
+                    2
+                };
+                push((mode << 6) | reg | base, &mut len);
+                if base == 4 {
+                    push(0x24, &mut len); // SIB: no index, base = rsp / r12
+                }
+                match mode {
+                    1 => push((disp / n) as i8 as u8, &mut len),
+                    2 => disp.to_le_bytes().iter().for_each(|byte| push(*byte, &mut len)),
+                    _ => {}
+                }
+            }
+            VexRm::Rip(_) => unreachable!(),
+        }
+        if let Some(imm) = self.imm {
+            push(imm, &mut len);
+        }
+        (out, len)
+    }
+}
+
+#[cfg(all(test, feature = "simd-experiment"))]
+mod evex_tests {
+    use super::{EvexInstruction as E, VexInstruction as V, VexRm, X86Register::*};
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Expected bytes from `llvm-mc --triple=x86_64 --show-encoding` (Intel syntax given in comments)
+    #[test]
+    fn evex_encodings_match_llvm_mc() {
+        let r = VexRm::Reg;
+        let cases: Vec<(E, &str)> = vec![
+            (E::load(16, R11, 0), "62 c1 7e 48 6f 03"),                 // vmovdqu32 zmm16, [r11]
+            (E::load(30, R11, 64 * 5), "62 41 7e 48 6f 73 05"),         // vmovdqu32 zmm30, [r11 + 320]
+            (E::load(17, R11, 32), "62 c1 7e 48 6f 8b 20 00 00 00"),    // vmovdqu32 zmm17, [r11 + 32]
+            (E::store(31, R11, 64 * 127), "62 41 7e 48 7f 7b 7f"),      // vmovdqu32 [r11 + 8128], zmm31
+            (E::store(16, R11, 64 * 128), "62 c1 7e 48 7f 83 00 20 00 00"), // vmovdqu32 [r11 + 8192], zmm16
+            (E::mov(20, 31), "62 81 7d 48 6f e7"),                      // vmovdqa32 zmm20, zmm31
+            (E::alu(2, 0xfe, 16, 17, r(30)), "62 81 75 40 fe c6"),     // vpaddd zmm16, zmm17, zmm30
+            (E::alu(2, 0xef, 31, 16, VexRm::Mem(R11, 128)), "62 41 7d 40 ef 7b 02"), // vpxord zmm31, zmm16, [r11 + 128]
+            (E::alu(2, 0xfd, 18, 19, r(20)), "62 a1 65 40 fd d4"),     // vpaddw zmm18, zmm19, zmm20
+            (E::alu38(2, 0x40, 21, 22, r(23)), "62 a2 4d 40 40 ef"),   // vpmulld zmm21, zmm22, zmm23
+            (E::alu38(2, 0x15, 16, 17, r(18)), "62 a2 75 40 15 c2"),   // vprolvd zmm16, zmm17, zmm18
+            (E::alu38(1, 0x15, 1, 2, r(3)), "62 f2 6d 28 15 cb"),      // vprolvd ymm1, ymm2, ymm3
+            (E::alu38(2, 0x3a, 24, 25, r(26)), "62 02 35 40 3a c2"),   // vpminuw zmm24, zmm25, zmm26
+            (E::shift_imm(2, 0, 16, 17, 7), "62 b1 7d 40 72 c1 07"),   // vprord zmm16, zmm17, 7
+            (E::shift_imm(1, 0, 3, 14, 31), "62 d1 65 28 72 c6 1f"),   // vprord ymm3, ymm14, 31
+            (E::shift_imm(2, 2, 16, 17, 16), "62 b1 7d 40 72 d1 10"),  // vpsrld zmm16, zmm17, 16
+            (E::shift_imm(2, 6, 16, 17, 3), "62 b1 7d 40 72 f1 03"),   // vpslld zmm16, zmm17, 3
+            (E::pshufd(16, r(17), 0x1b), "62 a1 7d 48 70 c1 1b"),      // vpshufd zmm16, zmm17, 0x1b
+            (E::permd(16, 17, r(18)), "62 a2 75 40 36 c2"),            // vpermd zmm16, zmm17, zmm18
+            (E::permi2d(2, 16, 17, r(18)), "62 a2 75 40 76 c2"),       // vpermi2d zmm16, zmm17, zmm18
+            (E::permi2d(1, 0, 1, r(2)), "62 f2 75 28 76 c2"),          // vpermi2d ymm0, ymm1, ymm2
+            (E::pternlogd(2, 16, 17, r(18), 0x96), "62 a3 75 40 25 c2 96"), // vpternlogd zmm16, zmm17, zmm18, 0x96
+            (E::pternlogd(1, 5, 14, r(9), 0xd2), "62 d3 0d 28 25 e9 d2"),   // vpternlogd ymm5, ymm14, ymm9, 0xd2
+            (E::pblendmd(16, 17, r(18), 1), "62 a2 75 41 64 c2"),      // vpblendmd zmm16 {k1}, zmm17, zmm18
+            (E::pblendmw(16, 17, r(18), 1), "62 a2 f5 41 66 c2"),      // vpblendmw zmm16 {k1}, zmm17, zmm18
+            (E::pbroadcastd_gpr(16, RAX), "62 e2 7d 48 7c c0"),        // vpbroadcastd zmm16, eax
+            (E::pbroadcastq_gpr(30, R9), "62 42 fd 48 7c f1"),         // vpbroadcastq zmm30, r9
+            (E::pmovb2m(1, 30), "62 92 7e 48 29 ce"),                  // vpmovb2m k1, zmm30
+        ];
+        for (insn, expected) in cases {
+            let (bytes, len) = insn.encode();
+            assert_eq!(hex(&bytes[..len]), expected);
+        }
+        let vex: Vec<(V, &str)> = vec![
+            (V::kmovq_to_gpr(R8, 1), "c4 61 fb 93 c1"),                // kmovq r8, k1
+            (V::movq_from_gpr(15, R9), "c4 41 f9 6e f9"),              // vmovq xmm15, r9
+            (V::movq_to_gpr(RAX, 3), "c4 e1 f9 7e d8"),                // vmovq rax, xmm3
+            (V::pextrq(R10, 15, 1), "c4 43 f9 16 fa 01"),              // vpextrq r10, xmm15, 1
+            (V::extracti128(15, 3, 1), "c4 c3 7d 39 df 01"),           // vextracti128 xmm15, ymm3, 1
+            (V::pbroadcastq(2, 15), "c4 c2 7d 59 d7"),                 // vpbroadcastq ymm2, xmm15
+            (V::pmovmskb(RCX, 14), "c4 c1 7d d7 ce"),                  // vpmovmskb ecx, ymm14
+            (V::blendvps(7, 4, 5, 6), "c4 e3 5d 4a fd 60"),            // vblendvps ymm7, ymm4, ymm5, ymm6
+        ];
+        for (insn, expected) in vex {
+            let (bytes, len) = insn.encode(std::ptr::null());
+            assert_eq!(hex(&bytes[..len]), expected);
+        }
     }
 }

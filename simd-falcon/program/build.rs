@@ -24,8 +24,7 @@ const QI: i64 = Q as i64;
 
 // Slots of the vector region (16 coefficients each)
 const P: u8 = 0; // working polynomial (s2, NTT, product, m), 32 slots
-const C: u8 = 64; // hash_to_point candidates (u16 < 5Q), 32 slots, up to 68 values of overrun
-const C_OVERRUN_END: u8 = 101;
+const C: u8 = 64; // hash_to_point candidates (u16 < 5Q), 32 slots
 const QV: u8 = 104; // q in every word
 const Q2V: u8 = 105;
 const Q4V: u8 = 106;
@@ -115,8 +114,8 @@ enum Op {
     Minu16(u8, u8, u8),
     Madd16(u8, u8, u8),
     Blendw(u8, u8, u8, u8),
-    /// Load a generated table row: (slot, table, row)
-    Load(u8, &'static str, usize),
+    /// Load consecutive generated table rows: (first slot, table, first row, rows)
+    Load(u8, &'static str, usize, u8),
 }
 
 
@@ -172,20 +171,20 @@ impl Gen {
         self.checks.push((self.ops.len(), slot, bound));
     }
 
-    /// Loads a table row (appended to `table`) into `slot`
-    fn row(&mut self, slot: u8, table: &'static str, row: [u32; 8]) {
+    /// Loads table rows (appended to `table`) into consecutive slots from `slot`
+    fn rows(&mut self, slot: u8, table: &'static str, new_rows: &[[u32; 8]]) {
         let rows = self.tables.entry(table).or_default();
-        rows.push(row);
-        let index = rows.len() - 1;
-        self.op(Op::Load(slot, table, index));
+        let index = rows.len();
+        rows.extend_from_slice(new_rows);
+        self.op(Op::Load(slot, table, index, new_rows.len() as u8));
     }
 
     /// Twiddle slots for per word Montgomery constants `w` (bound returned)
     fn twiddle_rows(&mut self, table: &'static str, w: [i64; 16]) -> i64 {
         let row = |f: &dyn Fn(i64) -> i64| -> [u32; 8] { std::array::from_fn(|i| pair(f(w[2 * i]), f(w[2 * i + 1]))) };
         let (plain, prime) = (row(&|x| x), row(&mont_prime));
-        self.row(TW, table, plain);
-        self.row(TW_P, table, prime);
+        assert_eq!(TW_P, TW + 1);
+        self.rows(TW, table, &[plain, prime]);
         w.iter().map(|x| x.abs()).max().unwrap()
     }
 
@@ -345,8 +344,7 @@ fn generate(psi_pos: &[u32; N], psi_neg: &[u32; N]) -> (Vec<Op>, Tables, Vec<(us
     }
     // Pointwise product with the prepared pubkey (NTT(h) / N, Montgomery form)
     for s in 0..32u8 {
-        g.row(TW, "H_PREP", [0; 8]);
-        g.row(TW_P, "H_PREP", [0; 8]);
+        g.rows(TW, "H_PREP", &[[0; 8]; 2]);
         g.mont(P + s, P + s, TW, TW_P, QI / 2 + 1);
     }
     // Inverse NTT: level 1, then 2, 4, 8 in the transposed layout, then 16..256
@@ -451,7 +449,11 @@ fn simulate(ops: &[Op], region: &mut [[u32; 8]; 256], tables: &dyn Fn(&str, usiz
                     region[d + r] = std::array::from_fn(|c| tile[c][r]);
                 }
             }
-            Op::Load(d, table, row) => region[d as usize] = tables(table, row),
+            Op::Load(d, table, row, n) => {
+                for i in 0..n as usize {
+                    region[d as usize + i] = tables(table, row + i);
+                }
+            }
             Op::Xor(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| x ^ y),
             Op::Permd(d, a, idx) => {
                 let (data, idx) = (region[a as usize], region[idx as usize]);
@@ -617,19 +619,19 @@ fn emit_fn(s: &mut String, name: &str, ops: &[Op]) {
             Op::Mov(d, a) => writeln!(s, "    mov({d}, {a});"),
             Op::Bcast(d, v) => writeln!(s, "    bcast({d}, {v});"),
             Op::Transpose(d) => writeln!(s, "    transpose({d});"),
-            Op::Load(d, t, row) => writeln!(s, "    load({d}, {t}.0[{row}].as_ptr());"),
+            Op::Load(d, t, row, n) => writeln!(s, "    load({d}, {n}, {t}.0[{row}].as_ptr());"),
             Op::Xor(d, a, b) => writeln!(s, "    xor({d}, {a}, {b});"),
             Op::Permd(d, a, i) => writeln!(s, "    permd({d}, {a}, {i});"),
             Op::Ror(d, a, n) => writeln!(s, "    ror({d}, {a}, {n});"),
             Op::Sll(d, a, n) => writeln!(s, "    sll({d}, {a}, {n});"),
             Op::Blend(d, a, b, m) => writeln!(s, "    blend({d}, {a}, {b}, {m});"),
             Op::Rolv(d, a, b) => writeln!(s, "    rolv({d}, {a}, {b});"),
-            Op::Add16(d, a, b) => writeln!(s, "    add16({d}, {a}, {b});"),
-            Op::Sub16(d, a, b) => writeln!(s, "    sub16({d}, {a}, {b});"),
-            Op::Mullo16(d, a, b) => writeln!(s, "    mullo16({d}, {a}, {b});"),
-            Op::Mulhi16(d, a, b) => writeln!(s, "    mulhi16({d}, {a}, {b});"),
-            Op::Minu16(d, a, b) => writeln!(s, "    minu16({d}, {a}, {b});"),
-            Op::Madd16(d, a, b) => writeln!(s, "    madd16({d}, {a}, {b});"),
+            Op::Add16(d, a, b) => writeln!(s, "    add16(false, {d}, {a}, {b});"),
+            Op::Sub16(d, a, b) => writeln!(s, "    sub16(false, {d}, {a}, {b});"),
+            Op::Mullo16(d, a, b) => writeln!(s, "    mullo16(false, {d}, {a}, {b});"),
+            Op::Mulhi16(d, a, b) => writeln!(s, "    mulhi16(false, {d}, {a}, {b});"),
+            Op::Minu16(d, a, b) => writeln!(s, "    minu16(false, {d}, {a}, {b});"),
+            Op::Madd16(d, a, b) => writeln!(s, "    madd16(false, {d}, {a}, {b});"),
             Op::Blendw(d, a, b, m) => writeln!(s, "    blendw({d}, {a}, {b}, {m});"),
             Op::Tern(d, a, b, imm) => writeln!(s, "    tern({d}, {a}, {b}, {imm});"),
         }
@@ -768,7 +770,8 @@ fn keccak_table() -> Vec<[u32; 8]> {
 }
 
 fn keccak_init_ops() -> Vec<Op> {
-    let mut ops: Vec<Op> = (0..keccak_table().len()).map(|row| Op::Load(K_RC_E + row as u8, "KC", row)).collect();
+    let rows = keccak_table().len();
+    let mut ops: Vec<Op> = (0..rows).step_by(32).map(|row| Op::Load(K_RC_E + row as u8, "KC", row, (rows - row).min(32) as u8)).collect();
     for (slot, v) in [(K_M16, 0x0000_ffff), (K_MH16, 0xffff_0000), (K_S8, 0x0000_ff00), (K_S4, 0x00f0_00f0), (K_S2, 0x0c0c_0c0c), (K_S1, 0x2222_2222)] {
         ops.push(Op::Bcast(slot, v));
     }
@@ -882,11 +885,10 @@ fn emit_take(s: &mut String) {
     // A cold call keeps the rare rejection out of line, so the common path is a not taken branch
     // instead of a select
     writeln!(s, "#[cold]\n#[inline(never)]\nfn rejected(p: *mut u16) -> *mut u16 {{\n    unsafe {{ p.sub(1) }}\n}}").unwrap();
-    writeln!(s, "/// Appends the accepted samples of a squeezed block at `p` (see shake::Sponge::take)").unwrap();
-    writeln!(s, "#[inline(always)]\npub unsafe fn take_candidates(mut p: *mut u16) -> *mut u16 {{").unwrap();
-    // An opaque base keeps the addresses as base + constant offset instead of 64 bit immediates
-    writeln!(s, "    let b = core::hint::black_box(0x6_0000_0000u64) as *const u8;").unwrap();
-    for off in sample_offsets() {
+    writeln!(s, "/// Appends the accepted samples of a squeezed block (`b`: the stored slots K_OUT_L..K_OUT_H + 4)").unwrap();
+    writeln!(s, "/// at `p` (see shake::Sponge::take)").unwrap();
+    writeln!(s, "#[inline(always)]\npub unsafe fn take_candidates(b: *const u8, mut p: *mut u16) -> *mut u16 {{").unwrap();
+    for off in sample_offsets().iter().map(|off| off - 32 * K_OUT_L as usize) {
         writeln!(s, "    let v = u16::from_be((b.add({off}) as *const u16).read_volatile()); p.write_volatile(v); p = p.add(1); if v >= {} {{ p = rejected(p); }}", 5 * Q).unwrap();
     }
     writeln!(s, "    p\n}}").unwrap();
@@ -1006,8 +1008,9 @@ fn main() {
     let pk_path = std::env::var("FALCON_PK").unwrap_or_else(|_| "../fixtures/falcon.pk".to_string());
     println!("cargo:rerun-if-changed={pk_path}");
     println!("cargo:rerun-if-changed=build.rs");
-    // take_candidates may write 68 values past the 512 candidates, into slots nothing else uses
-    assert!(16 * C as usize + N + 68 <= 16 * C_OVERRUN_END as usize && C_OVERRUN_END <= QV);
+    assert_eq!(K_IN_O, K_IN_E + 4);
+    assert_eq!(K_OUT_H, K_OUT_L + 4);
+    assert_eq!(ACC2, ACC1 + 1);
     let (psi_pos, psi_neg) = twiddles();
     let (ops, mut tables, checks) = generate(&psi_pos, &psi_neg);
     self_test(&ops, &tables, &checks, &psi_pos);
@@ -1020,8 +1023,8 @@ fn main() {
         emit_table(&mut s, name, rows);
     }
     emit_table(&mut s, "KC", &keccak_table());
-    writeln!(s, "pub const ACC1: usize = {ACC1};\npub const ACC2: usize = {ACC2};\npub const C_SLOT: usize = {C};\npub const P_SLOT: usize = {P};").unwrap();
-    writeln!(s, "pub const K_IN_E: usize = {K_IN_E};\npub const K_IN_O: usize = {K_IN_O};").unwrap();
+    writeln!(s, "pub const ACC1: u8 = {ACC1};\npub const C_SLOT: u8 = {C};\npub const P_SLOT: u8 = {P};").unwrap();
+    writeln!(s, "pub const K_IN_E: u8 = {K_IN_E};\npub const K_OUT_L: u8 = {K_OUT_L};").unwrap();
     emit_fn(&mut s, "vector_core", &ops);
     emit_fn(&mut s, "keccak_init", &k_init);
     emit_fn(&mut s, "keccak_absorb", &k_absorb);

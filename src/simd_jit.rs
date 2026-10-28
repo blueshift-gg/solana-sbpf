@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::{
-    simd::{self, Operand, VecInsn},
+    simd::{self, VecInsn},
     vm::SimdJitStrategy,
     x86::{VexInstruction as V, VexRm},
 };
@@ -57,7 +57,7 @@ pub struct SimdJitStats {
     pub evictions: usize,
     /// Dirty slots written back at block boundaries, calls, memory accesses, meter checkpoints
     pub flush_stores: usize,
-    /// Runtime operand translations (calls into the memory mapping)
+    /// Runtime vload / vstore transfers (calls into the memory mapping)
     pub translations: usize,
     /// Intrinsic calls whose operands weren't known at compile time (regular syscall)
     pub intrinsic_slow_paths: usize,
@@ -76,7 +76,6 @@ struct SlotState {
 enum R11 {
     Unknown,
     VectorBase,
-    Scratch(usize),
 }
 
 /// Compile time state of the vector lowering
@@ -95,8 +94,8 @@ pub struct SimdJitState {
     r11: R11,
     /// The previous instruction left R11 intact
     previous_keeps_r11: bool,
-    /// Static call identifiers of the vector intrinsics, indexed by sub-operation
-    intrinsic_hashes: [u32; simd::SUBOP_COUNT as usize],
+    /// `(static call identifier, sub-operation, wide)` of the vector intrinsics
+    intrinsics: Vec<(u32, u8, bool)>,
     /// Block local constant tracking of the guest registers (for the intrinsic operands)
     known: [Option<u64>; 11],
     /// The previously compiled instruction, its effect on `known` is applied lazily
@@ -118,7 +117,7 @@ impl SimdJitState {
             pinned: [false; CACHE_REGS],
             r11: R11::Unknown,
             previous_keeps_r11: false,
-            intrinsic_hashes: [0; simd::SUBOP_COUNT as usize],
+            intrinsics: Vec::new(),
             known: [None; 11],
             previous: None,
             stats: SimdJitStats::default(),
@@ -138,7 +137,6 @@ impl SimdJitState {
         let _ = program;
         let analysis = executable.simd_analysis();
         let vector_instructions = analysis.vector_instructions;
-        let intrinsic_hashes = simd::intrinsics::hashes();
         if vector_instructions > 0
             && !config.simd_assume_avx2
             && !std::arch::is_x86_feature_detected!("avx2")
@@ -155,7 +153,7 @@ impl SimdJitState {
         state.static_flow = true;
         state.cached = config.simd_jit_strategy == SimdJitStrategy::RegisterCached;
         state.jump_targets = analysis.jump_targets.clone();
-        state.intrinsic_hashes = intrinsic_hashes;
+        state.intrinsics = simd::intrinsics::hashes();
         Ok((state, vector_instructions))
     }
 }
@@ -242,10 +240,16 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.simd.previous = Some(insn.clone());
     }
 
+    /// `(sub-operation, wide)` if the instruction is a vector intrinsic call
+    fn simd_intrinsic(&self, insn: &ebpf::Insn) -> Option<(u8, bool)> {
+        if insn.opc != ebpf::CALL_IMM || insn.src != 0 {
+            return None;
+        }
+        self.simd.intrinsics.iter().find(|(hash, _, _)| *hash == insn.imm as u32).map(|(_, subop, wide)| (*subop, *wide))
+    }
+
     fn simd_is_intrinsic(&self, insn: &ebpf::Insn) -> bool {
-        insn.opc == ebpf::CALL_IMM
-            && insn.src == 0
-            && self.simd.intrinsic_hashes.contains(&(insn.imm as u32))
+        self.simd_intrinsic(insn).is_some()
     }
 
     /// Applies the effect of an instruction on the known register constants
@@ -265,10 +269,20 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             ebpf::MOV64_REG if dst < 11 => {
                 self.simd.known[dst] = self.simd.known.get(insn.src as usize).copied().flatten()
             }
-            ebpf::CALL_IMM if self.simd_is_intrinsic(insn) => self.simd.known[0] = Some(0),
+            ebpf::CALL_IMM if self.simd_is_intrinsic(insn) => {
+                let (subop, _) = self.simd_intrinsic(insn).unwrap();
+                self.simd.known[0] = if simd::writes_dst(subop) { None } else { Some(0) };
+            }
             // Syscalls write r0, internal calls may change anything
             ebpf::CALL_IMM | ebpf::CALL_REG => self.simd.known = [None; 11],
-            ebpf::EXIT | ebpf::VOP => {}
+            ebpf::VOP => {
+                if let Some(op) = VecInsn::decode(insn) {
+                    if simd::writes_dst(op.subop) {
+                        self.simd.known[op.dst as usize] = None;
+                    }
+                }
+            }
+            ebpf::EXIT => {}
             _ if class == ebpf::BPF_JMP64 || class == ebpf::BPF_JMP32 => {}
             _ => {
                 // Conservatively treat everything else as writing dst (stores only read it)
@@ -280,27 +294,25 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     }
 
     /// Codegen of a vector intrinsic call (SIMD-0645 style): inline AVX2 if the packed operands
-    /// in r5 are a known valid constant, otherwise a regular syscall to `slow_path`
-    pub(crate) fn emit_simd_intrinsic(&mut self, subop: u8, slow_path: BuiltinFunction<C>) {
+    /// in r1 are a known valid constant, otherwise a regular syscall to `slow_path`
+    pub(crate) fn emit_simd_intrinsic(&mut self, subop: u8, wide: bool, slow_path: BuiltinFunction<C>) {
         let op = if self.simd.enabled {
             self.simd.known[simd::intrinsics::OPERAND_REG as usize]
-                .and_then(|packed| simd::intrinsics::unpack(subop, packed))
+                .and_then(|packed| simd::intrinsics::unpack(subop, wide, packed))
         } else {
             None
         };
         if let Some(op) = op {
-            if op.subop == simd::VLOAD && self.emit_simd_static_load(&op) {
-                self.emit_ins(X86Instruction::load_immediate(REGISTER_MAP[0], 0));
-                return;
-            }
             if self.emit_simd_op(&op).is_ok() {
-                // The intrinsic returns 0 in r0
-                self.emit_ins(X86Instruction::load_immediate(REGISTER_MAP[0], 0));
+                // The intrinsic returns its scalar result (written by the op) or 0 in r0
+                if !simd::writes_dst(op.subop) {
+                    self.emit_ins(X86Instruction::load_immediate(REGISTER_MAP[0], 0));
+                }
                 return;
             }
         }
         if self.simd.enabled {
-            // Host calls clobber all YMM registers and access the vector region in memory
+            // Host calls clobber all YMM registers and read or write the vector file in memory
             self.simd_flush(true);
             self.simd.stats.intrinsic_slow_paths += 1;
         }
@@ -310,37 +322,32 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
     }
 
-    /// `vload256` from a compile time known address in the read-only section (e.g. a table in
+    /// `vload` from a compile time known address in the read-only section (e.g. a table in
     /// .rodata): the section is immutable and always mapped at its address, so the translation is
     /// done here instead of at runtime, and the load leaves the register cache intact. Returns false
-    /// (nothing emitted) if the address isn't known or the 32 bytes aren't all in the section.
+    /// (nothing emitted) if the address isn't known or the bytes aren't all in the section.
     fn emit_simd_static_load(&mut self, op: &VecInsn) -> bool {
-        let Some(base) = self.simd.known[simd::intrinsics::SCALAR_REG as usize] else {
+        let Some(base) = self.simd.known[op.src as usize] else {
             return false;
         };
         let addr = base.wrapping_add(op.off as i64 as u64);
+        let slots = op.transfer_slots();
         let ro = self.executable.get_ro_region();
-        let Some(host) = ro.vm_to_host_buffer(addr, ebpf::VECTOR_WIDTH as u64) else {
+        let Some(host) = ro.vm_to_host_buffer(addr, (slots * ebpf::VECTOR_WIDTH) as u64) else {
             return false;
         };
         let host = host.ptr() as *const u8 as i64;
-        self.simd.stats.vector_instructions += 1;
         self.simd.stats.static_loads += 1;
-        // Validates the vector base like every slot mode instruction
+        // Validates the vector base like every vector instruction
         self.simd_ensure_base();
-        if self.simd.cached {
-            self.simd.pinned = [false; CACHE_REGS];
-            let rd = self.simd_destination(op.vd);
-            self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, host));
-            self.emit_vex(V::load(rd, REGISTER_SCRATCH, 0));
-        } else {
-            self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, host));
-            self.emit_vex(V::load(0, REGISTER_SCRATCH, 0));
+        self.simd.pinned = [false; CACHE_REGS];
+        for i in 0..slots {
+            // The destination is allocated first: an eviction stores relative to the vector base
+            let rd = self.simd_destination(op.vd + i as u8);
+            self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, host + (i * ebpf::VECTOR_WIDTH) as i64));
             self.simd.r11 = R11::Unknown;
-            self.simd_ensure_base();
-            self.emit_vex(V::store(0, REGISTER_SCRATCH, Self::slot_disp(op.vd)));
+            self.emit_vex(V::load(rd, REGISTER_SCRATCH, 0));
         }
-        self.simd.r11 = R11::Unknown;
         true
     }
 
@@ -394,21 +401,6 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         ));
         // Reset at the end of the instruction if R11 can not be tracked across instructions
         self.simd.r11 = R11::VectorBase;
-    }
-
-    fn simd_ensure_scratch(&mut self, index: usize) {
-        if self.simd.r11 == R11::Scratch(index) {
-            return;
-        }
-        self.emit_ins(X86Instruction::load(
-            OperandSize::S64,
-            REGISTER_PTR_TO_VM,
-            REGISTER_SCRATCH,
-            X86IndirectAccess::Offset(
-                self.slot_in_vm(RuntimeEnvironmentSlot::SimdScratch) + 8 * index as i32,
-            ),
-        ));
-        self.simd.r11 = R11::Scratch(index);
     }
 
     fn slot_disp(slot: u8) -> i32 {
@@ -692,42 +684,65 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         [8, 9, 10, 11, 12, 13, 14, 0]
     }
 
-    /// Translates the operands which need runtime translation, host addresses end up in scratch
-    fn simd_emit_translation(&mut self, op: &VecInsn, operands: &[Operand]) -> [Option<usize>; 3] {
-        let mut scratch_index = [None; 3];
-        let mut requests = Vec::new();
-        for (i, operand) in operands.iter().enumerate() {
-            if !operand.needs_translation(op.memory_mode) {
-                continue;
-            }
-            let (reg, offset) = match operand {
-                Operand::Slot(slot, _) | Operand::Transpose(slot) => {
-                    (REGISTER_MAP[op.base_reg as usize], Self::slot_disp(*slot) as i64)
+    /// Compiles one vector instruction
+    pub(super) fn emit_simd_instruction(&mut self, insn: &ebpf::Insn) -> Result<(), EbpfError> {
+        let Some(op) = VecInsn::decode(insn) else {
+            return Err(EbpfError::UnsupportedInstruction);
+        };
+        self.emit_simd_op(&op)
+    }
+
+    /// Compiles one decoded vector operation (opcode or intrinsic call form)
+    fn emit_simd_op(&mut self, op: &VecInsn) -> Result<(), EbpfError> {
+        use crate::simd::*;
+        if self.offset_in_text_section + 4096 >= self.result.text_section().len() {
+            return Err(EbpfError::ExhaustedTextSegment(self.pc));
+        }
+        let op = *op;
+        self.simd.stats.vector_instructions += 1;
+        match op.subop {
+            VLOAD if self.emit_simd_static_load(&op) => {}
+            VLOAD | VSTORE => self.emit_simd_transfer(&op),
+            VTRANSPOSE8 | VPERMI2D => self.emit_simd_fixed(&op),
+            VPERMD if op.wide => self.emit_simd_fixed(&op),
+            VMOVMSK8 if op.wide => self.emit_simd_movmsk_wide(&op),
+            _ if op.wide => {
+                // Lane-wise on the two halves. All slots are even, so the low half's result never
+                // overwrites a source of the high half.
+                for h in 0..2u8 {
+                    let half = VecInsn { wide: false, vd: op.vd + h, va: op.va + h, vb: op.vb + h, ..op };
+                    self.emit_simd_cached(&half);
                 }
-                Operand::Scalar(_) => (REGISTER_MAP[op.src as usize], op.off as i64),
-            };
-            self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, offset));
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, reg, REGISTER_SCRATCH, None));
-            self.emit_ins(X86Instruction::store(
-                OperandSize::S64,
-                REGISTER_SCRATCH,
-                REGISTER_PTR_TO_VM,
-                X86IndirectAccess::Offset(
-                    self.slot_in_vm(RuntimeEnvironmentSlot::SimdScratch) + 8 * requests.len() as i32,
-                ),
-            ));
-            scratch_index[i] = Some(requests.len());
-            requests.push((operand.len(), operand.access_type()));
+            }
+            _ => self.emit_simd_cached(&op),
         }
-        if requests.is_empty() {
-            return scratch_index;
+        if !self.simd.cached {
+            // Strategy A: nothing stays in registers across vector instructions
+            self.simd_flush(true);
         }
+        if !self.simd.static_flow {
+            self.simd.r11 = R11::Unknown;
+        }
+        Ok(())
+    }
+
+    /// vload / vstore: one call which translates the guest range and copies all slots
+    fn emit_simd_transfer(&mut self, op: &VecInsn) {
+        // Host calls clobber all YMM registers, and vstore reads the vector file in memory
+        self.simd_flush(true);
+        let store = op.subop == simd::VSTORE;
+        let slot = if store { op.va } else { op.vd };
+        let spec = store as u64 | (slot as u64) << 8 | (op.transfer_slots() as u64) << 16;
+        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, op.off as i64));
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_MAP[op.src as usize], REGISTER_SCRATCH, None));
         self.simd.stats.translations += 1;
         self.emit_rust_call(
-            Value::Constant64(simd::jit_translate_operands as *const u8 as i64, false),
+            Value::Constant64(simd::jit_transfer as *const u8 as i64, false),
             &[
-                Argument { index: 3, value: Value::Constant64(simd::translation_spec(&requests) as i64, false) },
-                Argument { index: 2, value: Value::RegisterPlusConstant32(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::SimdScratch), false) },
+                // First, the other arguments may overwrite it
+                Argument { index: 3, value: Value::Register(REGISTER_SCRATCH) },
+                Argument { index: 4, value: Value::Constant64(spec as i64, false) },
+                Argument { index: 2, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::SimdVectorBase), false) },
                 Argument { index: 1, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping), false) },
                 Argument { index: 0, value: Value::RegisterPlusConstant32(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult), false) },
             ],
@@ -737,192 +752,152 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
         self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 6)));
         self.simd.r11 = R11::Unknown;
-        scratch_index
     }
 
-    /// Memory operand of operand `i` for the uncached lowering
-    fn simd_mem(&mut self, op: &VecInsn, operand: &Operand, scratch: Option<usize>, extra: i32) -> VexRm {
-        match scratch {
-            Some(index) => {
-                self.simd_ensure_scratch(index);
-                VexRm::Mem(REGISTER_SCRATCH, extra)
-            }
-            None => {
-                debug_assert!(!op.memory_mode);
-                self.simd_ensure_base();
-                let slot = match operand {
-                    Operand::Slot(slot, _) | Operand::Transpose(slot) => *slot,
-                    Operand::Scalar(_) => unreachable!(),
-                };
-                VexRm::Mem(REGISTER_SCRATCH, Self::slot_disp(slot) + extra)
-            }
-        }
+    /// Makes `slot` resident in `reg` (dirty), after a flush emptied the cache
+    fn simd_assign(&mut self, slot: u8, reg: u8) {
+        self.simd.slots[slot as usize] = SlotState { reg: Some(reg), dirty: true, evicted: false };
+        self.simd.regs[reg as usize] = Some(slot);
+        self.simd_touch(reg);
     }
 
-    fn simd_load(&mut self, dst: u8, mem: VexRm) {
-        let VexRm::Mem(base, disp) = mem else { unreachable!() };
-        self.emit_vex(V::load(dst, base, disp));
-    }
-
-    fn simd_store(&mut self, src: u8, mem: VexRm) {
-        let VexRm::Mem(base, disp) = mem else { unreachable!() };
-        self.emit_vex(V::store(src, base, disp));
-    }
-
-    /// Compiles one vector instruction
-    pub(super) fn emit_simd_instruction(&mut self, insn: &ebpf::Insn) -> Result<(), EbpfError> {
-        if self.offset_in_text_section + 4096 >= self.result.text_section().len() {
-            return Err(EbpfError::ExhaustedTextSegment(self.pc));
-        }
-        let Some(op) = VecInsn::decode(insn) else {
-            return Err(EbpfError::UnsupportedInstruction);
-        };
-        self.emit_simd_op(&op)
-    }
-
-    /// Compiles one decoded vector operation (opcode or intrinsic call form)
-    fn emit_simd_op(&mut self, op: &VecInsn) -> Result<(), EbpfError> {
-        if self.offset_in_text_section + 4096 >= self.result.text_section().len() {
-            return Err(EbpfError::ExhaustedTextSegment(self.pc));
-        }
-        let op = *op;
-        self.simd.stats.vector_instructions += 1;
-        let (operands, count) = op.operands();
-        let operands = &operands[..count];
-        let needs_translation = operands.iter().any(|o| o.needs_translation(op.memory_mode));
-        if self.simd.cached && !needs_translation && op.subop != simd::VLOAD && op.subop != simd::VSTORE {
-            self.emit_simd_cached(&op);
-        } else {
-            if self.simd.cached {
-                // Host calls clobber all YMM registers and the operands may alias the vector region
-                self.simd_flush(true);
-            }
-            let scratch = self.simd_emit_translation(&op, operands);
-            self.emit_simd_direct(&op, operands, scratch);
-        }
-        if !self.simd.static_flow {
-            self.simd.r11 = R11::Unknown;
-        }
-        Ok(())
-    }
-
-    /// Strategy A: every operand comes from memory and the result goes back to memory
-    fn emit_simd_direct(&mut self, op: &VecInsn, operands: &[Operand], scratch: [Option<usize>; 3]) {
+    /// Operations on fixed registers (cross half permutations, transpose): flush, load every source
+    /// into ymm0.., compute, leave the results resident and dirty
+    fn emit_simd_fixed(&mut self, op: &VecInsn) {
         use crate::simd::*;
-        match op.subop {
-            VTRANSPOSE8 => {
+        self.simd_flush(true);
+        self.simd_ensure_base();
+        let load = |jit: &mut Self, reg: u8, slot: u8| jit.emit_vex(V::load(reg, REGISTER_SCRATCH, Self::slot_disp(slot)));
+        match (op.subop, op.wide) {
+            (VTRANSPOSE8, _) => {
                 for row in 0..8u8 {
-                    let mem = self.simd_mem(op, &operands[0], scratch[0], Self::slot_disp(row));
-                    self.simd_load(row, mem);
+                    load(self, row, op.vd + row);
                 }
                 let out = self.simd_emit_transpose_regs();
                 for (row, reg) in out.iter().enumerate() {
-                    let mem = self.simd_mem(op, &operands[0], scratch[0], Self::slot_disp(row as u8));
-                    self.simd_store(*reg, mem);
+                    self.simd_assign(op.vd + row as u8, *reg);
                 }
             }
-            VBCAST32 => {
-                self.emit_vex(V::movd_from_gpr(0, REGISTER_MAP[op.src as usize]));
-                self.emit_vex(V::pbroadcastd(0, 0));
-                let mem = self.simd_mem(op, &operands[0], scratch[0], 0);
-                self.simd_store(0, mem);
+            (VPERMD, true) => {
+                // out_h = idx_h bit 3 ? a_hi[idx_h & 7] : a_lo[idx_h & 7]
+                for (reg, slot) in [(0, op.va), (1, op.va + 1), (2, op.vb), (3, op.vb + 1)] {
+                    load(self, reg, slot);
+                }
+                for h in 0..2u8 {
+                    let idx = 2 + h;
+                    self.emit_vex(V::permd(4, idx, VexRm::Reg(0)));
+                    self.emit_vex(V::permd(5, idx, VexRm::Reg(1)));
+                    self.emit_vex(V::pslld(6, idx, 28));
+                    self.emit_vex(V::blendvps(7 + h, 4, 5, 6));
+                }
+                self.simd_assign(op.vd, 7);
+                self.simd_assign(op.vd + 1, 8);
             }
-            VADD32 | VXOR | VAND | VOR | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN | VADD16 | VSUB16
-            | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDW => {
-                let a = self.simd_mem(op, &operands[0], scratch[0], 0);
-                self.simd_load(0, a);
-                let b = self.simd_mem(op, &operands[1], scratch[1], 0);
-                self.emit_vex(Self::simd_binary(op.subop, 0, 0, b, op.off as u8));
-                let d = self.simd_mem(op, &operands[2], scratch[2], 0);
-                self.simd_store(0, d);
-            }
-            VROLV32 => {
-                let a = self.simd_mem(op, &operands[0], scratch[0], 0);
-                self.simd_load(0, a);
-                let b = self.simd_mem(op, &operands[1], scratch[1], 0);
-                self.simd_load(1, b);
-                self.simd_emit_rolv(0, 0, VexRm::Reg(1));
-                let d = self.simd_mem(op, &operands[2], scratch[2], 0);
-                self.simd_store(0, d);
-            }
-            VTERNLOG => {
-                let a = self.simd_mem(op, &operands[0], scratch[0], 0);
-                self.simd_load(1, a);
-                let b = self.simd_mem(op, &operands[1], scratch[1], 0);
-                self.simd_load(2, b);
-                let d = self.simd_mem(op, &operands[2], scratch[2], 0);
-                self.simd_load(0, d);
-                // Same aliasing as the slots, so that the folding matches
-                let ra = if op.va == op.vd { 0 } else { 1 };
-                let rb = if op.vb == op.vd { 0 } else if op.vb == op.va { ra } else { 2 };
-                self.simd_emit_ternlog(0, ra, rb, op.off as u8);
-                let d = self.simd_mem(op, &operands[2], scratch[2], 0);
-                self.simd_store(0, d);
-            }
-            VPERMD => {
-                let b = self.simd_mem(op, &operands[1], scratch[1], 0);
-                self.simd_load(1, b);
-                let a = self.simd_mem(op, &operands[0], scratch[0], 0);
-                self.emit_vex(V::permd(0, 1, a));
-                let d = self.simd_mem(op, &operands[2], scratch[2], 0);
-                self.simd_store(0, d);
-            }
-            VSHUFD => {
-                let a = self.simd_mem(op, &operands[0], scratch[0], 0);
-                self.emit_vex(V::pshufd(0, a, op.off as u8));
-                let d = self.simd_mem(op, &operands[1], scratch[1], 0);
-                self.simd_store(0, d);
-            }
-            VSRL32 | VSLL32 => {
-                let a = self.simd_mem(op, &operands[0], scratch[0], 0);
-                self.simd_load(0, a);
-                self.emit_vex(if op.subop == VSRL32 { V::psrld(0, 0, op.off as u8) } else { V::pslld(0, 0, op.off as u8) });
-                let d = self.simd_mem(op, &operands[1], scratch[1], 0);
-                self.simd_store(0, d);
-            }
-            VROR32 => {
-                let a = self.simd_mem(op, &operands[0], scratch[0], 0);
-                self.simd_load(0, a);
-                self.simd_emit_rotate(0, 0, op.off as u8);
-                let d = self.simd_mem(op, &operands[1], scratch[1], 0);
-                self.simd_store(0, d);
+            (VPERMI2D, false) => {
+                // out = idx bit 3 ? b[idx & 7] : a[idx & 7]
+                for (reg, slot) in [(0, op.va), (1, op.vb), (2, op.vd)] {
+                    load(self, reg, slot);
+                }
+                self.emit_vex(V::permd(4, 2, VexRm::Reg(0)));
+                self.emit_vex(V::permd(5, 2, VexRm::Reg(1)));
+                self.emit_vex(V::pslld(6, 2, 28));
+                self.emit_vex(V::blendvps(7, 4, 5, 6));
+                self.simd_assign(op.vd, 7);
             }
             _ => {
-                // VLOAD, VSTORE, VMOV
-                let a = self.simd_mem(op, &operands[0], scratch[0], 0);
-                self.simd_load(0, a);
-                let d = self.simd_mem(op, &operands[1], scratch[1], 0);
-                self.simd_store(0, d);
+                // VPERMI2D, 512 bit: bit 3 of the index picks the half, bit 4 the table
+                for (reg, slot) in [(0, op.va), (1, op.va + 1), (2, op.vb), (3, op.vb + 1), (4, op.vd), (5, op.vd + 1)] {
+                    load(self, reg, slot);
+                }
+                for h in 0..2u8 {
+                    let idx = 4 + h;
+                    self.emit_vex(V::pslld(8, idx, 28));
+                    self.emit_vex(V::permd(6, idx, VexRm::Reg(0)));
+                    self.emit_vex(V::permd(7, idx, VexRm::Reg(1)));
+                    self.emit_vex(V::blendvps(6, 6, 7, 8));
+                    self.emit_vex(V::permd(7, idx, VexRm::Reg(2)));
+                    self.emit_vex(V::permd(9, idx, VexRm::Reg(3)));
+                    self.emit_vex(V::blendvps(7, 7, 9, 8));
+                    self.emit_vex(V::pslld(8, idx, 27));
+                    self.emit_vex(V::blendvps(10 + h, 6, 7, 8));
+                }
+                self.simd_assign(op.vd, 10);
+                self.simd_assign(op.vd + 1, 11);
             }
         }
     }
 
-    /// Strategy B: slots of the dedicated region are cached in YMM registers
+    /// Register holding `slot` for a read, ymm15 loaded from memory if it isn't cached
+    fn simd_read_reg(&mut self, slot: u8) -> u8 {
+        if let Some(reg) = self.simd.slots[slot as usize].reg {
+            self.simd.stats.cache_hits += 1;
+            self.simd_touch(reg);
+            return reg;
+        }
+        self.simd_ensure_base();
+        self.emit_vex(V::load(SCRATCH_YMM, REGISTER_SCRATCH, Self::slot_disp(slot)));
+        SCRATCH_YMM
+    }
+
+    /// vmovmsk8, 512 bit: the masks of both halves combined in one 64 bit register
+    fn emit_simd_movmsk_wide(&mut self, op: &VecInsn) {
+        let dst = REGISTER_MAP[op.dst as usize];
+        let lo = self.simd_read_reg(op.va);
+        self.emit_vex(V::pmovmskb(dst, lo));
+        let hi = self.simd_read_reg(op.va + 1);
+        self.emit_vex(V::pmovmskb(REGISTER_SCRATCH, hi));
+        self.simd.r11 = R11::Unknown;
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, REGISTER_SCRATCH, 32, None));
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, REGISTER_SCRATCH, dst, None));
+    }
+
+    /// Strategy B: slots of the vector file are cached in YMM registers (strategy A flushes after
+    /// every instruction)
     fn emit_simd_cached(&mut self, op: &VecInsn) {
         use crate::simd::*;
-        // Every slot mode instruction validates the vector base, like the interpreter
+        // Every vector instruction validates the vector base, like the interpreter
         self.simd_ensure_base();
         self.simd.pinned = [false; CACHE_REGS];
         match op.subop {
-            VTRANSPOSE8 => {
-                self.simd_flush(true);
-                self.simd_ensure_base();
-                for row in 0..8u8 {
-                    self.emit_vex(V::load(row, REGISTER_SCRATCH, Self::slot_disp(op.vd + row)));
-                }
-                let out = self.simd_emit_transpose_regs();
-                // Keep the results resident (dirty) instead of storing them right away
-                for (row, reg) in out.iter().enumerate() {
-                    let slot = op.vd + row as u8;
-                    self.simd.slots[slot as usize] = SlotState { reg: Some(*reg), dirty: true, evicted: false };
-                    self.simd.regs[*reg as usize] = Some(slot);
-                    self.simd_touch(*reg);
-                }
-            }
             VBCAST32 => {
                 self.emit_vex(V::movd_from_gpr(SCRATCH_YMM, REGISTER_MAP[op.src as usize]));
                 let rd = self.simd_destination(op.vd);
                 self.emit_vex(V::pbroadcastd(rd, SCRATCH_YMM));
+            }
+            VBCAST64 => {
+                self.emit_vex(V::movq_from_gpr(SCRATCH_YMM, REGISTER_MAP[op.src as usize]));
+                let rd = self.simd_destination(op.vd);
+                self.emit_vex(V::pbroadcastq(rd, SCRATCH_YMM));
+            }
+            VINS64 => {
+                let rd = self.simd_ensure_reg(op.vd);
+                self.simd_pin(rd);
+                self.emit_vex(V::movq_from_gpr(SCRATCH_YMM, REGISTER_MAP[op.src as usize]));
+                self.emit_vex(V::pbroadcastq(SCRATCH_YMM, SCRATCH_YMM));
+                let rd = self.simd_destination(op.vd);
+                self.emit_vex(V::pblendd(rd, rd, VexRm::Reg(SCRATCH_YMM), 3 << (2 * op.off)));
+            }
+            VEXT64 => {
+                let dst = REGISTER_MAP[op.dst as usize];
+                if let Some(reg) = self.simd.slots[op.va as usize].reg {
+                    self.simd.stats.cache_hits += 1;
+                    self.simd_touch(reg);
+                    let lane = op.off as u8;
+                    let src = if lane >= 2 {
+                        self.emit_vex(V::extracti128(SCRATCH_YMM, reg, 1));
+                        SCRATCH_YMM
+                    } else {
+                        reg
+                    };
+                    self.emit_vex(if lane & 1 == 0 { V::movq_to_gpr(dst, src) } else { V::pextrq(dst, src, 1) });
+                } else {
+                    let disp = Self::slot_disp(op.va) + 8 * op.off as i32;
+                    self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_SCRATCH, dst, X86IndirectAccess::Offset(disp)));
+                }
+            }
+            VMOVMSK8 => {
+                let ra = self.simd_read_reg(op.va);
+                self.emit_vex(V::pmovmskb(REGISTER_MAP[op.dst as usize], ra));
             }
             VADD32 | VXOR | VAND | VOR | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN | VADD16 | VSUB16
             | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDW => {

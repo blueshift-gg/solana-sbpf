@@ -192,7 +192,6 @@ impl Runner {
             MemoryRegion::new(&raw mut *runner.stack.as_slice_mut(), ebpf::MM_STACK_START),
             MemoryRegion::new(&raw mut *runner.heap.as_slice_mut(), ebpf::MM_HEAP_START),
             MemoryRegion::new(&raw mut *runner.input.as_slice_mut(), ebpf::MM_INPUT_START),
-            runner.vector.region(),
         ];
         runner.context.mapping = unsafe {
             MemoryMapping::new(
@@ -236,7 +235,7 @@ impl Runner {
         vm.execute_program(&self.executable, &mut mode, &mut self.call_frames)
     }
 
-    /// Runs without attaching the vector memory
+    /// Runs without attaching [Self::vector], the VM allocates its own vector file
     pub fn run_detached(&mut self, engine: Engine) -> (u64, ProgramResult) {
         self.context.remaining = self.budget;
         let stack_len = self.stack.len();

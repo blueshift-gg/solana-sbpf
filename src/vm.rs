@@ -299,9 +299,6 @@ pub enum RuntimeEnvironmentSlot {
     /// [EbpfVm::simd_vector_base]
     #[cfg(feature = "simd-experiment")]
     SimdVectorBase = offset_of!(EbpfVm<DummyContextObject>, simd_vector_base) as isize,
-    /// [EbpfVm::simd_scratch]
-    #[cfg(feature = "simd-experiment")]
-    SimdScratch = offset_of!(EbpfVm<DummyContextObject>, simd_scratch) as isize,
 }
 
 /// A virtual machine to run eBPF programs.
@@ -390,12 +387,13 @@ pub struct EbpfVm<'a, C: ContextObject> {
     pub loader: Arc<BuiltinProgram<C>>,
     /// Collector for the instruction trace
     pub register_trace: Vec<RegisterTraceEntry>,
-    /// Host address of the experimental vector region (null if not attached)
+    /// Host address of the experimental vector file (null until a program with vector
+    /// instructions runs, or one is attached)
     #[cfg(feature = "simd-experiment")]
     pub simd_vector_base: *mut u8,
-    /// Operand translation scratch space of the experimental vector instructions in the JIT
+    /// Vector file allocated by the VM (if none was attached)
     #[cfg(feature = "simd-experiment")]
-    pub simd_scratch: [u64; 4],
+    simd_vector_memory: Option<crate::simd::VectorMemory>,
     /// TCP port for the debugger interface
     #[cfg(feature = "debugger")]
     pub debug_port: Option<u16>,
@@ -445,17 +443,18 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
             #[cfg(feature = "simd-experiment")]
             simd_vector_base: std::ptr::null_mut(),
             #[cfg(feature = "simd-experiment")]
-            simd_scratch: [0; 4],
+            simd_vector_memory: None,
         }
     }
 
-    /// Attaches the host memory of the experimental vector region.
+    /// Attaches host memory for the experimental vector file, instead of the one the VM would
+    /// allocate itself (e.g. to inspect the slots after a run). The vector file is private VM
+    /// state, it is never mapped into the guest address space.
     ///
     /// # Safety
     ///
     /// `vector_memory` must point to [ebpf::VECTOR_MEMORY_SIZE] writable bytes which stay valid as
-    /// long as this VM executes programs, and it must be the same buffer which is mapped at
-    /// [ebpf::MM_VECTOR_START] in the memory mapping.
+    /// long as this VM executes programs.
     #[cfg(feature = "simd-experiment")]
     pub unsafe fn set_vector_memory(&mut self, vector_memory: *mut u8) {
         self.simd_vector_base = vector_memory;
@@ -485,8 +484,18 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         self.due_insn_count = 0;
         self.program_result = ProgramResult::Ok(0);
         #[cfg(feature = "simd-experiment")]
+        if self.simd_vector_base.is_null()
+            && config.enable_simd_experiment
+            && executable.simd_analysis().vector_instructions > 0
+        {
+            self.simd_vector_base = self
+                .simd_vector_memory
+                .get_or_insert_with(crate::simd::VectorMemory::new)
+                .host_ptr();
+        }
+        #[cfg(feature = "simd-experiment")]
         if !self.simd_vector_base.is_null() {
-            // The vector region is zero initialized for every invocation
+            // The vector file is zero initialized for every invocation
             unsafe { std::ptr::write_bytes(self.simd_vector_base, 0, ebpf::VECTOR_MEMORY_SIZE) };
         }
 
@@ -697,7 +706,5 @@ mod tests {
         check_slot!(env, register_trace, RegisterTrace);
         #[cfg(feature = "simd-experiment")]
         check_slot!(env, simd_vector_base, SimdVectorBase);
-        #[cfg(feature = "simd-experiment")]
-        check_slot!(env, simd_scratch, SimdScratch);
     }
 }

@@ -7,22 +7,26 @@
 //!
 //! ```text
 //! opc = 0xe7 (VOP)
-//! dst = vector file base register (memory mode only, must be 0 in slot mode)
-//! src = scalar register (address for vload/vstore, value for vbcast32)
-//! off = memory offset (vload/vstore) or 8 bit immediate (vror32x8, vshufd, vblendd)
+//! dst = scalar destination register (vext64, vmovmsk8), otherwise 0
+//! src = scalar source register (address of vload/vstore, value of vbcast / vins64)
+//! off = memory offset (vload/vstore), 8 bit immediate (vror32x8, vshufd, vblendd, ...) or lane
+//!       (vins64, vext64)
 //! imm = bits  0.. 5  vd   destination slot
 //!       bits  6..11  va   first source slot
-//!       bits 12..17  vb   second source slot
+//!       bits 12..17  vb   second source slot (slot count - 1 of vload/vstore)
 //!       bits 18..23  sub-operation
-//!       bit  24      memory mode
+//!       bit  24      512 bit operation on slot pairs
 //!       bits 25..31  reserved, must be zero
 //! ```
 //!
-//! In *slot mode* the slot `vN` is the 32 byte vector at `MM_VECTOR_START + 32 * N` (the dedicated
-//! vector region). In *memory mode* the slot `vN` is the 32 byte vector at `r[dst] + 32 * N` in
-//! ordinary VM memory, which has to be translated and bounds checked on every access. The two modes
-//! run the exact same programs and only differ in where the vector file lives, which allows to
-//! measure whether the dedicated region is worth it.
+//! The vector file (256 slots of 32 bytes) is private state of the VM, like the scalar registers.
+//! It is not mapped into the guest address space: data enters and leaves it only through
+//! `vload`/`vstore` (up to 32 consecutive slots from / to guest memory with one translation), the
+//! 64 bit lane moves `vins64`/`vext64`, the broadcasts and `vmovmsk8`.
+//!
+//! 512 bit operations work on the slot pairs `(v2k, v2k + 1)` (low half in the even slot). All
+//! of their slot operands must be even. They are defined lane by lane on the two halves, except
+//! for the cross lane `vpermd` / `vpermi2d` (which index all 16 lanes) and `vmovmsk8` (64 bit mask).
 
 #![allow(clippy::arithmetic_side_effects)]
 
@@ -37,9 +41,9 @@ use crate::{
     memory_region::{AccessType, MemoryMapping},
 };
 
-/// `v[vd] = load256(r[src] + off)`
+/// `v[vd + i] = load256(r[src] + off + 32 i)` for the `vb + 1` slots `i` (at most 32)
 pub const VLOAD: u8 = 0x00;
-/// `store256(r[src] + off, v[va])`
+/// `store256(r[src] + off + 32 i, v[va + i])` for the `vb + 1` slots `i` (at most 32)
 pub const VSTORE: u8 = 0x01;
 /// `v[vd] = v[va] + v[vb]` (eight wrapping u32 additions)
 pub const VADD32: u8 = 0x02;
@@ -101,11 +105,24 @@ pub const VMADD16: u8 = 0x1c;
 /// `v[vd][i] = if (off >> (i % 8)) & 1 != 0 { v[vb][i] } else { v[va][i] }` for the sixteen u16
 /// lanes (vpblendw)
 pub const VBLENDW: u8 = 0x1d;
+/// `v[vd].u64[off] = r[src]` (64 bit lane `off` in 0..4)
+pub const VINS64: u8 = 0x1e;
+/// `r[dst] = v[va].u64[off]` (64 bit lane `off` in 0..4)
+pub const VEXT64: u8 = 0x1f;
+/// `v[vd] = [r[src]; 4]` (u64 lanes)
+pub const VBCAST64: u8 = 0x20;
+/// `r[dst] = sign bits of the 32 bytes of v[va]` (vpmovmskb, 64 bytes for the 512 bit form)
+pub const VMOVMSK8: u8 = 0x21;
+/// `v[vd][i] = (v[va] ++ v[vb])[v[vd][i] & (2 L - 1)]` for `L` u32 lanes per operand: two table
+/// permutation, the index operand is overwritten (vpermi2d)
+pub const VPERMI2D: u8 = 0x22;
 /// Number of defined sub-operations
-pub const SUBOP_COUNT: u8 = 0x1e;
+pub const SUBOP_COUNT: u8 = 0x23;
 
-/// Memory mode flag in the immediate
-pub const MEMORY_MODE: u32 = 1 << 24;
+/// 512 bit flag in the immediate
+pub const WIDE: u32 = 1 << 24;
+/// Maximal slot count of one vload / vstore
+pub const MAX_TRANSFER_SLOTS: usize = 32;
 
 /// The eight u32 lanes of a 256 bit vector, little-endian in memory
 pub type Lanes = [u32; 8];
@@ -119,34 +136,62 @@ pub struct VecInsn {
     pub vd: u8,
     /// First source slot
     pub va: u8,
-    /// Second source slot
+    /// Second source slot, slot count - 1 of vload / vstore
     pub vb: u8,
-    /// Vector file lives in ordinary memory at `r[base_reg]`
-    pub memory_mode: bool,
-    /// Vector file base register (memory mode)
-    pub base_reg: u8,
-    /// Scalar register operand
+    /// 512 bit operation on slot pairs
+    pub wide: bool,
+    /// Scalar destination register (vext64, vmovmsk8)
+    pub dst: u8,
+    /// Scalar source register
     pub src: u8,
-    /// Offset or immediate
+    /// Offset, immediate or lane
     pub off: i16,
+}
+
+/// Sub-operations which have a 512 bit form
+pub fn has_wide_form(subop: u8) -> bool {
+    !matches!(subop, VLOAD | VSTORE | VTRANSPOSE8 | VINS64 | VEXT64) && subop < SUBOP_COUNT
+}
+
+/// Sub-operations which read the scalar source register
+pub fn uses_src(subop: u8) -> bool {
+    matches!(subop, VLOAD | VSTORE | VBCAST32 | VBCAST64 | VINS64)
+}
+
+/// Sub-operations which write the scalar destination register
+pub fn writes_dst(subop: u8) -> bool {
+    matches!(subop, VEXT64 | VMOVMSK8)
 }
 
 /// Operand validation shared by the opcode form and the intrinsic call form
 pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
-    if op.subop >= SUBOP_COUNT || op.src > 10 {
+    if op.subop >= SUBOP_COUNT || op.src > 10 || op.dst > 9 {
         return None;
     }
-    let uses_src = matches!(op.subop, VLOAD | VSTORE | VBCAST32);
-    if !uses_src && op.src != 0 {
+    if (!uses_src(op.subop) && op.src != 0) || (!writes_dst(op.subop) && op.dst != 0) {
         return None;
     }
     let off_ok = match op.subop {
         VLOAD | VSTORE => true,
         VROR32 | VSRL32 | VSLL32 => (0..32).contains(&op.off),
         VSHUFD | VBLENDD | VTERNLOG | VBLENDW => (0..256).contains(&op.off),
+        VINS64 | VEXT64 => (0..4).contains(&op.off),
         _ => op.off == 0,
     };
-    if !off_ok || (op.subop == VTRANSPOSE8 && op.vd as usize > ebpf::VECTOR_SLOTS - 8) {
+    if !off_ok {
+        return None;
+    }
+    match op.subop {
+        VTRANSPOSE8 if op.vd as usize > ebpf::VECTOR_SLOTS - 8 => return None,
+        VLOAD | VSTORE => {
+            let first = if op.subop == VLOAD { op.vd } else { op.va } as usize;
+            if op.vb as usize >= MAX_TRANSFER_SLOTS || first + op.vb as usize >= ebpf::VECTOR_SLOTS {
+                return None;
+            }
+        }
+        _ => {}
+    }
+    if op.wide && (!has_wide_form(op.subop) || (op.vd | op.va | op.vb) & 1 != 0) {
         return None;
     }
     Some(())
@@ -167,14 +212,11 @@ impl VecInsn {
             va: ((imm >> 6) & 63) as u8,
             vb: ((imm >> 12) & 63) as u8,
             subop: ((imm >> 18) & 63) as u8,
-            memory_mode: imm & MEMORY_MODE != 0,
-            base_reg: insn.dst,
+            wide: imm & WIDE != 0,
+            dst: insn.dst,
             src: insn.src,
             off: insn.off,
         };
-        if insn.dst > 10 || (!op.memory_mode && insn.dst != 0) {
-            return None;
-        }
         validate_slot_op(&op)?;
         Some(op)
     }
@@ -185,176 +227,72 @@ impl VecInsn {
             | ((self.va as u32 & 63) << 6)
             | ((self.vb as u32 & 63) << 12)
             | ((self.subop as u32 & 63) << 18)
-            | if self.memory_mode { MEMORY_MODE } else { 0 };
+            | if self.wide { WIDE } else { 0 };
         ebpf::Insn {
             ptr: 0,
             opc: ebpf::VOP,
-            dst: self.base_reg,
+            dst: self.dst,
             src: self.src,
             off: self.off,
             imm: imm as i32 as i64,
         }
     }
 
-    /// The vector operands this instruction touches in the order in which they are translated.
-    ///
-    /// The interpreter and the JIT translate in this exact order, so that the reported error of an
-    /// instruction with multiple invalid operands is identical.
-    pub fn operands(&self) -> ([Operand; 3], usize) {
-        use Operand::*;
-        let none = Slot(0, AccessType::Load);
-        match self.subop {
-            VLOAD => ([Scalar(AccessType::Load), Slot(self.vd, AccessType::Store), none], 2),
-            VSTORE => ([Slot(self.va, AccessType::Load), Scalar(AccessType::Store), none], 2),
-            VADD32 | VXOR | VAND | VOR | VPERMD | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN
-            | VROLV32 | VTERNLOG | VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDW => (
-                [
-                    Slot(self.va, AccessType::Load),
-                    Slot(self.vb, AccessType::Load),
-                    Slot(self.vd, AccessType::Store),
-                ],
-                3,
-            ),
-            VROR32 | VSHUFD | VMOV | VSRL32 | VSLL32 => (
-                [
-                    Slot(self.va, AccessType::Load),
-                    Slot(self.vd, AccessType::Store),
-                    none,
-                ],
-                2,
-            ),
-            VTRANSPOSE8 => ([Transpose(self.vd), none, none], 1),
-            VBCAST32 => ([Slot(self.vd, AccessType::Store), none, none], 1),
-            _ => unreachable!(),
-        }
+    /// Slot count of vload / vstore
+    pub fn transfer_slots(&self) -> usize {
+        self.vb as usize + 1
+    }
+
+    /// Number of 256 bit halves of every vector operand (1, or 2 for the 512 bit form)
+    pub fn halves(&self) -> usize {
+        1 + self.wide as usize
     }
 }
 
-/// A memory operand of a vector instruction
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Operand {
-    /// Slot of the vector file (32 bytes)
-    Slot(u8, AccessType),
-    /// Eight consecutive slots (256 bytes), read and written
-    Transpose(u8),
-    /// `r[src] + off` (32 bytes)
-    Scalar(AccessType),
-}
-
-impl Operand {
-    /// Number of bytes accessed
-    pub fn len(&self) -> u64 {
-        match self {
-            Operand::Transpose(_) => 8 * ebpf::VECTOR_WIDTH as u64,
-            _ => ebpf::VECTOR_WIDTH as u64,
-        }
-    }
-
-    /// Always false
-    pub fn is_empty(&self) -> bool {
-        false
-    }
-
-    /// Access type of the translation
-    pub fn access_type(&self) -> AccessType {
-        match self {
-            Operand::Slot(_, access_type) | Operand::Scalar(access_type) => *access_type,
-            Operand::Transpose(_) => AccessType::Store,
-        }
-    }
-
-    /// Whether the operand must be translated (and bounds checked) at runtime
-    pub fn needs_translation(&self, memory_mode: bool) -> bool {
-        memory_mode || matches!(self, Operand::Scalar(_))
-    }
-
-    /// VM address of the operand
-    pub fn vm_addr(&self, op: &VecInsn, reg: &[u64]) -> u64 {
-        match self {
-            Operand::Slot(slot, _) | Operand::Transpose(slot) => {
-                let base = if op.memory_mode {
-                    reg[op.base_reg as usize]
-                } else {
-                    ebpf::MM_VECTOR_START
-                };
-                base.wrapping_add(*slot as u64 * ebpf::VECTOR_WIDTH as u64)
-            }
-            Operand::Scalar(_) => reg[op.src as usize].wrapping_add(op.off as i64 as u64),
-        }
-    }
-}
-
-/// Packs the translation request of up to three operands into one u64:
-/// `len` in bits `16 * i .. 16 * i + 15` and the store flag in bit `16 * i + 15`.
-pub fn translation_spec(requests: &[(u64, AccessType)]) -> u64 {
-    let mut spec = 0u64;
-    for (i, (len, access_type)) in requests.iter().enumerate() {
-        debug_assert!(*len < 0x8000);
-        let store = (*access_type == AccessType::Store) as u64;
-        spec |= (len | (store << 15)) << (16 * i);
-    }
-    spec
-}
-
-/// Translates up to three vector operands, used by both the interpreter and the JIT.
-///
-/// `scratch[i]` holds the VM address on input and the host address on output. Translation happens
-/// in two passes: The first pass may invoke the access violation handler which can replace regions
-/// and thus invalidate host addresses translated before. The second pass only looks up the now
-/// resident regions, so all returned host addresses are valid at the same time.
-pub fn translate_operands(
+/// Copies `slots` vectors between guest memory at `vm_addr` and the vector file starting at
+/// `slot` (vload if `!store`), with one translation of the whole guest range
+pub fn transfer(
+    store: bool,
+    slot: u8,
+    slots: usize,
+    vm_addr: u64,
+    vector_base: *mut u8,
     mapping: &mut MemoryMapping,
-    scratch: &mut [u64; 4],
-    spec: u64,
 ) -> Result<(), EbpfError> {
-    for pass in 0..2 {
-        for (i, slot) in scratch.iter_mut().enumerate().take(3) {
-            let request = (spec >> (16 * i)) & 0xffff;
-            if request == 0 {
-                break;
-            }
-            let len = request & 0x7fff;
-            let access_type = if request & 0x8000 != 0 {
-                AccessType::Store
-            } else {
-                AccessType::Load
-            };
-            let vm_addr = if pass == 0 { *slot } else { scratch_vm_addr(slot) };
-            let result = if pass == 0 {
-                mapping.map_with_access_violation_handler(access_type, vm_addr, len)
-            } else {
-                mapping.map(access_type, vm_addr, len)
-            };
-            match result {
-                StableResult::Ok(host) => {
-                    if pass == 0 {
-                        // Keep the VM address around for the second pass
-                        *slot = vm_addr;
-                    } else {
-                        *slot = host.ptr().cast::<u8>() as usize as u64;
-                    }
-                }
-                StableResult::Err(err) => return Err(err),
-            }
+    let len = slots * ebpf::VECTOR_WIDTH;
+    let access_type = if store { AccessType::Store } else { AccessType::Load };
+    let host = match mapping.map_with_access_violation_handler(access_type, vm_addr, len as u64) {
+        StableResult::Ok(host) => host.ptr().cast::<u8>() as usize as *mut u8,
+        StableResult::Err(err) => return Err(err),
+    };
+    if vector_base.is_null() {
+        return Err(EbpfError::UnsupportedInstruction);
+    }
+    let vector = unsafe { vector_base.add(slot as usize * ebpf::VECTOR_WIDTH) };
+    unsafe {
+        if store {
+            std::ptr::copy_nonoverlapping(vector, host, len);
+        } else {
+            std::ptr::copy_nonoverlapping(host, vector, len);
         }
     }
     Ok(())
 }
 
-#[inline(always)]
-fn scratch_vm_addr(slot: &u64) -> u64 {
-    *slot
-}
-
-/// Entry point of the JIT for [translate_operands]
-pub(crate) extern "C" fn jit_translate_operands(
+/// Entry point of the JIT for [transfer]: `spec` = `store | slot << 8 | slots << 16`
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_transfer(
     result: *mut ProgramResult,
     mapping: *mut MemoryMapping,
-    scratch: *mut [u64; 4],
+    vector_base: *mut u8,
+    vm_addr: u64,
     spec: u64,
 ) {
+    let store = spec & 1 != 0;
+    let slot = (spec >> 8) as u8;
+    let slots = (spec >> 16) as usize;
     unsafe {
-        if let Err(err) = translate_operands(&mut *mapping, &mut *scratch, spec) {
+        if let Err(err) = transfer(store, slot, slots, vm_addr, vector_base, &mut *mapping) {
             *result = ProgramResult::Err(err);
         }
     }
@@ -437,7 +375,7 @@ pub fn compute(op: &VecInsn, a: &Lanes, b: &Lanes) -> Lanes {
             let p = |i: usize| a[i] as i16 as i32 * b[i] as i16 as i32;
             (0..8).for_each(|i| out[i] = p(2 * i).wrapping_add(p(2 * i + 1)) as u32);
         }
-        VMOV | VLOAD | VSTORE => {}
+        VMOV => {}
         _ => unreachable!(),
     }
     out
@@ -472,81 +410,93 @@ pub fn transpose8(rows: &mut [Lanes; 8]) {
     }
 }
 
-/// Executes one vector instruction in the interpreter
+/// Lane-wise result of a two (three for vternlog) operand sub-operation on one 256 bit half
+fn compute_half(op: &VecInsn, a: &Lanes, b: &Lanes, d: &Lanes) -> Lanes {
+    if op.subop == VTERNLOG {
+        std::array::from_fn(|i| ternlog(d[i], a[i], b[i], op.off as u8))
+    } else {
+        compute(op, a, b)
+    }
+}
+
+/// Executes one vector instruction in the interpreter, returns the scalar result (vext64,
+/// vmovmsk8, 0 otherwise)
 pub fn interpret(
     op: &VecInsn,
     reg: &[u64],
     vector_base: *mut u8,
     mapping: &mut MemoryMapping,
-) -> Result<(), EbpfError> {
-    let (operands, count) = op.operands();
-    let operands = &operands[..count];
-    let mut scratch = [0u64; 4];
-    let mut requests = [(0u64, AccessType::Load); 3];
-    let mut translated = 0;
-    for operand in operands {
-        if operand.needs_translation(op.memory_mode) {
-            scratch[translated] = operand.vm_addr(op, reg);
-            requests[translated] = (operand.len(), operand.access_type());
-            translated += 1;
-        }
+) -> Result<u64, EbpfError> {
+    if matches!(op.subop, VLOAD | VSTORE) {
+        let vm_addr = reg[op.src as usize].wrapping_add(op.off as i64 as u64);
+        let slot = if op.subop == VLOAD { op.vd } else { op.va };
+        transfer(op.subop == VSTORE, slot, op.transfer_slots(), vm_addr, vector_base, mapping)?;
+        return Ok(0);
     }
-    if translated > 0 {
-        translate_operands(
-            mapping,
-            &mut scratch,
-            translation_spec(&requests[..translated]),
-        )?;
-    }
-    if !op.memory_mode && vector_base.is_null() {
+    if vector_base.is_null() {
         return Err(EbpfError::UnsupportedInstruction);
     }
-    let mut host = [std::ptr::null_mut::<u8>(); 3];
-    let mut next_translated = 0;
-    for (i, operand) in operands.iter().enumerate() {
-        host[i] = if operand.needs_translation(op.memory_mode) {
-            next_translated += 1;
-            scratch[next_translated - 1] as usize as *mut u8
-        } else {
-            match operand {
-                Operand::Slot(slot, _) | Operand::Transpose(slot) => unsafe {
-                    vector_base.add(*slot as usize * ebpf::VECTOR_WIDTH)
-                },
-                Operand::Scalar(_) => unreachable!(),
-            }
-        };
-    }
+    let slot = |n: u8| unsafe { vector_base.add(n as usize * ebpf::VECTOR_WIDTH) };
+    let read = |n: u8| read_lanes(slot(n));
+    let scalar = reg[op.src as usize];
     match op.subop {
         VTRANSPOSE8 => {
-            let mut rows = [[0u32; 8]; 8];
-            for (i, row) in rows.iter_mut().enumerate() {
-                *row = read_lanes(unsafe { host[0].add(i * ebpf::VECTOR_WIDTH) });
-            }
+            let mut rows: [Lanes; 8] = std::array::from_fn(|i| read(op.vd + i as u8));
             transpose8(&mut rows);
             for (i, row) in rows.iter().enumerate() {
-                write_lanes(unsafe { host[0].add(i * ebpf::VECTOR_WIDTH) }, row);
+                write_lanes(slot(op.vd + i as u8), row);
             }
+            return Ok(0);
         }
-        VBCAST32 => write_lanes(host[0], &[reg[op.src as usize] as u32; 8]),
-        VADD32 | VXOR | VAND | VOR | VPERMD | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN
-            | VROLV32 | VTERNLOG | VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDW => {
-            let a = read_lanes(host[0]);
-            let b = read_lanes(host[1]);
-            if op.subop == VTERNLOG {
-                let d = read_lanes(host[2]);
-                let out: Lanes = std::array::from_fn(|i| ternlog(d[i], a[i], b[i], op.off as u8));
-                write_lanes(host[2], &out);
-            } else {
-                write_lanes(host[2], &compute(op, &a, &b));
+        VINS64 => {
+            unsafe { std::ptr::write_unaligned(slot(op.vd).add(8 * op.off as usize).cast::<u64>(), scalar.to_le()) };
+            return Ok(0);
+        }
+        VEXT64 => {
+            return Ok(u64::from_le(unsafe { std::ptr::read_unaligned(slot(op.va).add(8 * op.off as usize).cast::<u64>()) }));
+        }
+        VMOVMSK8 => {
+            let mut mask = 0u64;
+            for i in 0..op.halves() * ebpf::VECTOR_WIDTH {
+                mask |= ((unsafe { *slot(op.va).add(i) } >> 7) as u64) << i;
             }
+            return Ok(mask);
         }
-        _ => {
-            // VLOAD, VSTORE, VROR32, VSHUFD, VMOV
-            let a = read_lanes(host[0]);
-            write_lanes(host[1], &compute(op, &a, &a));
-        }
+        _ => {}
     }
-    Ok(())
+    // Every source is read before the destination is written
+    let halves = op.halves();
+    let a: [Lanes; 2] = std::array::from_fn(|h| if h < halves { read(op.va + h as u8) } else { [0; 8] });
+    let b: [Lanes; 2] = std::array::from_fn(|h| if h < halves { read(op.vb + h as u8) } else { [0; 8] });
+    let d: [Lanes; 2] = std::array::from_fn(|h| if h < halves { read(op.vd + h as u8) } else { [0; 8] });
+    let lanes = 8 * halves;
+    let get = |x: &[Lanes; 2], i: usize| x[i / 8][i % 8];
+    let out: [Lanes; 2] = match op.subop {
+        VBCAST32 => [[scalar as u32; 8]; 2],
+        VBCAST64 => [std::array::from_fn(|i| (scalar >> (32 * (i % 2))) as u32); 2],
+        // Cross lane over all lanes of the operand
+        VPERMD => std::array::from_fn(|h| std::array::from_fn(|i| get(&a, (get(&b, 8 * h + i) as usize) & (lanes - 1)))),
+        VPERMI2D => std::array::from_fn(|h| {
+            std::array::from_fn(|i| {
+                let index = get(&d, 8 * h + i) as usize & (2 * lanes - 1);
+                if index < lanes { get(&a, index) } else { get(&b, index - lanes) }
+            })
+        }),
+        _ => std::array::from_fn(|h| compute_half(op, &a[h], &b[h], &d[h])),
+    };
+    for (h, half) in out.iter().enumerate().take(halves) {
+        write_lanes(slot(op.vd + h as u8), half);
+    }
+    Ok(0)
+}
+
+/// Mnemonic of a sub-operation (the intrinsic name without `sol_<isa>_`, prefixed with `v`)
+pub fn mnemonic(subop: u8, wide: bool) -> String {
+    let name = if wide { intrinsics::NAMES_512[subop as usize] } else { Some(intrinsics::NAMES_256[subop as usize]) };
+    match name {
+        Some(name) => format!("v{}", name.splitn(3, '_').nth(2).unwrap()),
+        None => "vinvalid".to_string(),
+    }
 }
 
 /// Textual representation of a vector instruction
@@ -554,55 +504,33 @@ pub fn disassemble(insn: &ebpf::Insn) -> String {
     let Some(op) = VecInsn::decode(insn) else {
         return format!("vop invalid imm={:#x}", insn.imm);
     };
-    let slot = |n: u8| {
-        if op.memory_mode {
-            format!("[r{}+{}]", op.base_reg, n as usize * ebpf::VECTOR_WIDTH)
-        } else {
-            format!("v{n}")
-        }
-    };
+    let name = mnemonic(op.subop, op.wide);
     let addr = format!("[r{}{:+}]", op.src, op.off);
-    let (vd, va, vb) = (slot(op.vd), slot(op.va), slot(op.vb));
+    let range = |first: u8| {
+        if op.transfer_slots() == 1 { format!("v{first}") } else { format!("v{first}..v{}", first as usize + op.vb as usize) }
+    };
+    let (vd, va, vb) = (op.vd, op.va, op.vb);
     match op.subop {
-        VLOAD => format!("vload256 {vd}, {addr}"),
-        VSTORE => format!("vstore256 {addr}, {va}"),
-        VADD32 => format!("vadd32x8 {vd}, {va}, {vb}"),
-        VXOR => format!("vxor256 {vd}, {va}, {vb}"),
-        VAND => format!("vand256 {vd}, {va}, {vb}"),
-        VOR => format!("vor256 {vd}, {va}, {vb}"),
-        VROR32 => format!("vror32x8 {vd}, {va}, {}", op.off),
-        VSHUFD => format!("vshufd {vd}, {va}, {:#x}", op.off),
-        VTRANSPOSE8 => format!("vtranspose8 {vd}..{}", slot(op.vd + 7)),
-        VBCAST32 => format!("vbcast32 {vd}, r{}", op.src),
-        VMOV => format!("vmov {vd}, {va}"),
-        VPERMD => format!("vpermd {vd}, {va}, {vb}"),
-        VBLENDD => format!("vblendd {vd}, {va}, {vb}, {:#x}", op.off),
-        VSUB32 => format!("vsub32x8 {vd}, {va}, {vb}"),
-        VMULLO32 => format!("vmullo32x8 {vd}, {va}, {vb}"),
-        VMINU32 => format!("vminu32x8 {vd}, {va}, {vb}"),
-        VSRL32 => format!("vsrl32x8 {vd}, {va}, {}", op.off),
-        VSLL32 => format!("vsll32x8 {vd}, {va}, {}", op.off),
-        VSLLV32 => format!("vsllv32x8 {vd}, {va}, {vb}"),
-        VSRLV32 => format!("vsrlv32x8 {vd}, {va}, {vb}"),
-        VANDN => format!("vandn256 {vd}, {va}, {vb}"),
-        VROLV32 => format!("vrolv32x8 {vd}, {va}, {vb}"),
-        VTERNLOG => format!("vternlog {vd}, {va}, {vb}, {:#x}", op.off),
-        VADD16 => format!("vadd16x16 {vd}, {va}, {vb}"),
-        VSUB16 => format!("vsub16x16 {vd}, {va}, {vb}"),
-        VMULLO16 => format!("vmullo16x16 {vd}, {va}, {vb}"),
-        VMULHI16 => format!("vmulhi16x16 {vd}, {va}, {vb}"),
-        VMINU16 => format!("vminu16x16 {vd}, {va}, {vb}"),
-        VMADD16 => format!("vmadd16x16 {vd}, {va}, {vb}"),
-        VBLENDW => format!("vblendw {vd}, {va}, {vb}, {:#x}", op.off),
-        _ => unreachable!(),
+        VLOAD => format!("{name} {}, {addr}", range(vd)),
+        VSTORE => format!("{name} {addr}, {}", range(va)),
+        VTRANSPOSE8 => format!("{name} v{vd}..v{}", vd + 7),
+        VBCAST32 | VBCAST64 => format!("{name} v{vd}, r{}", op.src),
+        VINS64 => format!("{name} v{vd}, r{}, {}", op.src, op.off),
+        VEXT64 => format!("{name} r{}, v{va}, {}", op.dst, op.off),
+        VMOVMSK8 => format!("{name} r{}, v{va}", op.dst),
+        VMOV => format!("{name} v{vd}, v{va}"),
+        VROR32 | VSRL32 | VSLL32 => format!("{name} v{vd}, v{va}, {}", op.off),
+        VSHUFD => format!("{name} v{vd}, v{va}, {:#x}", op.off),
+        VBLENDD | VBLENDW | VTERNLOG => format!("{name} v{vd}, v{va}, v{vb}, {:#x}", op.off),
+        _ => format!("{name} v{vd}, v{va}, v{vb}"),
     }
 }
 
-/// Host memory backing the experimental vector region.
+/// Host memory of a vector file.
 ///
-/// The same buffer must be mapped at [ebpf::MM_VECTOR_START] (see [Self::region]) and attached to
-/// the VM (see [crate::vm::EbpfVm::set_vector_memory]). It is zeroed by the VM at the beginning of
-/// every program invocation.
+/// The VM allocates its own when it runs a program with vector instructions. An embedder may
+/// provide one instead (see [crate::vm::EbpfVm::set_vector_memory]), e.g. to inspect the slots
+/// after a run. It is zeroed by the VM at the beginning of every program invocation.
 pub struct VectorMemory {
     memory: crate::aligned_memory::AlignedMemory<{ ebpf::VECTOR_WIDTH }>,
 }
@@ -619,14 +547,6 @@ impl VectorMemory {
         Self {
             memory: crate::aligned_memory::AlignedMemory::zero_filled(ebpf::VECTOR_MEMORY_SIZE),
         }
-    }
-
-    /// The memory region to add to the memory mapping
-    pub fn region(&mut self) -> crate::memory_region::MemoryRegion {
-        crate::memory_region::MemoryRegion::new(
-            &raw mut *self.memory.as_slice_mut(),
-            ebpf::MM_VECTOR_START,
-        )
     }
 
     /// Host address of the vector memory
@@ -700,7 +620,7 @@ pub fn analyze<C: crate::vm::ContextObject>(executable: &crate::elf::Executable<
     let sbpf_version = executable.get_sbpf_version();
     let (_, program) = executable.get_text_bytes();
     let len = program.len() / ebpf::INSN_SIZE;
-    let intrinsic_hashes = intrinsics::hashes();
+    let intrinsic_hashes: Vec<u32> = intrinsics::hashes().iter().map(|(hash, _, _)| *hash).collect();
     let is_vector = |insn: &ebpf::Insn| {
         insn.opc == ebpf::VOP
             || (insn.opc == ebpf::CALL_IMM && insn.src == 0 && intrinsic_hashes.contains(&(insn.imm as u32)))

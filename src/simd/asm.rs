@@ -5,15 +5,13 @@
 use super::*;
 use crate::ebpf::Insn;
 
-/// Where the vector file lives
+/// How vector operations are encoded
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VecMode {
-    /// Dedicated vector region at [ebpf::MM_VECTOR_START]
+    /// The experimental opcode [ebpf::VOP]
     Slot,
-    /// Ordinary VM memory pointed to by the given register
-    Memory(u8),
-    /// Dedicated vector region, every operation is a static call (`mov64 r1, operands` +
-    /// `call sol_<op>`, scalar operand in r2), see [super::intrinsics]. Clobbers r0, r1 and, for
+    /// Every operation is a static call (`mov64 r1, operands` + `call sol_<isa>_<op>`, scalar
+    /// operand in r2, scalar result in r0), see [super::intrinsics]. Clobbers r0, r1 and, for
     /// operations with a scalar operand in another register, r2.
     Call,
 }
@@ -152,38 +150,33 @@ impl Asm {
         self.raw(ebpf::ST_DW_IMM, dst, 0, off, imm);
     }
 
-    fn vop(&mut self, subop: u8, vd: u8, va: u8, vb: u8, src: u8, off: i16) {
+    /// Emits a vector operation. `dst` is the scalar destination (vext64, vmovmsk8), which is
+    /// r0 in [VecMode::Call] (a mov follows if another register is requested).
+    #[allow(clippy::too_many_arguments)]
+    pub fn vop_full(&mut self, subop: u8, wide: bool, vd: u8, va: u8, vb: u8, dst: u8, src: u8, off: i16) {
         if self.mode == VecMode::Call {
             use super::intrinsics::{hash, pack, unpack, OPERAND_REG, SCALAR_REG};
-            let op = VecInsn { subop, vd, va, vb, memory_mode: false, base_reg: 0, src: if src != 0 { SCALAR_REG } else { 0 }, off };
+            let op = VecInsn { subop, vd, va, vb, wide, dst: 0, src: if uses_src(subop) { SCALAR_REG } else { 0 }, off };
             let packed = pack(&op);
-            assert!(unpack(subop, packed).is_some(), "operands not encodable as an intrinsic call");
+            assert!(unpack(subop, wide, packed).is_some(), "operands not encodable as an intrinsic call");
             // The scalar operand is passed in r2 (clobbers r2 unless it is already there)
-            if src != 0 && src != SCALAR_REG {
+            if uses_src(subop) && src != SCALAR_REG {
                 self.mov64(SCALAR_REG, src);
             }
             self.mov64_imm(OPERAND_REG, packed as i64);
-            self.raw(ebpf::CALL_IMM, 0, 0, 0, hash(subop) as i32 as i64);
+            self.raw(ebpf::CALL_IMM, 0, 0, 0, hash(subop, wide) as i32 as i64);
+            if writes_dst(subop) && dst != 0 {
+                self.mov64(dst, 0);
+            }
             return;
         }
-        let (memory_mode, base_reg) = match self.mode {
-            VecMode::Slot => (false, 0),
-            VecMode::Memory(reg) => (true, reg),
-            VecMode::Call => unreachable!(),
-        };
-        let insn = VecInsn {
-            subop,
-            vd,
-            va,
-            vb,
-            memory_mode,
-            base_reg,
-            src,
-            off,
-        }
-        .encode();
-        debug_assert!(VecInsn::decode(&insn).is_some());
+        let insn = VecInsn { subop, vd, va, vb, wide, dst, src, off }.encode();
+        assert!(VecInsn::decode(&insn).is_some(), "invalid vector operation");
         self.insns.push(insn);
+    }
+
+    fn vop(&mut self, subop: u8, vd: u8, va: u8, vb: u8, src: u8, off: i16) {
+        self.vop_full(subop, false, vd, va, vb, 0, src, off);
     }
 
     pub fn vload(&mut self, vd: u8, src: u8, off: i16) {
@@ -191,6 +184,33 @@ impl Asm {
     }
     pub fn vstore(&mut self, src: u8, off: i16, va: u8) {
         self.vop(VSTORE, 0, va, 0, src, off);
+    }
+    /// Loads `slots` consecutive slots
+    pub fn vload_n(&mut self, vd: u8, slots: u8, src: u8, off: i16) {
+        self.vop(VLOAD, vd, 0, slots - 1, src, off);
+    }
+    /// Stores `slots` consecutive slots
+    pub fn vstore_n(&mut self, src: u8, off: i16, va: u8, slots: u8) {
+        self.vop(VSTORE, 0, va, slots - 1, src, off);
+    }
+    pub fn vins64(&mut self, vd: u8, src: u8, lane: i16) {
+        self.vop(VINS64, vd, 0, 0, src, lane);
+    }
+    pub fn vext64(&mut self, dst: u8, va: u8, lane: i16) {
+        self.vop_full(VEXT64, false, 0, va, 0, dst, 0, lane);
+    }
+    pub fn vbcast64(&mut self, vd: u8, src: u8) {
+        self.vop(VBCAST64, vd, 0, 0, src, 0);
+    }
+    pub fn vmovmsk8(&mut self, dst: u8, va: u8, wide: bool) {
+        self.vop_full(VMOVMSK8, wide, 0, va, 0, dst, 0, 0);
+    }
+    pub fn vpermi2d(&mut self, vd: u8, va: u8, vb: u8, wide: bool) {
+        self.vop_full(VPERMI2D, wide, vd, va, vb, 0, 0, 0);
+    }
+    /// 512 bit form of a slot operation (even slots)
+    pub fn wide(&mut self, subop: u8, vd: u8, va: u8, vb: u8, src: u8, off: i16) {
+        self.vop_full(subop, true, vd, va, vb, 0, src, off);
     }
     pub fn vadd(&mut self, vd: u8, va: u8, vb: u8) {
         self.vop(VADD32, vd, va, vb, 0, 0);

@@ -49,7 +49,7 @@ fn blake3_interpreter_all_kernels() {
             let data = test_data(len, seed);
             let expected = *blake3::hash(&data).as_bytes();
             for kernel in [Kernel::Scalar, Kernel::Simd1, Kernel::Simd8] {
-                for mode in [VecMode::Slot, VecMode::Memory(9), VecMode::Call] {
+                for mode in [VecMode::Slot, VecMode::Call] {
                     if kernel == Kernel::Scalar && mode != VecMode::Slot {
                         continue;
                     }
@@ -68,7 +68,7 @@ fn blake3_jit_matches_interpreter() {
         let data = test_data(len, 3);
         let expected = *blake3::hash(&data).as_bytes();
         for kernel in [Kernel::Scalar, Kernel::Simd1, Kernel::Simd8] {
-            for mode in [VecMode::Slot, VecMode::Memory(9), VecMode::Call] {
+            for mode in [VecMode::Slot, VecMode::Call] {
                 if kernel == Kernel::Scalar && mode != VecMode::Slot {
                     continue;
                 }
@@ -204,6 +204,55 @@ fn op_cases() -> Vec<(&'static str, Body)> {
         cases.push(("vror", Box::new(move |a| a.vror(2, 3, amount))));
         cases.push(("vror_inplace", Box::new(move |a| a.vror(3, 3, amount))));
     }
+    cases.push(("lane_moves", Box::new(|a| {
+        for lane in 0..4 {
+            a.vext64(4, 1 + lane as u8, lane);
+            a.vins64(5 + lane as u8, 4, 3 - lane);
+        }
+        a.vadd(9, 9, 10); // cached source for vext64
+        a.vext64(6, 9, 2);
+        a.vins64(9, 6, 0);
+        a.vbcast64(10, 6);
+        a.vmovmsk8(7, 11, false);
+        a.vmovmsk8(8, 12, true);
+        a.vbcast64(13, 7);
+        a.vbcast64(14, 8);
+    })));
+    cases.push(("vpermi2d", Box::new(|a| {
+        a.vpermi2d(0, 1, 2, false);
+        a.vpermi2d(3, 3, 4, false); // table aliases the index
+        a.vpermi2d(5, 6, 6, false);
+    })));
+    cases.push(("wide_cross", Box::new(|a| {
+        a.wide(solana_sbpf::simd::VPERMD, 0, 2, 4, 0, 0);
+        a.wide(solana_sbpf::simd::VPERMD, 6, 6, 8, 0, 0); // data aliases the destination
+        a.vpermi2d(10, 12, 14, true);
+        a.vpermi2d(2, 2, 4, true); // first table aliases the index
+        a.vpermi2d(4, 6, 4, true); // second table aliases the index
+    })));
+    for subop in [
+        solana_sbpf::simd::VADD32, solana_sbpf::simd::VXOR, solana_sbpf::simd::VROR32, solana_sbpf::simd::VSHUFD,
+        solana_sbpf::simd::VBLENDD, solana_sbpf::simd::VROLV32, solana_sbpf::simd::VTERNLOG, solana_sbpf::simd::VMULHI16,
+        solana_sbpf::simd::VBLENDW, solana_sbpf::simd::VMOV, solana_sbpf::simd::VMADD16,
+    ] {
+        cases.push(("wide", Box::new(move |a| {
+            let off = match subop {
+                solana_sbpf::simd::VROR32 => 7,
+                solana_sbpf::simd::VSHUFD | solana_sbpf::simd::VBLENDD | solana_sbpf::simd::VBLENDW => 0x93,
+                solana_sbpf::simd::VTERNLOG => 0xd2,
+                _ => 0,
+            };
+            a.wide(subop, 0, 2, 4, 0, off);
+            a.wide(subop, 6, 6, 8, 0, off);
+            a.wide(subop, 10, 12, 10, 0, off);
+            a.wide(subop, 14, 14, 14, 0, off);
+        })));
+    }
+    cases.push(("wide_bcast", Box::new(|a| {
+        a.lddw(3, 0x8765_4321_0fed_cba9);
+        a.wide(solana_sbpf::simd::VBCAST32, 2, 0, 0, 3, 0);
+        a.wide(solana_sbpf::simd::VBCAST64, 6, 0, 0, 3, 0);
+    })));
     cases
 }
 
@@ -226,7 +275,7 @@ fn new_ops_reference() {
         assert_eq!(ternlog(d, a, b, 0xcc), a);
         assert_eq!(ternlog(d, a, b, 0xaa), b);
     }
-    let op = |subop| VecInsn { subop, vd: 0, va: 0, vb: 0, memory_mode: false, base_reg: 0, src: 0, off: 0 };
+    let op = |subop| VecInsn { subop, vd: 0, va: 0, vb: 0, wide: false, dst: 0, src: 0, off: 0 };
     let x: [u32; 8] = std::array::from_fn(|_| next());
     let y: [u32; 8] = [0, 1, 5, 13, 16, 31, 32, 7];
     let out = compute(&op(VROLV32), &x, &y);
@@ -279,7 +328,7 @@ fn vector_ops_jit_matches_interpreter() {
         let input = random_input(seed);
         for (name, body) in op_cases() {
             let (slot_result, _) = run_op(&op_program(VecMode::Slot, &*body), &input, Engine::Interpreter, SimdJitStrategy::Direct);
-            for mode in [VecMode::Slot, VecMode::Memory(9), VecMode::Call] {
+            for mode in [VecMode::Slot, VecMode::Call] {
                 let program = op_program(mode, &*body);
                 let (expected, cus) = run_op(&program, &input, Engine::Interpreter, SimdJitStrategy::Direct);
                 if mode == VecMode::Call {
@@ -332,54 +381,186 @@ fn run_all(program: &[u8], input: &[u8]) -> (String, Vec<u8>, Vec<u8>, u64) {
 }
 
 #[test]
-fn vector_region_bounds_and_scalar_access() {
+fn vector_file_is_not_mapped() {
     let input = random_input(5);
-    // Scalar accesses to the first and last byte of the region work and alias slot memory
-    let mut a = Asm::new(VecMode::Slot);
-    a.vload(0, 1, 0);
-    a.lddw(2, ebpf::MM_VECTOR_START);
-    a.mov64_imm(3, 0x5a);
-    a.stxb(2, ebpf::VECTOR_MEMORY_SIZE as i16 - 1, 3); // last byte of the last slot
-    a.stxb(2, 3, 3); // partial write into the cached v0
-    a.vadd(1, 0, 0);
-    a.ldxb(4, 2, ebpf::VECTOR_MEMORY_SIZE as i16 - 1);
-    a.lddw(5, ebpf::MM_HEAP_START);
-    a.stxdw(5, 0x1000, 4);
-    a.vstore(5, 0, 1);
-    a.mov64_imm(0, 0);
-    a.exit();
-    let (result, heap, vector, _) = run_all(&a.finish(), &input);
-    assert_eq!(result, "Ok(0)");
-    assert_eq!(heap[0x1000], 0x5a);
-    assert_eq!(vector[ebpf::VECTOR_MEMORY_SIZE - 1], 0x5a);
-    let mut v0 = input[0..32].to_vec();
-    v0[3] = 0x5a;
-    let v0 = solana_sbpf::simd::read_lanes(v0.as_ptr());
-    let v1 = solana_sbpf::simd::read_lanes(heap.as_ptr());
-    for i in 0..8 {
-        assert_eq!(v1[i], v0[i].wrapping_add(v0[i]));
-    }
-
-    // One past the end of the region
-    let mut a = Asm::new(VecMode::Slot);
-    a.lddw(2, ebpf::MM_VECTOR_START);
-    a.ldxb(4, 2, ebpf::VECTOR_MEMORY_SIZE as i16);
-    a.exit();
-    let (result, ..) = run_all(&a.finish(), &input);
-    assert!(result.contains("AccessViolation"), "{}", result);
-
-    // vload / vstore straddling the end of the region
+    // The former vector region address is unmapped, scalar accesses fault
     for store in [false, true] {
         let mut a = Asm::new(VecMode::Slot);
-        a.lddw(2, ebpf::MM_VECTOR_START + ebpf::VECTOR_MEMORY_SIZE as u64 - 16);
+        a.vload(0, 1, 0);
+        a.lddw(2, 6 << 32);
         if store {
-            a.vstore(2, 0, 0);
+            a.stxb(2, 0, 3);
         } else {
-            a.vload(0, 2, 0);
+            a.ldxb(4, 2, 0);
         }
+        a.mov64_imm(0, 0);
         a.exit();
         let (result, ..) = run_all(&a.finish(), &input);
         assert!(result.contains("AccessViolation"), "{}", result);
+    }
+    // vload / vstore of several slots straddling the end of the heap
+    for store in [false, true] {
+        let mut a = Asm::new(VecMode::Slot);
+        a.lddw(2, ebpf::MM_HEAP_START + 0x2000 - 3 * 32 + 1);
+        if store {
+            a.vstore_n(2, 0, 0, 3);
+        } else {
+            a.vload_n(0, 3, 2, 0);
+        }
+        a.mov64_imm(0, 0);
+        a.exit();
+        let (result, ..) = run_all(&a.finish(), &input);
+        assert!(result.contains("AccessViolation"), "{}", result);
+    }
+    // vstore into the read-only program region
+    let mut a = Asm::new(VecMode::Slot);
+    a.lddw(2, ebpf::MM_RODATA_START);
+    a.vstore(2, 0, 0);
+    a.exit();
+    let (result, ..) = run_all(&a.finish(), &input);
+    assert!(result.contains("AccessViolation") && result.contains("Store"), "{}", result);
+}
+
+/// Bulk vload / vstore (up to 32 slots with one translation), both forms
+#[test]
+fn bulk_transfers() {
+    let input = test_data(32 * 40, 77);
+    for mode in [VecMode::Slot, VecMode::Call] {
+        let mut a = Asm::new(mode);
+        a.mov64(3, 1);
+        a.vload_n(10, 32, 3, 0);
+        a.vload_n(42, 8, 3, 32 * 32);
+        a.vadd(10, 10, 41); // first and last slot of the first transfer
+        a.lddw(4, ebpf::MM_HEAP_START);
+        a.vstore_n(4, 7, 10, 32);
+        a.vstore_n(4, 7 + 32 * 32, 42, 8);
+        a.mov64_imm(0, 0);
+        a.exit();
+        let (result, heap, ..) = run_all(&a.finish(), &input);
+        assert_eq!(result, "Ok(0)");
+        assert_eq!(heap[7 + 32..7 + 40 * 32], input[32..40 * 32], "{mode:?}");
+        let (x, y) = (solana_sbpf::simd::read_lanes(input.as_ptr()), solana_sbpf::simd::read_lanes(input[31 * 32..].as_ptr()));
+        let got = solana_sbpf::simd::read_lanes(heap[7..].as_ptr());
+        for i in 0..8 {
+            assert_eq!(got[i], x[i].wrapping_add(y[i]));
+        }
+    }
+}
+
+/// 64 bit lane moves, broadcasts and byte masks against a Rust model, both forms
+#[test]
+fn lane_moves() {
+    let input = random_input(40);
+    let lanes64 = |i: usize| -> [u64; 4] { std::array::from_fn(|l| u64::from_le_bytes(input[32 * i + 8 * l..][..8].try_into().unwrap())) };
+    for mode in [VecMode::Slot, VecMode::Call] {
+        let mut a = Asm::new(mode);
+        a.mov64(3, 1);
+        a.vload_n(0, 4, 3, 0);
+        a.lddw(6, ebpf::MM_HEAP_START);
+        // r7 = sum of the four lanes of v1, stored at heap + 0x100
+        a.mov64_imm(7, 0);
+        for lane in 0..4 {
+            a.vext64(4, 1, lane);
+            a.add64(7, 4);
+        }
+        a.stxdw(6, 0x100, 7);
+        // v0 lane 2 = 0x1122334455667788, v2 = broadcast, v3 lane 3 = v1 lane 0 (from a cached slot)
+        a.lddw(5, 0x1122_3344_5566_7788);
+        a.vins64(0, 5, 2);
+        a.vbcast64(2, 5);
+        a.vadd(1, 1, 1);
+        a.vext64(4, 1, 0);
+        a.vins64(3, 4, 3);
+        a.vmovmsk8(8, 3, false);
+        a.stxdw(6, 0x108, 8);
+        a.vmovmsk8(8, 0, true);
+        a.stxdw(6, 0x110, 8);
+        a.vstore_n(6, 0, 0, 4);
+        a.mov64_imm(0, 0);
+        a.exit();
+        let (result, heap, ..) = run_all(&a.finish(), &input);
+        assert_eq!(result, "Ok(0)", "{mode:?}");
+        let word = |at: usize| u64::from_le_bytes(heap[at..at + 8].try_into().unwrap());
+        let out = |i: usize, l: usize| word(32 * i + 8 * l);
+        assert_eq!(word(0x100), lanes64(1).iter().fold(0u64, |s, x| s.wrapping_add(*x)));
+        let mut v0 = lanes64(0);
+        v0[2] = 0x1122_3344_5566_7788;
+        let doubled: Vec<u64> = (0..4).map(|l| {
+            let x = lanes64(1)[l];
+            (x as u32).wrapping_mul(2) as u64 | ((((x >> 32) as u32).wrapping_mul(2)) as u64) << 32
+        }).collect();
+        let mut v3 = lanes64(3);
+        v3[3] = doubled[0];
+        for l in 0..4 {
+            assert_eq!(out(0, l), v0[l]);
+            assert_eq!(out(2, l), 0x1122_3344_5566_7788);
+            assert_eq!(out(3, l), v3[l]);
+        }
+        let mask = |bytes: &[u8]| bytes.iter().enumerate().fold(0u64, |m, (i, b)| m | ((b >> 7) as u64) << i);
+        assert_eq!(word(0x108), mask(&heap[96..128]));
+        assert_eq!(word(0x110), mask(&heap[0..64]));
+    }
+}
+
+/// Every 512 bit operation equals its definition: the 256 bit operation on both halves (lane-wise
+/// ones), or the Rust model (cross lane ones)
+#[test]
+fn wide_ops_reference() {
+    use solana_sbpf::simd::{self, intrinsics::NAMES_512, VecInsn};
+    let input = random_input(41);
+    for subop in 0..simd::SUBOP_COUNT {
+        if NAMES_512[subop as usize].is_none() || matches!(subop, simd::VMOVMSK8 | simd::VBCAST32 | simd::VBCAST64) {
+            continue;
+        }
+        let off = match subop {
+            simd::VROR32 | simd::VSRL32 | simd::VSLL32 => 13,
+            simd::VSHUFD | simd::VBLENDD | simd::VTERNLOG | simd::VBLENDW => 0x6c,
+            _ => 0,
+        };
+        let build = |wide: bool| {
+            let body = move |a: &mut Asm| {
+                if wide {
+                    a.wide(subop, 0, 4, 8, 0, off);
+                    a.wide(subop, 10, 10, 12, 0, off);
+                } else {
+                    for h in 0..2 {
+                        a.vop_full(subop, false, h, 4 + h, 8 + h, 0, 0, off);
+                        a.vop_full(subop, false, 10 + h, 10 + h, 12 + h, 0, 0, off);
+                    }
+                }
+            };
+            op_program(VecMode::Slot, &body)
+        };
+        let (wide, _) = run_op(&build(true), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+        let lane = |buf: &[u8], slot: usize, i: usize| u32::from_le_bytes(buf[32 * slot + 4 * i..][..4].try_into().unwrap());
+        let get = |buf: &[u8], pair: usize, i: usize| lane(buf, pair + i / 8, i % 8);
+        match subop {
+            simd::VPERMD => {
+                for i in 0..16 {
+                    assert_eq!(get(&wide, 0, i), get(&input, 4, (get(&input, 8, i) & 15) as usize));
+                }
+            }
+            simd::VPERMI2D => {
+                for i in 0..16 {
+                    let idx = (get(&input, 0, i) & 31) as usize;
+                    let expected = if idx < 16 { get(&input, 4, idx) } else { get(&input, 8, idx - 16) };
+                    assert_eq!(get(&wide, 0, i), expected, "vpermi2d512 lane {i}");
+                }
+            }
+            _ => {
+                let (split, _) = run_op(&build(false), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+                assert_eq!(wide, split, "{}", simd::mnemonic(subop, true));
+            }
+        }
+        let _ = VecInsn::decode;
+    }
+    // vpermi2d256 against the model
+    let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.vpermi2d(0, 4, 5, false)), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+    let lane = |buf: &[u8], slot: usize, i: usize| u32::from_le_bytes(buf[32 * slot + 4 * i..][..4].try_into().unwrap());
+    for i in 0..8 {
+        let idx = (lane(&input, 0, i) & 15) as usize;
+        let expected = if idx < 8 { lane(&input, 4, idx) } else { lane(&input, 5, idx - 8) };
+        assert_eq!(lane(&out, 0, i), expected);
     }
 }
 
@@ -401,28 +582,6 @@ fn unaligned_vector_load_store() {
 }
 
 #[test]
-fn memory_mode_invalid_base_and_readonly() {
-    let input = random_input(7);
-    // Base register points nowhere
-    let mut a = Asm::new(VecMode::Memory(9));
-    a.mov64_imm(9, 0x1234);
-    a.vadd(0, 1, 2);
-    a.exit();
-    let (result, ..) = run_all(&a.finish(), &input);
-    assert!(result.contains("AccessViolation"), "{}", result);
-    // Vector file in the read-only program region: loads work, the store fails
-    let mut a = Asm::new(VecMode::Memory(9));
-    a.mov64_imm(9, 0);
-    a.vxor(0, 1, 2);
-    a.exit();
-    for _ in 0..16 {
-        a.mov64_imm(0, 0); // make the read-only region large enough for the loads
-    }
-    let (result, ..) = run_all(&a.finish(), &input);
-    assert!(result.contains("AccessViolation") && result.contains("Store"), "{}", result);
-}
-
-#[test]
 fn register_cache_branches_calls_and_pressure() {
     let input = random_input(8);
     let mut a = Asm::new(VecMode::Slot);
@@ -434,10 +593,11 @@ fn register_cache_branches_calls_and_pressure() {
     a.mov64_imm(6, 5);
     a.bind(top);
     // More live slots than host registers: forces evictions, spills and reloads
-    for i in 0..48u8 {
-        a.vadd(16 + (i % 40), i % 16, (i * 7) % 16);
-        a.vxor(i % 16, 16 + ((i * 3) % 40), i % 16);
-        a.vror(16 + ((i * 5) % 40), 16 + (i % 40), (i % 31) as i16 + 1);
+    for i in 0..48usize {
+        let s = |x: usize| x as u8;
+        a.vadd(s(16 + (i % 40)), s(i % 16), s((i * 7) % 16));
+        a.vxor(s(i % 16), s(16 + ((i * 3) % 40)), s(i % 16));
+        a.vror(s(16 + ((i * 5) % 40)), s(16 + (i % 40)), (i % 31) as i16 + 1);
     }
     a.call(func);
     a.sub64_imm(6, 1);
@@ -518,14 +678,16 @@ fn detached_and_disabled_and_malformed() {
     a.vadd(0, 1, 2);
     a.exit();
     let program = a.finish();
-    // No vector memory attached: UnsupportedInstruction, not a host fault
+    // No vector memory attached: the VM allocates its own vector file
     for (engine, strategy) in engines() {
         let mut runner = Runner::new(&program, &input, 0x2000, config(strategy)).unwrap();
         if engine == Engine::Jit {
             runner.jit_compile().unwrap();
         }
-        let (_, result) = runner.run_detached(engine);
-        assert!(matches!(result, solana_sbpf::error::StableResult::Err(EbpfError::UnsupportedInstruction)), "{:?}", result);
+        for _ in 0..2 {
+            let (_, result) = runner.run_detached(engine);
+            assert!(result.is_ok(), "{:?}", result);
+        }
     }
     // Feature disabled at runtime
     let mut cfg = config(SimdJitStrategy::Direct);
@@ -542,8 +704,13 @@ fn detached_and_disabled_and_malformed() {
         (1 << 25, 0, 0, 0),           // reserved bit
         ((0x06 << 18) as i32, 0, 0, 32), // rotation >= 32
         ((0x10 << 18) as i32, 0, 0, 32), // shift >= 32
-        ((0x02 << 18) as i32, 3, 0, 0), // dst register in slot mode
+        ((0x02 << 18) as i32, 3, 0, 0), // dst register of an op without scalar result
         ((0x02 << 18) as i32, 0, 2, 0), // unused src register
+        ((0x1f << 18) as i32, 10, 0, 0), // vext64 into r10
+        ((0x1f << 18) as i32, 1, 0, 4), // vext64 lane out of range
+        ((0x02 << 18 | 1 << 24 | 1) as i32, 0, 0, 0), // 512 bit op on an odd slot
+        ((0x08 << 18 | 1 << 24) as i32, 0, 0, 0), // vtranspose8 has no 512 bit form
+        ((32 << 12) as i32, 0, 1, 0),    // vload of 33 slots
     ] {
         let insn = ebpf::Insn { ptr: 0, opc: ebpf::VOP, dst, src, off, imm: imm as i64 };
         let mut bytes = insn.to_vec();
@@ -594,7 +761,6 @@ fn blake3_one_mebibyte() {
     let mut configs = vec![(Kernel::Simd8, VecMode::Slot, Engine::Interpreter, SimdJitStrategy::Direct)];
     if cfg!(target_arch = "x86_64") {
         configs.push((Kernel::Scalar, VecMode::Slot, Engine::Jit, SimdJitStrategy::Direct));
-        configs.push((Kernel::Simd8, VecMode::Memory(9), Engine::Jit, SimdJitStrategy::Direct));
         configs.push((Kernel::Simd8, VecMode::Slot, Engine::Jit, SimdJitStrategy::Direct));
         configs.push((Kernel::Simd8, VecMode::Slot, Engine::Jit, SimdJitStrategy::RegisterCached));
         configs.push((Kernel::Simd1, VecMode::Slot, Engine::Jit, SimdJitStrategy::RegisterCached));
@@ -616,7 +782,6 @@ fn dump_jit_code() {
     let dir = std::env::var("JIT_DUMP_DIR").unwrap();
     let repeat = 4;
     for (name, mode, strategy) in [
-        ("memory_mode", VecMode::Memory(9), SimdJitStrategy::Direct),
         ("slot_direct", VecMode::Slot, SimdJitStrategy::Direct),
         ("slot_cached", VecMode::Slot, SimdJitStrategy::RegisterCached),
         ("call_direct", VecMode::Call, SimdJitStrategy::Direct),
@@ -677,7 +842,7 @@ fn intrinsic_dynamic_operands_slow_path() {
     use solana_sbpf::simd::{VecInsn, VADD32, VSTORE, VXOR};
     let input = random_input(21);
     let mut packed_input = input.clone();
-    let packed = intrinsics::pack(&VecInsn { subop: VADD32, vd: 0, va: 1, vb: 2, memory_mode: false, base_reg: 0, src: 0, off: 0 });
+    let packed = intrinsics::pack(&VecInsn { subop: VADD32, vd: 0, va: 1, vb: 2, wide: false, dst: 0, src: 0, off: 0 });
     packed_input.extend_from_slice(&packed.to_le_bytes());
     let mut a = Asm::new(VecMode::Call);
     a.mov64(3, 1);
@@ -686,13 +851,13 @@ fn intrinsic_dynamic_operands_slow_path() {
     }
     // r1 loaded from memory
     a.ldxdw(1, 3, input.len() as i16);
-    a.raw(ebpf::CALL_IMM, 0, 0, 0, intrinsics::hash(VADD32) as i32 as i64);
+    a.raw(ebpf::CALL_IMM, 0, 0, 0, intrinsics::hash(VADD32, false) as i32 as i64);
     // r1 constant, but set before a block boundary
     a.mov64_imm(1, packed as i64);
     let join = a.new_label();
     a.ja(join);
     a.bind(join);
-    a.raw(ebpf::CALL_IMM, 0, 0, 0, intrinsics::hash(VXOR) as i32 as i64);
+    a.raw(ebpf::CALL_IMM, 0, 0, 0, intrinsics::hash(VXOR, false) as i32 as i64);
     // Fast path again, mixing with the slow path results
     a.vadd(3, 0, 3);
     a.lddw(2, ebpf::MM_HEAP_START);
@@ -704,7 +869,7 @@ fn intrinsic_dynamic_operands_slow_path() {
     let program = a.finish();
     let (result, heap, _, _) = run_all(&program, &packed_input);
     // r1 still holds the operands of the last call (the intrinsics leave it unchanged)
-    let last = intrinsics::pack(&VecInsn { subop: VSTORE, vd: 0, va: 3, vb: 0, memory_mode: false, base_reg: 0, src: 2, off: 96 });
+    let last = intrinsics::pack(&VecInsn { subop: VSTORE, vd: 0, va: 3, vb: 0, wide: false, dst: 0, src: 2, off: 96 });
     assert_eq!(result, format!("Ok({})", last));
     let lanes = |i: usize, buf: &[u8]| -> Vec<u32> { buf[32 * i..32 * i + 32].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect() };
     let (v1, v2, v3) = (lanes(1, &input), lanes(2, &input), lanes(3, &input));
@@ -729,7 +894,8 @@ fn intrinsic_malformed_operands() {
     for (subop, packed) in [
         (solana_sbpf::simd::VADD32, -1i64),                   // high bits set
         (solana_sbpf::simd::VADD32, 1 << 24),                 // non canonical bit
-        (solana_sbpf::simd::VLOAD, 1 << 26),                  // non canonical bit
+        (solana_sbpf::simd::VLOAD, 250 | 7 << 24),            // 8 slots from v250 run past the last slot
+        (solana_sbpf::simd::VEXT64, 4 << 8),                  // lane out of range
         (solana_sbpf::simd::VBCAST32, 1 << 8),                // vbcast32 has no source slot
         (solana_sbpf::simd::VROR32, 40 << 16),                // rotation out of range
         (solana_sbpf::simd::VSRL32, 32 << 16),                // shift out of range
@@ -737,7 +903,7 @@ fn intrinsic_malformed_operands() {
     ] {
         let mut a = Asm::new(VecMode::Call);
         a.mov64_imm(1, packed);
-        a.raw(ebpf::CALL_IMM, 0, 0, 0, intrinsics::hash(subop) as i32 as i64);
+        a.raw(ebpf::CALL_IMM, 0, 0, 0, intrinsics::hash(subop, false) as i32 as i64);
         a.exit();
         let (result, ..) = run_all(&a.finish(), &input);
         assert!(result.contains("UnsupportedInstruction"), "{subop} {packed:#x}: {result}");
@@ -767,7 +933,7 @@ fn intrinsics_unknown_to_runtime_fail_verification() {
             .unwrap()
             .verify::<LocalVerifier>()
     };
-    let hash = intrinsics::hash(solana_sbpf::simd::VADD32);
+    let hash = intrinsics::hash(solana_sbpf::simd::VADD32, false);
     let result = verify(false);
     assert!(matches!(result, Err(EbpfError::VerifierError(VerifierError::InvalidSyscall(h))) if h == hash), "{:?}", result);
     assert!(verify(true).is_ok());
@@ -888,7 +1054,7 @@ fn falcon_programs() {
                     let stats = r.executable.get_compiled_program().unwrap().simd_stats;
                     assert_eq!(stats.intrinsic_slow_paths, 0);
                     // Table rows (twiddles, prepared pubkey, Keccak constants) from .rodata
-                    assert!(stats.static_loads > 300 && stats.translations < 10, "{:?}", stats);
+                    assert!(stats.static_loads > 100 && stats.translations < 10, "{:?}", stats);
                     if strategy == SimdJitStrategy::RegisterCached {
                         assert!(stats.cache_hits > 5_000, "{:?}", stats);
                     }

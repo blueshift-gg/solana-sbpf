@@ -1,15 +1,17 @@
 //! The vector operations as static calls (SIMD-0645 style JIT intrinsics)
 //!
 //! Instead of a new opcode, every vector operation is a static syscall: `CALL_IMM` with `src = 0`,
-//! `dst = 0`, `off = 0` and `imm = murmur32("sol_<op>")`. The bytecode stays within the BPF ISA,
-//! and a runtime which doesn't know the names rejects the program at verification
-//! (`InvalidSyscall`).
+//! `dst = 0`, `off = 0` and `imm = murmur32("sol_<isa>_<op>")` (see [NAMES_256], [NAMES_512]).
+//! The bytecode stays within the BPF ISA, and a runtime which doesn't know the names rejects the
+//! program at verification (`InvalidSyscall`).
 //!
 //! ABI (chosen so that compiled code needs nothing but the call itself; a Rust wrapper
-//! `sol_vadd32x8(ops(V0, V0, V1))` compiles to `mov64 r1, imm` + `call`):
+//! `sol_avx2_add32x8(ops(V0, V0, V1))` compiles to `mov64 r1, imm` + `call`):
 //! - `r1` holds the packed operands (see [pack]), always a compile time constant in practice.
-//! - `r2` holds the scalar operand: the address of `vload`/`vstore`, the value of `vbcast32`.
-//! - The operation writes `r0 = 0` and leaves every other register unchanged.
+//! - `r2` holds the scalar operand: the address of `load256`/`store256`, the value of `bcast` /
+//!   `ins64`.
+//! - The operation writes its scalar result (`ext64`, `movmsk8`) or 0 to `r0` and leaves every
+//!   other register unchanged.
 //! - It costs the 1 CU of its `CALL_IMM` instruction and nothing else.
 //!
 //! Every execution backend runs the operation through [interpret]. The JIT lowers a call to inline
@@ -24,38 +26,86 @@ use crate::{
     vm::{ContextObject, EncryptedHostAddressToEbpfVm},
 };
 
-/// Function names, indexed by sub-operation
-pub const NAMES: [&str; SUBOP_COUNT as usize] = [
-    "sol_vload256",
-    "sol_vstore256",
-    "sol_vadd32x8",
-    "sol_vxor256",
-    "sol_vand256",
-    "sol_vor256",
-    "sol_vror32x8",
-    "sol_vshufd",
-    "sol_vtranspose8",
-    "sol_vbcast32",
-    "sol_vmov256",
-    "sol_vpermd",
-    "sol_vblendd",
-    "sol_vsub32x8",
-    "sol_vmullo32x8",
-    "sol_vminu32x8",
-    "sol_vsrl32x8",
-    "sol_vsll32x8",
-    "sol_vsllv32x8",
-    "sol_vsrlv32x8",
-    "sol_vandn256",
-    "sol_vrolv32x8",
-    "sol_vternlog256",
-    "sol_vadd16x16",
-    "sol_vsub16x16",
-    "sol_vmullo16x16",
-    "sol_vmulhi16x16",
-    "sol_vminu16x16",
-    "sol_vmadd16x16",
-    "sol_vblendw",
+/// Function names of the 256 bit forms, indexed by sub-operation. The prefix names the ISA level
+/// which has the operation as (essentially) one instruction: `sol_avx_` (AVX: 256 bit moves and 64
+/// bit lane moves), `sol_avx2_` (AVX2 integer operations), `sol_avx512_` (AVX-512VL: rotates,
+/// three input logic, two table permutation). Every engine runs every operation, the JIT lowers the
+/// AVX-512 ones to short AVX2 sequences on hosts without AVX-512.
+pub const NAMES_256: [&str; SUBOP_COUNT as usize] = [
+    "sol_avx_load256",
+    "sol_avx_store256",
+    "sol_avx2_add32x8",
+    "sol_avx2_xor256",
+    "sol_avx2_and256",
+    "sol_avx2_or256",
+    "sol_avx512_ror32x8",
+    "sol_avx2_shufd256",
+    "sol_avx2_transpose8x8",
+    "sol_avx2_bcast32x8",
+    "sol_avx_mov256",
+    "sol_avx2_permd256",
+    "sol_avx2_blendd256",
+    "sol_avx2_sub32x8",
+    "sol_avx2_mullo32x8",
+    "sol_avx2_minu32x8",
+    "sol_avx2_srl32x8",
+    "sol_avx2_sll32x8",
+    "sol_avx2_sllv32x8",
+    "sol_avx2_srlv32x8",
+    "sol_avx2_andn256",
+    "sol_avx512_rolv32x8",
+    "sol_avx512_ternlog256",
+    "sol_avx2_add16x16",
+    "sol_avx2_sub16x16",
+    "sol_avx2_mullo16x16",
+    "sol_avx2_mulhi16x16",
+    "sol_avx2_minu16x16",
+    "sol_avx2_madd16x16",
+    "sol_avx2_blendw256",
+    "sol_avx_ins64",
+    "sol_avx_ext64",
+    "sol_avx2_bcast64x4",
+    "sol_avx2_movmsk8x32",
+    "sol_avx512_permi2d256",
+];
+
+/// Function names of the 512 bit forms (slot pairs, AVX-512F/BW), indexed by sub-operation
+pub const NAMES_512: [Option<&str>; SUBOP_COUNT as usize] = [
+    None,
+    None,
+    Some("sol_avx512_add32x16"),
+    Some("sol_avx512_xor512"),
+    Some("sol_avx512_and512"),
+    Some("sol_avx512_or512"),
+    Some("sol_avx512_ror32x16"),
+    Some("sol_avx512_shufd512"),
+    None,
+    Some("sol_avx512_bcast32x16"),
+    Some("sol_avx512_mov512"),
+    Some("sol_avx512_permd512"),
+    Some("sol_avx512_blendd512"),
+    Some("sol_avx512_sub32x16"),
+    Some("sol_avx512_mullo32x16"),
+    Some("sol_avx512_minu32x16"),
+    Some("sol_avx512_srl32x16"),
+    Some("sol_avx512_sll32x16"),
+    Some("sol_avx512_sllv32x16"),
+    Some("sol_avx512_srlv32x16"),
+    Some("sol_avx512_andn512"),
+    Some("sol_avx512_rolv32x16"),
+    Some("sol_avx512_ternlog512"),
+    Some("sol_avx512_add16x32"),
+    Some("sol_avx512_sub16x32"),
+    Some("sol_avx512_mullo16x32"),
+    Some("sol_avx512_mulhi16x32"),
+    Some("sol_avx512_minu16x32"),
+    Some("sol_avx512_madd16x32"),
+    Some("sol_avx512_blendw512"),
+    None,
+    None,
+    Some("sol_avx512_bcast64x8"),
+    Some("sol_avx512_movmsk8x64"),
+    Some("sol_avx512_permi2d512"),
 ];
 
 /// Register holding the packed operands
@@ -63,40 +113,59 @@ pub const OPERAND_REG: u8 = 1;
 /// Register holding the scalar operand
 pub const SCALAR_REG: u8 = 2;
 
-/// Static call identifier of a sub-operation
-pub fn hash(subop: u8) -> u32 {
-    ebpf::hash_symbol_name(NAMES[subop as usize].as_bytes())
+/// Function name of a sub-operation
+pub fn name(subop: u8, wide: bool) -> Option<&'static str> {
+    if wide {
+        NAMES_512.get(subop as usize).copied().flatten()
+    } else {
+        NAMES_256.get(subop as usize).copied()
+    }
 }
 
-/// Identifiers of all sub-operations, indexed by sub-operation
-pub fn hashes() -> [u32; SUBOP_COUNT as usize] {
-    let mut hashes = [0; SUBOP_COUNT as usize];
-    for (subop, hash) in hashes.iter_mut().enumerate() {
-        *hash = self::hash(subop as u8);
+/// Static call identifier of a sub-operation
+pub fn hash(subop: u8, wide: bool) -> u32 {
+    ebpf::hash_symbol_name(name(subop, wide).expect("no such intrinsic").as_bytes())
+}
+
+/// `(identifier, sub-operation, wide)` of every intrinsic
+pub fn hashes() -> Vec<(u32, u8, bool)> {
+    let mut hashes = Vec::new();
+    for subop in 0..SUBOP_COUNT {
+        for wide in [false, true] {
+            if name(subop, wide).is_some() {
+                hashes.push((hash(subop, wide), subop, wide));
+            }
+        }
     }
     hashes
 }
 
-/// Packs the operands of `op` (slot mode, scalar operand in `r2`) into the `r1` value.
+/// Packs the operands of `op` (scalar operand in `r2`, scalar result in `r0`) into the `r1` value.
 ///
 /// Slots are 8 bit (256 slots). The layout depends on the operation, and every packed value is
 /// below `2^29`, so it always fits a `mov64 r1, imm32`:
 ///
 /// ```text
-/// vload256 / vstore256   bits 0..7 slot (vd / va)   bits 8..23 signed 16 bit offset
-/// vbcast32 / vtranspose8 bits 0..7 vd
-/// two sources            bits 0..7 vd   bits 8..15 va   bits 16..23 vb
-/// one source + imm8      bits 0..7 vd   bits 8..15 va   bits 16..23 imm8   (vror, vshufd, vsrl, vsll)
-/// vmov256                bits 0..7 vd   bits 8..15 va
-/// vblendd / vblendw /    bits 0..6 vd   bits 7..13 va   bits 14..20 vb   bits 21..28 imm8 (slots < 128)
-/// vternlog
+/// load256 / store256     bits 0..7 first slot   bits 8..23 signed 16 bit offset   bits 24..28 slots - 1
+/// bcast / transpose8     bits 0..7 vd
+/// ins64                  bits 0..7 vd   bits 8..9 lane
+/// ext64                  bits 0..7 va   bits 8..9 lane
+/// movmsk8                bits 0..7 va
+/// two sources            bits 0..7 vd   bits 8..15 va   bits 16..23 vb   (also permi2d)
+/// one source + imm8      bits 0..7 vd   bits 8..15 va   bits 16..23 imm8   (ror, shufd, srl, sll)
+/// mov                    bits 0..7 vd   bits 8..15 va
+/// blendd / blendw /      bits 0..6 vd   bits 7..13 va   bits 14..20 vb   bits 21..28 imm8 (slots < 128)
+/// ternlog
 /// ```
 pub fn pack(op: &VecInsn) -> u64 {
     let (vd, va, vb, imm) = (op.vd as u64, op.va as u64, op.vb as u64, op.off as u16 as u64);
     match op.subop {
-        VLOAD => vd | imm << 8,
-        VSTORE => va | imm << 8,
-        VBCAST32 | VTRANSPOSE8 => vd,
+        VLOAD => vd | imm << 8 | vb << 24,
+        VSTORE => va | imm << 8 | vb << 24,
+        VBCAST32 | VBCAST64 | VTRANSPOSE8 => vd,
+        VINS64 => vd | imm << 8,
+        VEXT64 => va | imm << 8,
+        VMOVMSK8 => va,
         VROR32 | VSHUFD | VSRL32 | VSLL32 => vd | va << 8 | (imm & 0xff) << 16,
         VBLENDD | VBLENDW | VTERNLOG => (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21,
         VMOV => vd | va << 8,
@@ -105,16 +174,19 @@ pub fn pack(op: &VecInsn) -> u64 {
 }
 
 /// Decodes the packed operands, `None` if they are malformed (including any non canonical bits)
-pub fn unpack(subop: u8, packed: u64) -> Option<VecInsn> {
+pub fn unpack(subop: u8, wide: bool, packed: u64) -> Option<VecInsn> {
     if subop >= SUBOP_COUNT || packed >> 29 != 0 {
         return None;
     }
     let byte = |shift: u32| ((packed >> shift) & 0xff) as u8;
     let (mut vd, mut va, mut vb, mut off) = (0u8, 0u8, 0u8, 0i16);
     match subop {
-        VLOAD => (vd, off) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16),
-        VSTORE => (va, off) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16),
-        VBCAST32 | VTRANSPOSE8 => vd = byte(0),
+        VLOAD => (vd, off, vb) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16, byte(24)),
+        VSTORE => (va, off, vb) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16, byte(24)),
+        VBCAST32 | VBCAST64 | VTRANSPOSE8 => vd = byte(0),
+        VINS64 => (vd, off) = (byte(0), byte(8) as i16),
+        VEXT64 => (va, off) = (byte(0), byte(8) as i16),
+        VMOVMSK8 => va = byte(0),
         VROR32 | VSHUFD | VSRL32 | VSLL32 => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
         VBLENDD | VBLENDW | VTERNLOG => {
             let field = |shift: u32| ((packed >> shift) & 0x7f) as u8;
@@ -123,29 +195,30 @@ pub fn unpack(subop: u8, packed: u64) -> Option<VecInsn> {
         VMOV => (vd, va) = (byte(0), byte(8)),
         _ => (vd, va, vb) = (byte(0), byte(8), byte(16)),
     }
-    let src = if matches!(subop, VLOAD | VSTORE | VBCAST32) { SCALAR_REG } else { 0 };
-    let op = VecInsn { subop, vd, va, vb, memory_mode: false, base_reg: 0, src, off };
+    let src = if uses_src(subop) { SCALAR_REG } else { 0 };
+    let op = VecInsn { subop, vd, va, vb, wide, dst: 0, src, off };
     // The opcode form's validation (operand ranges), applied without its 6 bit slot encoding
     validate_slot_op(&op)?;
     (pack(&op) == packed).then_some(op)
 }
 
-/// Executes one call with the argument registers `r1..=r5`
+/// Executes one call with the argument registers `r1..=r5`, returns `r0`
 pub fn execute(
     subop: u8,
+    wide: bool,
     args: [u64; 5],
     vector_base: *mut u8,
     mapping: &mut MemoryMapping,
-) -> Result<(), EbpfError> {
-    let op = unpack(subop, args[0]).ok_or(EbpfError::UnsupportedInstruction)?;
+) -> Result<u64, EbpfError> {
+    let op = unpack(subop, wide, args[0]).ok_or(EbpfError::UnsupportedInstruction)?;
     let reg = [0, args[0], args[1], args[2], args[3], args[4]];
     interpret(&op, &reg, vector_base, mapping)
 }
 
 /// The built-in function of one sub-operation
-pub struct Intrinsic<const SUBOP: u8>;
+pub struct Intrinsic<const SUBOP: u8, const WIDE: bool>;
 
-impl<C: ContextObject, const SUBOP: u8> BuiltinFunctionDefinition<C> for Intrinsic<SUBOP> {
+impl<C: ContextObject, const SUBOP: u8, const WIDE: bool> BuiltinFunctionDefinition<C> for Intrinsic<SUBOP, WIDE> {
     type Error = EbpfError;
 
     fn rust(_: &mut C, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, EbpfError> {
@@ -163,8 +236,8 @@ impl<C: ContextObject, const SUBOP: u8> BuiltinFunctionDefinition<C> for Intrins
                     vm.context().consume(used_cus);
                 }
                 let vector_base = vm.simd_vector_base;
-                vm.program_result = match execute(SUBOP, [a, b, c, d, e], vector_base, vm.memory()) {
-                    Ok(()) => ProgramResult::Ok(0),
+                vm.program_result = match execute(SUBOP, WIDE, [a, b, c, d, e], vector_base, vm.memory()) {
+                    Ok(value) => ProgramResult::Ok(value),
                     Err(err) => ProgramResult::Err(err),
                 };
                 if enable_insn_meter {
@@ -176,7 +249,7 @@ impl<C: ContextObject, const SUBOP: u8> BuiltinFunctionDefinition<C> for Intrins
 
     fn codegen(jit: &mut JitCompiler<C>) {
         #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
-        jit.emit_simd_intrinsic(SUBOP, <Self as BuiltinFunctionDefinition<C>>::vm);
+        jit.emit_simd_intrinsic(SUBOP, WIDE, <Self as BuiltinFunctionDefinition<C>>::vm);
         #[cfg(not(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64")))]
         jit.emit_external_call(<Self as BuiltinFunctionDefinition<C>>::vm);
     }
@@ -185,10 +258,13 @@ impl<C: ContextObject, const SUBOP: u8> BuiltinFunctionDefinition<C> for Intrins
 /// Registers all vector operations with the loader
 pub fn register<C: ContextObject>(loader: &mut BuiltinProgram<C>) -> Result<(), ElfError> {
     macro_rules! register {
-        ($($subop:literal),*) => {
-            $(loader.register_definition::<Intrinsic<$subop>>(NAMES[$subop])?;)*
+        ($wide:literal: $($subop:literal),*) => {
+            $(loader.register_definition::<Intrinsic<$subop, $wide>>(name($subop, $wide).unwrap())?;)*
         };
     }
-    register!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29);
+    register!(false: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29, 30, 31, 32, 33, 34);
+    register!(true: 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+        32, 33, 34);
     Ok(())
 }

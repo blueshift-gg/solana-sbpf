@@ -413,8 +413,8 @@ impl Verifier for RequisiteVerifier {
                     if crate::simd::VecInsn::decode(&insn).is_none() {
                         return Err(VerifierError::UnknownOpCode(insn.opc, insn_ptr));
                     }
-                    // `dst` is only ever read (vector file base in memory mode)
-                    store = true;
+                    // `dst` is only written by vext64 / vmovmsk8 (and must be 0 otherwise)
+                    store = !crate::simd::writes_dst(crate::simd::VecInsn::decode(&insn).unwrap().subop);
                 },
 
                 _                => {

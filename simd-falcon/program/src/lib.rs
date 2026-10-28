@@ -1,6 +1,9 @@
 //! Falcon-512 verification (compressed signatures, compile time prepared pubkey) using vector
 //! intrinsics for SHAKE-256, the NTT, the pointwise product and the norm. Same instruction format and
 //! entrypoint as blueshift-gg/solana-falcon512's example program.
+//!
+//! The vector file is private to the VM: the scalar code exchanges data with it through buffers in
+//! guest memory and bulk `load` / `store` (up to 32 slots per call).
 
 #![no_std]
 
@@ -11,12 +14,11 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/vector_core.rs"));
 }
 
+const N: usize = 512;
 const SIG_LEN: usize = 666;
 const NONCE_LEN: usize = 40;
 const L2_BOUND: u64 = 34_034_726;
 const SIG_HEADER: u8 = 0x39;
-/// Host view of the vector region (slot n at REGION + 32 n)
-const REGION: u64 = 0x6_0000_0000;
 const ERR_INVALID_DATA: u64 = 0x0000_0003_0000_0000;
 const ERR_VERIFY_FAILED: u64 = 3;
 
@@ -26,27 +28,33 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-fn slot_ptr(slot: usize) -> *mut u32 {
-    (REGION + 32 * slot as u64) as *mut u32
+/// Rows of 8 u32 lanes, the memory image of consecutive slots
+type Rows<const R: usize> = [[u32; 8]; R];
+
+/// The Keccak state lives in the vector file (see build.rs), the absorb input and the squeezed
+/// words go through these buffers
+struct VectorSponge<'a> {
+    /// Absorb buffer rows (E rows 0..4, O rows 0..4), slots K_IN_E..K_IN_E + 8
+    input: Rows<8>,
+    /// Squeezed words, slots K_OUT_L..K_OUT_L + 8
+    output: Rows<8>,
+    /// hash_to_point candidates (u16 < 5q)
+    candidates: &'a mut Candidates,
 }
 
-fn lane_sum(slot: usize) -> u64 {
-    (0..8).map(|i| unsafe { slot_ptr(slot).add(i).read_volatile() } as u64).sum()
-}
+/// 512 candidates and the up to 68 values a block may write past them
+#[repr(align(32))]
+struct Candidates([u16; N + 68]);
 
-/// The Keccak state in the vector region, see build.rs
-struct VectorSponge;
-
-impl shake::Sponge for VectorSponge {
+impl shake::Sponge for VectorSponge<'_> {
     #[inline(always)]
     fn set_input(&mut self, lane: usize, even: u32, odd: u32) {
-        unsafe {
-            slot_ptr(generated::K_IN_E + lane / 5).add(lane % 5).write_volatile(even);
-            slot_ptr(generated::K_IN_O + lane / 5).add(lane % 5).write_volatile(odd);
-        }
+        self.input[lane / 5][lane % 5] = even;
+        self.input[4 + lane / 5][lane % 5] = odd;
     }
     #[inline(always)]
     fn absorb_permute(&mut self) {
+        iv::load(generated::K_IN_E, 8, self.input.as_ptr().cast());
         generated::keccak_absorb();
         generated::keccak_f();
     }
@@ -57,14 +65,13 @@ impl shake::Sponge for VectorSponge {
     #[inline(always)]
     fn squeeze(&mut self) {
         generated::keccak_squeeze();
+        iv::store(self.output.as_mut_ptr().cast(), generated::K_OUT_L, 8);
     }
     #[inline(always)]
     fn take(&mut self, n: usize) -> usize {
-        // The candidates may run up to 68 values past the 512 of C, into slots which the vector code
-        // initializes before reading (see build.rs)
         unsafe {
-            let start = slot_ptr(generated::C_SLOT) as *mut u16;
-            generated::take_candidates(start.add(n)).offset_from(start) as usize
+            let start = self.candidates.0.as_mut_ptr();
+            generated::take_candidates(self.output.as_ptr().cast(), start.add(n)).offset_from(start) as usize
         }
     }
 }
@@ -76,14 +83,21 @@ fn verify(sig: &[u8; SIG_LEN], message: &[u8]) -> bool {
     }
     let nonce = &sig[1..1 + NONCE_LEN];
     let comp: &[u8; codec::COMP_LEN] = sig[1 + NONCE_LEN..].try_into().unwrap();
-    // SHAKE-256 first: its state lives in the slots the polynomial uses afterwards
+    // SHAKE-256 first: its state lives in the slots the polynomial uses afterwards. The candidates
+    // and then s2 share one buffer.
+    let mut buffer = Candidates([0; N + 68]);
     generated::keccak_init();
-    shake::hash_to_point(&mut VectorSponge, nonce, message);
-    if !codec::decompress_signature(comp, slot_ptr(generated::P_SLOT) as *mut u16) {
+    let mut sponge = VectorSponge { input: [[0; 8]; 8], output: [[0; 8]; 8], candidates: &mut buffer };
+    shake::hash_to_point(&mut sponge, nonce, message);
+    iv::load(generated::C_SLOT, 32, buffer.0.as_ptr().cast());
+    if !codec::decompress_signature(comp, buffer.0.as_mut_ptr()) {
         return false;
     }
+    iv::load(generated::P_SLOT, 32, buffer.0.as_ptr().cast());
     generated::vector_core();
-    lane_sum(generated::ACC1) + lane_sum(generated::ACC2) <= L2_BOUND
+    let mut acc: Rows<2> = [[0; 8]; 2];
+    iv::store(acc.as_mut_ptr().cast(), generated::ACC1, 2);
+    acc.iter().flatten().map(|x| *x as u64).sum::<u64>() <= L2_BOUND
 }
 
 /// Instruction data: `[signature (666 bytes)][message]`, no accounts

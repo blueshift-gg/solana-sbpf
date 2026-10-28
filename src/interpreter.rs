@@ -624,8 +624,13 @@ impl<'a, 'b, 'c, C: ContextObject> Interpreter<'a, 'b, 'c, C> {
                     throw_error!(self, EbpfError::UnsupportedInstruction);
                 };
                 let vector_base = self.vm.simd_vector_base;
-                if let Err(err) = crate::simd::interpret(&op, &self.reg, vector_base, self.vm.memory()) {
-                    throw_error!(self, err);
+                match crate::simd::interpret(&op, &self.reg, vector_base, self.vm.memory()) {
+                    Ok(value) => {
+                        if crate::simd::writes_dst(op.subop) {
+                            self.reg[op.dst as usize] = value;
+                        }
+                    }
+                    Err(err) => throw_error!(self, err),
                 }
             }
             _ => throw_error!(self, EbpfError::UnsupportedInstruction),

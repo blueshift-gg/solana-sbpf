@@ -50,17 +50,13 @@ pub const MM_HEAP_START: u64 = MM_REGION_SIZE * 3;
 /// Virtual address of the input region
 pub const MM_INPUT_START: u64 = MM_REGION_SIZE * 4;
 
-/// Region `0x5 << 32` is reserved for a separate static-sysvars proposal.
-/// Virtual address of the experimental vector register region
-#[cfg(feature = "simd-experiment")]
-pub const MM_VECTOR_START: u64 = MM_REGION_SIZE * 6;
 /// Width of one virtual vector slot in bytes (256 bit)
 #[cfg(feature = "simd-experiment")]
 pub const VECTOR_WIDTH: usize = 32;
 /// Number of virtual vector slots
 #[cfg(feature = "simd-experiment")]
 pub const VECTOR_SLOTS: usize = 256;
-/// Size of the vector region in bytes
+/// Size of the vector file in bytes (private VM state, not mapped)
 #[cfg(feature = "simd-experiment")]
 pub const VECTOR_MEMORY_SIZE: usize = VECTOR_WIDTH * VECTOR_SLOTS;
 /// Experimental vector operation (ALU64 class, otherwise unused operation 0xe0).
