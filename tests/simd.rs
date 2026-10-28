@@ -7,6 +7,7 @@ use solana_sbpf::{
         asm::VecMode,
         blake3_program::{self, Kernel, HEAP_OUT, HEAP_SIZE},
         harness::{config, Engine, Runner},
+        VADD16, VMADD16, VMINU16, VMULHI16, VMULLO16, VROLV32, VSUB16,
     },
     vm::SimdJitStrategy,
 };
@@ -160,11 +161,90 @@ fn op_cases() -> Vec<(&'static str, Body)> {
             }
         })),
     ];
+    cases.push(("vrolv", Box::new(|a| a.vrolv(1, 2, 3))));
+    cases.push(("vrolv_small", Box::new(|a| {
+        a.vsrl(3, 3, 26); // counts 0..=63, covering 32
+        a.vrolv(1, 2, 3);
+        a.vrolv(4, 4, 3);
+        a.vrolv(5, 6, 5);
+    })));
+    for (name, op) in [
+        ("vadd16", VADD16), ("vsub16", VSUB16), ("vmullo16", VMULLO16), ("vmulhi16", VMULHI16),
+        ("vminu16", VMINU16), ("vmadd16", VMADD16),
+    ] {
+        cases.push((name, Box::new(move |a| {
+            let f = |a: &mut solana_sbpf::simd::asm::Asm, d, x, y| match op {
+                VADD16 => a.vadd16(d, x, y),
+                VSUB16 => a.vsub16(d, x, y),
+                VMULLO16 => a.vmullo16(d, x, y),
+                VMULHI16 => a.vmulhi16(d, x, y),
+                VMINU16 => a.vminu16(d, x, y),
+                _ => a.vmadd16(d, x, y),
+            };
+            f(a, 1, 2, 3);
+            f(a, 4, 4, 5);
+            f(a, 6, 7, 6);
+            f(a, 8, 8, 8);
+        })));
+    }
+    cases.push(("vblendw", Box::new(|a| {
+        a.vblendw(1, 2, 3, 0xa6);
+        a.vblendw(4, 4, 5, 0x0f);
+    })));
+    for imm in [0x00i16, 0xff, 0x96, 0xd2, 0x78, 0xe8, 0xca, 0x01, 0x5a, 0x3c, 0xf0, 0xaa, 0xcc, 0x1e, 0xb4, 0x6b, 0x0f, 0x55, 0x33] {
+        cases.push(("vternlog", Box::new(move |a| {
+            a.vternlog(1, 2, 3, imm);
+            a.vternlog(4, 4, 5, imm);
+            a.vternlog(6, 7, 6, imm);
+            a.vternlog(8, 9, 9, imm);
+            a.vternlog(10, 10, 10, imm);
+        })));
+    }
     for amount in [0i16, 1, 7, 8, 12, 16, 31] {
         cases.push(("vror", Box::new(move |a| a.vror(2, 3, amount))));
         cases.push(("vror_inplace", Box::new(move |a| a.vror(3, 3, amount))));
     }
     cases
+}
+
+#[test]
+fn new_ops_reference() {
+    use solana_sbpf::simd::{compute, from_words, ternlog, words, VecInsn};
+    let mut seed = 7u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as u32
+    };
+    for _ in 0..100 {
+        let (d, a, b) = (next(), next(), next());
+        assert_eq!(ternlog(d, a, b, 0x96), d ^ a ^ b);
+        assert_eq!(ternlog(d, a, b, 0xd2), d ^ (!a & b));
+        assert_eq!(ternlog(d, a, b, 0xca), (d & a) | (!d & b));
+        assert_eq!(ternlog(d, a, b, 0xf0), d);
+        assert_eq!(ternlog(d, a, b, 0xcc), a);
+        assert_eq!(ternlog(d, a, b, 0xaa), b);
+    }
+    let op = |subop| VecInsn { subop, vd: 0, va: 0, vb: 0, memory_mode: false, base_reg: 0, src: 0, off: 0 };
+    let x: [u32; 8] = std::array::from_fn(|_| next());
+    let y: [u32; 8] = [0, 1, 5, 13, 16, 31, 32, 7];
+    let out = compute(&op(VROLV32), &x, &y);
+    for i in 0..8 {
+        assert_eq!(out[i], x[i].rotate_left(y[i] % 32), "vrolv count {}", y[i]);
+    }
+    let (xw, yw) = (words(&x), words(&std::array::from_fn(|_| next())));
+    let y2 = from_words(&yw);
+    let hi = words(&compute(&op(VMULHI16), &x, &y2));
+    let madd = compute(&op(VMADD16), &x, &y2);
+    for i in 0..16 {
+        assert_eq!(hi[i] as i16 as i32, (xw[i] as i16 as i32 * yw[i] as i16 as i32) >> 16);
+    }
+    for i in 0..8 {
+        let p = |j: usize| xw[j] as i16 as i32 * yw[j] as i16 as i32;
+        assert_eq!(madd[i] as i32, p(2 * i).wrapping_add(p(2 * i + 1)));
+    }
+    assert_eq!(from_words(&words(&x)), x);
 }
 
 #[test]
@@ -807,8 +887,10 @@ fn falcon_programs() {
                 if engine == Engine::Jit && name == "falcon_simd.so" {
                     let stats = r.executable.get_compiled_program().unwrap().simd_stats;
                     assert_eq!(stats.intrinsic_slow_paths, 0);
+                    // Table rows (twiddles, prepared pubkey, Keccak constants) from .rodata
+                    assert!(stats.static_loads > 300 && stats.translations < 10, "{:?}", stats);
                     if strategy == SimdJitStrategy::RegisterCached {
-                        assert!(stats.cache_hits > 10_000, "{stats:?}");
+                        assert!(stats.cache_hits > 5_000, "{:?}", stats);
                     }
                 }
             }

@@ -47,6 +47,15 @@ pub const NAMES: [&str; SUBOP_COUNT as usize] = [
     "sol_vsllv32x8",
     "sol_vsrlv32x8",
     "sol_vandn256",
+    "sol_vrolv32x8",
+    "sol_vternlog256",
+    "sol_vadd16x16",
+    "sol_vsub16x16",
+    "sol_vmullo16x16",
+    "sol_vmulhi16x16",
+    "sol_vminu16x16",
+    "sol_vmadd16x16",
+    "sol_vblendw",
 ];
 
 /// Register holding the packed operands
@@ -79,7 +88,8 @@ pub fn hashes() -> [u32; SUBOP_COUNT as usize] {
 /// two sources            bits 0..7 vd   bits 8..15 va   bits 16..23 vb
 /// one source + imm8      bits 0..7 vd   bits 8..15 va   bits 16..23 imm8   (vror, vshufd, vsrl, vsll)
 /// vmov256                bits 0..7 vd   bits 8..15 va
-/// vblendd                bits 0..6 vd   bits 7..13 va   bits 14..20 vb   bits 21..28 imm8 (slots < 128)
+/// vblendd / vblendw /    bits 0..6 vd   bits 7..13 va   bits 14..20 vb   bits 21..28 imm8 (slots < 128)
+/// vternlog
 /// ```
 pub fn pack(op: &VecInsn) -> u64 {
     let (vd, va, vb, imm) = (op.vd as u64, op.va as u64, op.vb as u64, op.off as u16 as u64);
@@ -88,7 +98,7 @@ pub fn pack(op: &VecInsn) -> u64 {
         VSTORE => va | imm << 8,
         VBCAST32 | VTRANSPOSE8 => vd,
         VROR32 | VSHUFD | VSRL32 | VSLL32 => vd | va << 8 | (imm & 0xff) << 16,
-        VBLENDD => (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21,
+        VBLENDD | VBLENDW | VTERNLOG => (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21,
         VMOV => vd | va << 8,
         _ => vd | va << 8 | vb << 16,
     }
@@ -106,7 +116,7 @@ pub fn unpack(subop: u8, packed: u64) -> Option<VecInsn> {
         VSTORE => (va, off) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16),
         VBCAST32 | VTRANSPOSE8 => vd = byte(0),
         VROR32 | VSHUFD | VSRL32 | VSLL32 => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
-        VBLENDD => {
+        VBLENDD | VBLENDW | VTERNLOG => {
             let field = |shift: u32| ((packed >> shift) & 0x7f) as u8;
             (vd, va, vb, off) = (field(0), field(7), field(14), byte(21) as i16);
         }
@@ -179,6 +189,6 @@ pub fn register<C: ContextObject>(loader: &mut BuiltinProgram<C>) -> Result<(), 
             $(loader.register_definition::<Intrinsic<$subop>>(NAMES[$subop])?;)*
         };
     }
-    register!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20);
+    register!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29);
     Ok(())
 }

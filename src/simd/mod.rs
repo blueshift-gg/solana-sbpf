@@ -79,8 +79,30 @@ pub const VSLLV32: u8 = 0x12;
 pub const VSRLV32: u8 = 0x13;
 /// `v[vd] = !v[va] & v[vb]` (vpandn)
 pub const VANDN: u8 = 0x14;
+/// `v[vd][i] = v[va][i] << v[vb][i] | v[va][i] >> (32 - v[vb][i])` (variable rotate left for
+/// counts in 0..=32, shifts follow vpsllvd / vpsrlvd for other counts)
+pub const VROLV32: u8 = 0x15;
+/// `v[vd] = f(v[vd], v[va], v[vb])` bitwise, `f` given by the truth table `off` indexed by
+/// `d << 2 | a << 1 | b` (vpternlogd)
+pub const VTERNLOG: u8 = 0x16;
+/// `v[vd] = v[va] + v[vb]` (sixteen wrapping u16 additions)
+pub const VADD16: u8 = 0x17;
+/// `v[vd] = v[va] - v[vb]` (sixteen wrapping u16 subtractions)
+pub const VSUB16: u8 = 0x18;
+/// `v[vd] = v[va] * v[vb]` (low 16 bits of sixteen products, vpmullw)
+pub const VMULLO16: u8 = 0x19;
+/// `v[vd] = (v[va] * v[vb]) >> 16` (high 16 bits of sixteen signed i16 products, vpmulhw)
+pub const VMULHI16: u8 = 0x1a;
+/// `v[vd] = min(v[va], v[vb])` (sixteen unsigned u16 minimums, vpminuw)
+pub const VMINU16: u8 = 0x1b;
+/// `v[vd][i] = a[2i] * b[2i] + a[2i + 1] * b[2i + 1]` (signed i16 products summed into eight
+/// wrapping i32 lanes, vpmaddwd)
+pub const VMADD16: u8 = 0x1c;
+/// `v[vd][i] = if (off >> (i % 8)) & 1 != 0 { v[vb][i] } else { v[va][i] }` for the sixteen u16
+/// lanes (vpblendw)
+pub const VBLENDW: u8 = 0x1d;
 /// Number of defined sub-operations
-pub const SUBOP_COUNT: u8 = 0x15;
+pub const SUBOP_COUNT: u8 = 0x1e;
 
 /// Memory mode flag in the immediate
 pub const MEMORY_MODE: u32 = 1 << 24;
@@ -121,7 +143,7 @@ pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
     let off_ok = match op.subop {
         VLOAD | VSTORE => true,
         VROR32 | VSRL32 | VSLL32 => (0..32).contains(&op.off),
-        VSHUFD | VBLENDD => (0..256).contains(&op.off),
+        VSHUFD | VBLENDD | VTERNLOG | VBLENDW => (0..256).contains(&op.off),
         _ => op.off == 0,
     };
     if !off_ok || (op.subop == VTRANSPOSE8 && op.vd as usize > ebpf::VECTOR_SLOTS - 8) {
@@ -184,7 +206,8 @@ impl VecInsn {
         match self.subop {
             VLOAD => ([Scalar(AccessType::Load), Slot(self.vd, AccessType::Store), none], 2),
             VSTORE => ([Slot(self.va, AccessType::Load), Scalar(AccessType::Store), none], 2),
-            VADD32 | VXOR | VAND | VOR | VPERMD | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN => (
+            VADD32 | VXOR | VAND | VOR | VPERMD | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN
+            | VROLV32 | VTERNLOG | VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDW => (
                 [
                     Slot(self.va, AccessType::Load),
                     Slot(self.vb, AccessType::Load),
@@ -389,10 +412,53 @@ pub fn compute(op: &VecInsn, a: &Lanes, b: &Lanes) -> Lanes {
         VSLLV32 => (0..8).for_each(|i| out[i] = if b[i] > 31 { 0 } else { a[i] << b[i] }),
         VSRLV32 => (0..8).for_each(|i| out[i] = if b[i] > 31 { 0 } else { a[i] >> b[i] }),
         VANDN => (0..8).for_each(|i| out[i] = !a[i] & b[i]),
+        VROLV32 => (0..8).for_each(|i| {
+            let shl = |x: u32, n: u32| if n > 31 { 0 } else { x << n };
+            let shr = |x: u32, n: u32| if n > 31 { 0 } else { x >> n };
+            out[i] = shl(a[i], b[i]) | shr(a[i], 32u32.wrapping_sub(b[i]));
+        }),
+        VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VBLENDW => {
+            let (a, b) = (words(a), words(b));
+            let mut w = [0u16; 16];
+            for i in 0..16 {
+                w[i] = match op.subop {
+                    VADD16 => a[i].wrapping_add(b[i]),
+                    VSUB16 => a[i].wrapping_sub(b[i]),
+                    VMULLO16 => a[i].wrapping_mul(b[i]),
+                    VMULHI16 => ((a[i] as i16 as i32 * b[i] as i16 as i32) >> 16) as u16,
+                    VMINU16 => a[i].min(b[i]),
+                    _ => if (op.off >> (i % 8)) & 1 != 0 { b[i] } else { a[i] },
+                };
+            }
+            out = from_words(&w);
+        }
+        VMADD16 => {
+            let (a, b) = (words(a), words(b));
+            let p = |i: usize| a[i] as i16 as i32 * b[i] as i16 as i32;
+            (0..8).for_each(|i| out[i] = p(2 * i).wrapping_add(p(2 * i + 1)) as u32);
+        }
         VMOV | VLOAD | VSTORE => {}
         _ => unreachable!(),
     }
     out
+}
+
+/// The sixteen u16 lanes of a vector
+pub fn words(x: &Lanes) -> [u16; 16] {
+    std::array::from_fn(|i| (x[i / 2] >> (16 * (i % 2))) as u16)
+}
+
+/// Inverse of [words]
+pub fn from_words(w: &[u16; 16]) -> Lanes {
+    std::array::from_fn(|i| w[2 * i] as u32 | (w[2 * i + 1] as u32) << 16)
+}
+
+/// `f(d, a, b)` bitwise for the truth table `imm` (vpternlogd)
+pub fn ternlog(d: u32, a: u32, b: u32, imm: u8) -> u32 {
+    let pick = |x: u32, set: bool| if set { x } else { !x };
+    (0..8u32).filter(|i| (imm >> i) & 1 != 0).fold(0, |r, i| {
+        r | (pick(d, i & 4 != 0) & pick(a, i & 2 != 0) & pick(b, i & 1 != 0))
+    })
 }
 
 /// Transposes an 8x8 matrix of u32
@@ -462,10 +528,17 @@ pub fn interpret(
             }
         }
         VBCAST32 => write_lanes(host[0], &[reg[op.src as usize] as u32; 8]),
-        VADD32 | VXOR | VAND | VOR | VPERMD | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN => {
+        VADD32 | VXOR | VAND | VOR | VPERMD | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN
+            | VROLV32 | VTERNLOG | VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDW => {
             let a = read_lanes(host[0]);
             let b = read_lanes(host[1]);
-            write_lanes(host[2], &compute(op, &a, &b));
+            if op.subop == VTERNLOG {
+                let d = read_lanes(host[2]);
+                let out: Lanes = std::array::from_fn(|i| ternlog(d[i], a[i], b[i], op.off as u8));
+                write_lanes(host[2], &out);
+            } else {
+                write_lanes(host[2], &compute(op, &a, &b));
+            }
         }
         _ => {
             // VLOAD, VSTORE, VROR32, VSHUFD, VMOV
@@ -512,6 +585,15 @@ pub fn disassemble(insn: &ebpf::Insn) -> String {
         VSLLV32 => format!("vsllv32x8 {vd}, {va}, {vb}"),
         VSRLV32 => format!("vsrlv32x8 {vd}, {va}, {vb}"),
         VANDN => format!("vandn256 {vd}, {va}, {vb}"),
+        VROLV32 => format!("vrolv32x8 {vd}, {va}, {vb}"),
+        VTERNLOG => format!("vternlog {vd}, {va}, {vb}, {:#x}", op.off),
+        VADD16 => format!("vadd16x16 {vd}, {va}, {vb}"),
+        VSUB16 => format!("vsub16x16 {vd}, {va}, {vb}"),
+        VMULLO16 => format!("vmullo16x16 {vd}, {va}, {vb}"),
+        VMULHI16 => format!("vmulhi16x16 {vd}, {va}, {vb}"),
+        VMINU16 => format!("vminu16x16 {vd}, {va}, {vb}"),
+        VMADD16 => format!("vmadd16x16 {vd}, {va}, {vb}"),
+        VBLENDW => format!("vblendw {vd}, {va}, {vb}, {:#x}", op.off),
         _ => unreachable!(),
     }
 }

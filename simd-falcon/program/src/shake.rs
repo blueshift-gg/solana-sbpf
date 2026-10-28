@@ -13,15 +13,14 @@ pub trait Sponge {
     fn permute(&mut self);
     /// Converts the rate lanes into standard (non interleaved) 32 bit words
     fn squeeze(&mut self);
-    /// Bits 0..32 (`hi == false`) or 32..64 of rate lane `lane`, after [Sponge::squeeze]
-    fn out_word(&self, lane: usize, hi: bool) -> u32;
-    /// Stores hash_to_point candidate `i`
-    fn put_candidate(&mut self, i: usize, value: u32);
+    /// Appends the accepted samples of the squeezed block (the 68 big-endian 16 bit words of the
+    /// rate, in order, kept if below 5Q) after the first `n` candidates, returns the new count.
+    /// May write up to 68 values past the last accepted one.
+    fn take(&mut self, n: usize) -> usize;
 }
 
 pub const RATE_LANES: usize = 17;
 const RATE: usize = 8 * RATE_LANES;
-const FALCON_Q: u32 = 12289;
 const FALCON_N: usize = 512;
 
 /// Splits a lane into its even bits and its odd bits (64 bit unshuffle)
@@ -99,20 +98,9 @@ pub fn hash_to_point<S: Sponge>(s: &mut S, nonce: &[u8], message: &[u8]) {
     let mut n = 0;
     loop {
         s.squeeze();
-        for lane in 0..RATE_LANES {
-            let words = [s.out_word(lane, false), s.out_word(lane, true)];
-            for word in words {
-                for half in [word & 0xffff, word >> 16] {
-                    let candidate = ((half & 0xff) << 8) | (half >> 8);
-                    if candidate < 5 * FALCON_Q {
-                        s.put_candidate(n, candidate);
-                        n += 1;
-                        if n == FALCON_N {
-                            return;
-                        }
-                    }
-                }
-            }
+        n = s.take(n);
+        if n >= FALCON_N {
+            return;
         }
         s.permute();
     }

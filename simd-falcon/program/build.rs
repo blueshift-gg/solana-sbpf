@@ -1,12 +1,16 @@
 //! Generates the vectorized part of the Falcon-512 verifier.
 //!
 //! Firedancer's algorithm (fd_falcon.c, branch drubin/falcon-syscall): a Cooley-Tukey forward NTT
-//! and a Gentleman-Sande inverse NTT over Z/12289 with lazy reduction in 32 bit lanes, a pointwise
-//! product, and the squared norm. Two adaptations for the vector intrinsics (AVX2, 8 x u32):
-//! - Twiddle products use Montgomery reduction (R = 2^16) with 32 bit multiplies only, instead of
-//!   the Barrett reduction with 64 bit multiplies of the AVX-512 code.
-//! - The last three forward levels (and the first three inverse levels) operate on transposed
-//!   8 x 8 tiles, so every butterfly stays between whole vectors.
+//! and a Gentleman-Sande inverse NTT over Z/12289, a pointwise product with the (here compile time)
+//! NTT of the public key, and the squared norm of (c - s2 * h, s2). Adapted to the vector
+//! intrinsics the way current AVX2 NTTs (Kyber, Dilithium) are written:
+//! - 16 signed 16 bit coefficients per vector, Montgomery products with R = 2^16 from 16 bit
+//!   multiplies: `mulhi(a, w) - mulhi(mullo(a, w * q^-1), q)`, 4 ops for 16 products.
+//! - Lazy reduction: the generator tracks a bound of every slot and reduces (a Montgomery product
+//!   by R mod q) only where the next butterfly could overflow 16 bits.
+//! - The last forward (first inverse) levels: levels 8, 4 and 2 between whole vectors after an
+//!   8 x 8 transpose of u32 lanes (pairs of coefficients), level 1 between the two halves of a
+//!   u32 with a 16 bit rotation and a word blend.
 //!
 //! The vector code must address slots with compile time constants for the JIT to lower each
 //! intrinsic call inline, so all of it is emitted as straight-line code. The generated op stream is
@@ -16,25 +20,25 @@ use std::fmt::Write;
 
 const Q: u32 = 12289;
 const N: usize = 512;
-const R_LOG: u32 = 16;
+const QI: i64 = Q as i64;
 
-// Slots (8 x u32 each) of the vector region
-const P: u8 = 0; // working polynomial (s2, NTT, product, m), 64 slots
-const C: u8 = 64; // hash_to_point candidates, 64 slots
-const Q1: u8 = 128;
-const Q2: u8 = 129;
-const Q4: u8 = 130;
-const Q8: u8 = 131;
-const MASK: u8 = 132;
-const QINV: u8 = 133;
-const TW: u8 = 134;
-const TWV: u8 = 135;
-const T0: u8 = 136;
-const T1: u8 = 137;
-const T2: u8 = 138;
-const T3: u8 = 139;
-const ACC1: u8 = 140;
-const ACC2: u8 = 141;
+// Slots of the vector region (16 coefficients each)
+const P: u8 = 0; // working polynomial (s2, NTT, product, m), 32 slots
+const C: u8 = 64; // hash_to_point candidates (u16 < 5Q), 32 slots, up to 68 values of overrun
+const C_OVERRUN_END: u8 = 101;
+const QV: u8 = 104; // q in every word
+const Q2V: u8 = 105;
+const Q4V: u8 = 106;
+const ONE: u8 = 107; // R mod q (Montgomery one) and its q^-1 multiple
+const ONE_P: u8 = 108;
+const TW: u8 = 109; // twiddle and its q^-1 multiple
+const TW_P: u8 = 110;
+const T0: u8 = 111;
+const T1: u8 = 112;
+const T2: u8 = 113;
+const ACC1: u8 = 114; // ||s1||^2 partial sums (u32 lanes)
+const ACC2: u8 = 115; // ||s2||^2
+const I16_MAX: i64 = i16::MAX as i64;
 
 fn pow_mod(mut b: u64, mut e: u64, m: u64) -> u64 {
     let mut r = 1;
@@ -70,10 +74,6 @@ fn twiddles() -> ([u32; N], [u32; N]) {
     (powers(psi), powers(psi_inv))
 }
 
-fn to_mont(x: u32) -> u32 {
-    (((x as u64) << R_LOG) % Q as u64) as u32
-}
-
 /// Reference forward NTT, Firedancer's loop structure with exact reduction
 fn ntt_ref(a: &mut [u32; N], psi_pos: &[u32; N]) {
     let (mut t, mut m) = (N, 1);
@@ -95,30 +95,71 @@ fn ntt_ref(a: &mut [u32; N], psi_pos: &[u32; N]) {
 #[derive(Clone, Copy, Debug)]
 enum Op {
     Add(u8, u8, u8),
-    Sub(u8, u8, u8),
-    Mullo(u8, u8, u8),
-    Minu(u8, u8, u8),
-    And(u8, u8, u8),
     Srl(u8, u8, u8),
     Mov(u8, u8),
     Bcast(u8, u32),
     Transpose(u8),
     Xor(u8, u8, u8),
-    Or(u8, u8, u8),
-    Andn(u8, u8, u8),
     /// (dst, data, indices)
     Permd(u8, u8, u8),
     Ror(u8, u8, u8),
     Sll(u8, u8, u8),
-    Sllv(u8, u8, u8),
-    Srlv(u8, u8, u8),
     Blend(u8, u8, u8, u8),
+    Rolv(u8, u8, u8),
+    /// d = f(d, a, b) for the truth table imm
+    Tern(u8, u8, u8, u8),
+    Add16(u8, u8, u8),
+    Sub16(u8, u8, u8),
+    Mullo16(u8, u8, u8),
+    Mulhi16(u8, u8, u8),
+    Minu16(u8, u8, u8),
+    Madd16(u8, u8, u8),
+    Blendw(u8, u8, u8, u8),
     /// Load a generated table row: (slot, table, row)
     Load(u8, &'static str, usize),
 }
 
+
+type Tables = std::collections::BTreeMap<&'static str, Vec<[u32; 8]>>;
+
+/// q^-1 mod 2^16
+fn qinv() -> i64 {
+    (1..1i64 << 16).find(|x| (x * QI) & 0xffff == 1).unwrap()
+}
+
+/// Montgomery form of `x` (x * 2^16 mod q) centered in (-q/2, q/2]
+fn mont_centered(x: i64) -> i64 {
+    let m = (x.rem_euclid(QI) << 16) % QI;
+    if m > QI / 2 { m - QI } else { m }
+}
+
+/// The q^-1 multiple of a Montgomery constant, as the i16 bit pattern
+fn mont_prime(w: i64) -> i64 {
+    ((w * qinv()) & 0xffff) as i16 as i64
+}
+
+fn pair(lo: i64, hi: i64) -> u32 {
+    (lo as u16 as u32) | (hi as u16 as u32) << 16
+}
+
+/// Bound of |mont(a, w)| for |a| <= a_bound: |a w| / 2^16 + 1 (floor) + 2^15 q / 2^16 (rounded up)
+fn mont_bound(a_bound: i64, w_abs: i64) -> i64 {
+    assert!(a_bound <= I16_MAX && w_abs <= QI / 2 + 1);
+    a_bound * w_abs / 65536 + 1 + 6145
+}
+
+/// Coefficient index -> (slot, word) after the transposes (layout of the last levels)
+fn transposed_pos(j: usize) -> (usize, usize) {
+    let (t, r, c, h) = (j / 128, (j / 16) % 8, (j / 2) % 8, j % 2);
+    (8 * t + c, 2 * r + h)
+}
+
 struct Gen {
     ops: Vec<Op>,
+    bound: [i64; 256],
+    /// (ops executed, slot, bound) for the simulation to check
+    checks: Vec<(usize, u8, i64)>,
+    tables: std::collections::BTreeMap<&'static str, Vec<[u32; 8]>>,
 }
 
 impl Gen {
@@ -126,201 +167,247 @@ impl Gen {
         self.ops.push(op);
     }
 
-    fn q_slot(k: u32) -> u8 {
-        match k {
-            1 => Q1,
-            2 => Q2,
-            4 => Q4,
-            8 => Q8,
-            _ => unreachable!(),
+    fn set_bound(&mut self, slot: u8, bound: i64) {
+        self.bound[slot as usize] = bound;
+        self.checks.push((self.ops.len(), slot, bound));
+    }
+
+    /// Loads a table row (appended to `table`) into `slot`
+    fn row(&mut self, slot: u8, table: &'static str, row: [u32; 8]) {
+        let rows = self.tables.entry(table).or_default();
+        rows.push(row);
+        let index = rows.len() - 1;
+        self.op(Op::Load(slot, table, index));
+    }
+
+    /// Twiddle slots for per word Montgomery constants `w` (bound returned)
+    fn twiddle_rows(&mut self, table: &'static str, w: [i64; 16]) -> i64 {
+        let row = |f: &dyn Fn(i64) -> i64| -> [u32; 8] { std::array::from_fn(|i| pair(f(w[2 * i]), f(w[2 * i + 1]))) };
+        let (plain, prime) = (row(&|x| x), row(&mont_prime));
+        self.row(TW, table, plain);
+        self.row(TW_P, table, prime);
+        w.iter().map(|x| x.abs()).max().unwrap()
+    }
+
+    /// Broadcast twiddle (bound returned)
+    fn twiddle_bcast(&mut self, w: i64) -> i64 {
+        self.op(Op::Bcast(TW, pair(w, w)));
+        self.op(Op::Bcast(TW_P, pair(mont_prime(w), mont_prime(w))));
+        w.abs()
+    }
+
+    /// dst = mont(a, W) (dst may be a)
+    fn mont(&mut self, dst: u8, a: u8, w: u8, w_p: u8, w_abs: i64) {
+        self.op(Op::Mullo16(T0, a, w_p));
+        self.op(Op::Mulhi16(T1, a, w));
+        self.op(Op::Mulhi16(T0, T0, QV));
+        self.op(Op::Sub16(dst, T1, T0));
+        self.set_bound(dst, mont_bound(self.bound[a as usize], w_abs));
+    }
+
+    /// Transposes a tile of 8 slots: every slot may now hold values of any slot of the tile
+    fn transpose(&mut self, tile: u8) {
+        self.op(Op::Transpose(tile));
+        let max = (tile..tile + 8).map(|s| self.bound[s as usize]).max().unwrap();
+        for s in tile..tile + 8 {
+            self.set_bound(s, max);
         }
     }
 
-    /// dst = src reduced from [0, bound) to [0, Q) with conditional subtractions
-    /// (`x = min(x, x - kQ)`, the wrap-around makes the subtraction a no-op below kQ)
-    fn reduce(&mut self, dst: u8, src: u8, mut bound: u64) {
-        let mut cur = src;
-        for k in [8u32, 4, 2, 1] {
-            let kq = k as u64 * Q as u64;
-            if bound > kq {
-                self.op(Op::Sub(T1, cur, Self::q_slot(k)));
-                self.op(Op::Minu(dst, cur, T1));
-                cur = dst;
-                bound = kq.max(bound - kq);
+    fn reduce(&mut self, x: u8) {
+        let one = mont_centered(1).abs();
+        self.mont(x, x, ONE, ONE_P, one);
+    }
+
+    fn reduce_if(&mut self, x: u8, limit: i64) {
+        if self.bound[x as usize] > limit {
+            self.reduce(x);
+        }
+    }
+
+    /// Cooley-Tukey: (a, b) = (a + b w, a - b w), twiddle in TW / TW_P
+    fn ct(&mut self, a: u8, b: u8, w_abs: i64) {
+        let bw = mont_bound(self.bound[b as usize], w_abs);
+        self.reduce_if(a, I16_MAX - bw);
+        assert!(self.bound[a as usize] + bw <= I16_MAX);
+        self.mont(T2, b, TW, TW_P, w_abs);
+        self.op(Op::Sub16(b, a, T2));
+        self.op(Op::Add16(a, a, T2));
+        let out = self.bound[a as usize] + bw;
+        self.set_bound(a, out);
+        self.set_bound(b, out);
+    }
+
+    /// Gentleman-Sande: (a, b) = (a + b, (a - b) w), twiddle in TW / TW_P
+    fn gs(&mut self, a: u8, b: u8, w_abs: i64) {
+        if self.bound[a as usize] + self.bound[b as usize] > I16_MAX {
+            let (big, small) = if self.bound[a as usize] >= self.bound[b as usize] { (a, b) } else { (b, a) };
+            self.reduce(big);
+            if self.bound[a as usize] + self.bound[b as usize] > I16_MAX {
+                self.reduce(small);
             }
         }
-        assert!(bound <= Q as u64);
-        if cur != dst {
-            self.op(Op::Mov(dst, cur));
+        let sum = self.bound[a as usize] + self.bound[b as usize];
+        assert!(sum <= I16_MAX);
+        self.op(Op::Sub16(T2, a, b));
+        self.op(Op::Add16(a, a, b));
+        self.set_bound(T2, sum);
+        self.mont(b, T2, TW, TW_P, w_abs);
+        self.set_bound(a, sum);
+    }
+
+    /// Level 1 on every slot (pairs inside a u32): forward (a, b) = (a + b w, a - b w),
+    /// inverse (a, b) = (a + b, (a - b) w)
+    fn level1(&mut self, slot: u8, w: [i64; 8], forward: bool) {
+        let one = mont_centered(1);
+        // Low words get the Montgomery one (a reduction), high words the twiddle
+        let words: [i64; 16] = std::array::from_fn(|i| if i % 2 == 0 { one } else { w[i / 2] });
+        let w_abs = self.twiddle_rows(if forward { "TWF1" } else { "TWI1" }, words);
+        let x = P + slot;
+        if forward {
+            // M = (a', b w), Ms = (b w, a'), out = (M + Ms, Ms - M) blended
+            self.mont(x, x, TW, TW_P, w_abs);
+            let m = self.bound[x as usize];
+            self.op(Op::Ror(T2, x, 16));
+            self.op(Op::Sub16(T1, T2, x));
+            self.op(Op::Add16(x, x, T2));
+            self.op(Op::Blendw(x, x, T1, 0xaa));
+            assert!(2 * m <= I16_MAX);
+            self.set_bound(x, 2 * m);
+        } else {
+            // Xs = (b, a), S = X + Xs = (a + b, a + b), D = Xs - X = (b - a, a - b),
+            // out = mont((S, D) blended, (one, w))
+            self.reduce_if(x, I16_MAX / 2);
+            let b = self.bound[x as usize];
+            self.op(Op::Ror(T2, x, 16));
+            self.op(Op::Sub16(T1, T2, x));
+            self.op(Op::Add16(x, x, T2));
+            self.op(Op::Blendw(x, x, T1, 0xaa));
+            self.set_bound(x, 2 * b);
+            self.mont(x, x, TW, TW_P, w_abs);
         }
-    }
-
-    /// dst = a * b * R^-1 mod Q in [0, Q), for a < a_bound and b < Q (Montgomery, R = 2^16)
-    fn mont(&mut self, dst: u8, a: u8, b: u8, a_bound: u64) {
-        let t_max = (a_bound - 1) * (Q as u64 - 1);
-        assert!(t_max + 0xffff * Q as u64 <= u32::MAX as u64, "Montgomery input overflows 32 bits");
-        self.op(Op::Mullo(T0, a, b));
-        self.op(Op::And(T1, T0, MASK));
-        self.op(Op::Mullo(T1, T1, QINV));
-        self.op(Op::And(T1, T1, MASK));
-        self.op(Op::Mullo(T1, T1, Q1));
-        self.op(Op::Add(T0, T0, T1));
-        self.op(Op::Srl(T0, T0, R_LOG as u8));
-        let u_bound = (t_max + 0xffff * Q as u64) / (1 << R_LOG) + 1;
-        self.reduce(dst, T0, u_bound);
-    }
-
-    /// Cooley-Tukey butterfly: (A, B) = (A + B*w, A - B*w + Q), inputs < bound
-    fn ct(&mut self, a: u8, b: u8, w: u8, bound: u64) {
-        self.mont(T2, b, w, bound);
-        self.op(Op::Add(b, a, Q1));
-        self.op(Op::Sub(b, b, T2));
-        self.op(Op::Add(a, a, T2));
-    }
-
-    /// Gentleman-Sande butterfly: (A, B) = (A + B, (A - B + off) * w), inputs < bound
-    fn gs(&mut self, a: u8, b: u8, w: u8, bound: u64, off_q: u32, reduce_sum: bool) {
-        assert!(off_q as u64 * Q as u64 >= bound);
-        self.op(Op::Add(T3, a, Self::q_slot(off_q)));
-        self.op(Op::Sub(T3, T3, b));
-        self.op(Op::Add(a, a, b));
-        if reduce_sum {
-            self.reduce(a, a, 2 * bound);
-        }
-        self.mont(b, T3, w, bound + off_q as u64 * Q as u64);
     }
 }
 
-/// Rows of the twiddle tables for the transposed levels (7 per 8 x 8 tile):
-/// row 0: t = 4, rows 1..3: t = 2 (g = 0, 1), rows 3..7: t = 1 (g = 0..4).
-/// Lane l of tile T belongs to block b = 8T + l (8 consecutive coefficients).
-fn tile_table(psi: &[u32; N]) -> Vec<[u32; 8]> {
-    let mut rows = Vec::new();
-    for t in 0..8 {
-        let row = |f: &dyn Fn(usize) -> usize| -> [u32; 8] { std::array::from_fn(|l| to_mont(psi[f(8 * t + l)])) };
-        rows.push(row(&|b| 64 + b));
-        for g in 0..2 {
-            rows.push(row(&|b| 128 + 2 * b + g));
-        }
-        for g in 0..4 {
-            rows.push(row(&|b| 256 + 4 * b + g));
-        }
+/// The vector core: ||s2||^2, NTT(s2), product with the prepared pubkey (table H_PREP), inverse
+/// NTT, s1 = c - s2 h, ||s1||^2. Returns the op stream and the generated tables (H_PREP rows are
+/// placeholders, filled by [prepare]).
+fn generate(psi_pos: &[u32; N], psi_neg: &[u32; N]) -> (Vec<Op>, Tables, Vec<(usize, u8, i64)>) {
+    let mut g = Gen { ops: Vec::new(), bound: [0; 256], checks: Vec::new(), tables: Default::default() };
+    let one = mont_centered(1);
+    for (slot, value) in [(QV, QI), (Q2V, 2 * QI), (Q4V, 4 * QI), (ONE, one), (ONE_P, mont_prime(one))] {
+        g.op(Op::Bcast(slot, pair(value, value)));
     }
-    rows
-}
-
-fn tile_row(tile: usize, t: usize, g: usize) -> usize {
-    tile * 7 + match t {
-        4 => 0,
-        2 => 1 + g,
-        _ => 3 + g,
+    // ||s2||^2 from the decoded (signed, |s2| < 2048) coefficients
+    for s in 0..32 {
+        g.op(Op::Madd16(T0, P + s, P + s));
+        g.op(Op::Add(ACC2, ACC2, T0));
+        g.set_bound(P + s, 2047);
     }
-}
-
-fn generate(psi_pos: &[u32; N], psi_neg: &[u32; N]) -> Vec<Op> {
-    let mut g = Gen { ops: Vec::new() };
-    let q = Q as u64;
-    // Constants
-    let qinv = (1u32 << R_LOG).wrapping_sub((1..1u32 << R_LOG).find(|x| (x * Q) & 0xffff == 1).unwrap());
-    for (slot, value) in [(Q1, Q), (Q2, 2 * Q), (Q4, 4 * Q), (Q8, 8 * Q), (MASK, 0xffff), (QINV, qinv)] {
-        g.op(Op::Bcast(slot, value));
-    }
-    // ||s2||^2 (s2 in [0, Q)): centered |x| = min(x, Q - x)
-    for s in 0..64 {
-        g.op(Op::Sub(T2, Q1, P + s));
-        g.op(Op::Minu(T3, P + s, T2));
-        g.op(Op::Mullo(T3, T3, T3));
-        g.op(Op::Add(ACC2, ACC2, T3));
-    }
-    // Forward NTT of s2
-    let (mut t, mut m, mut bound) = (N, 1, q);
-    while m < N {
-        t >>= 1;
-        if t >= 8 {
-            let tv = (t / 8) as u8;
-            for i in 0..m {
-                g.op(Op::Bcast(TW, to_mont(psi_pos[m + i])));
-                let base = (2 * i * t / 8) as u8;
-                for k in 0..tv {
-                    g.ct(P + base + k, P + base + tv + k, TW, bound);
-                }
+    let twiddle = |psi: &[u32; N], t: usize, i: usize| mont_centered(psi[N / (2 * t) + i] as i64);
+    // Forward NTT, levels 256..16 between whole slots
+    let mut t = 256;
+    while t >= 16 {
+        let ts = (t / 16) as u8;
+        for i in 0..N / (2 * t) {
+            let w_abs = g.twiddle_bcast(twiddle(psi_pos, t, i));
+            let base = (2 * i * t / 16) as u8;
+            for k in 0..ts {
+                g.ct(P + base + k, P + base + ts + k, w_abs);
             }
-        } else {
-            if t == 4 {
-                for tile in 0..8 {
-                    g.op(Op::Transpose(P + 8 * tile));
-                }
-            }
-            for tile in 0..8u8 {
-                let groups = 4 / t;
-                for grp in 0..groups {
-                    g.op(Op::Load(TWV, "TWF", tile_row(tile as usize, t, grp)));
-                    // Element pairs (e, e + t) of the group, e = grp * 2t + 0..t
-                    for e in grp * 2 * t..grp * 2 * t + t {
-                        g.ct(P + 8 * tile + e as u8, P + 8 * tile + (e + t) as u8, TWV, bound);
-                    }
+        }
+        t /= 2;
+    }
+    for tile in 0..4 {
+        g.transpose(P + 8 * tile);
+    }
+    // Levels 8, 4, 2: slot c and c + t / 2 of a tile, block index from (tile, lane, group)
+    for t in [8usize, 4, 2] {
+        let d = t / 2; // slot distance
+        for tile in 0..4 {
+            for grp in 0..4 / d {
+                let w: [i64; 16] = std::array::from_fn(|word| {
+                    let (r, h) = (word / 2, word % 2);
+                    let j = 128 * tile + 16 * r + 2 * (grp * 2 * d) + h;
+                    twiddle(psi_pos, t, j / (2 * t))
+                });
+                let w_abs = g.twiddle_rows("TWF", w);
+                for c in grp * 2 * d..grp * 2 * d + d {
+                    g.ct(P + 8 * tile as u8 + c as u8, P + 8 * tile as u8 + (c + d) as u8, w_abs);
                 }
             }
         }
-        bound += q;
-        m <<= 1;
     }
-    // Pointwise product with the prepared pubkey (NTT(h) * N^-1, Montgomery form)
-    for s in 0..64u8 {
-        g.op(Op::Load(TWV, "H_PREP", s as usize));
-        g.mont(P + s, P + s, TWV, bound);
+    for slot in 0..32u8 {
+        let (tile, c) = (slot as usize / 8, slot as usize % 8);
+        let w: [i64; 8] = std::array::from_fn(|r| twiddle(psi_pos, 1, (128 * tile + 16 * r + 2 * c) / 2));
+        g.level1(slot, w, true);
     }
-    // Inverse NTT
-    let (mut t, mut m, mut off_q, mut bound) = (1usize, N, 1u32, q);
-    while m > 1 {
-        let h = m / 2;
-        let reduce_sum = off_q >= 8;
-        if t < 8 {
-            for tile in 0..8u8 {
-                for grp in 0..4 / t {
-                    g.op(Op::Load(TWV, "TWI", tile_row(tile as usize, t, grp)));
-                    for e in grp * 2 * t..grp * 2 * t + t {
-                        g.gs(P + 8 * tile + e as u8, P + 8 * tile + (e + t) as u8, TWV, bound, off_q, reduce_sum);
-                    }
-                }
-            }
-            if t == 4 {
-                for tile in 0..8 {
-                    g.op(Op::Transpose(P + 8 * tile));
-                }
-            }
-        } else {
-            let tv = (t / 8) as u8;
-            for i in 0..h {
-                g.op(Op::Bcast(TW, to_mont(psi_neg[h + i])));
-                let base = (2 * i * t / 8) as u8;
-                for k in 0..tv {
-                    g.gs(P + base + k, P + base + tv + k, TW, bound, off_q, reduce_sum);
+    // Pointwise product with the prepared pubkey (NTT(h) / N, Montgomery form)
+    for s in 0..32u8 {
+        g.row(TW, "H_PREP", [0; 8]);
+        g.row(TW_P, "H_PREP", [0; 8]);
+        g.mont(P + s, P + s, TW, TW_P, QI / 2 + 1);
+    }
+    // Inverse NTT: level 1, then 2, 4, 8 in the transposed layout, then 16..256
+    for slot in 0..32u8 {
+        let (tile, c) = (slot as usize / 8, slot as usize % 8);
+        let w: [i64; 8] = std::array::from_fn(|r| twiddle(psi_neg, 1, (128 * tile + 16 * r + 2 * c) / 2));
+        g.level1(slot, w, false);
+    }
+    for t in [2usize, 4, 8] {
+        let d = t / 2;
+        for tile in 0..4 {
+            for grp in 0..4 / d {
+                let w: [i64; 16] = std::array::from_fn(|word| {
+                    let (r, h) = (word / 2, word % 2);
+                    let j = 128 * tile + 16 * r + 2 * (grp * 2 * d) + h;
+                    twiddle(psi_neg, t, j / (2 * t))
+                });
+                let w_abs = g.twiddle_rows("TWI", w);
+                for c in grp * 2 * d..grp * 2 * d + d {
+                    g.gs(P + 8 * tile as u8 + c as u8, P + 8 * tile as u8 + (c + d) as u8, w_abs);
                 }
             }
         }
-        if reduce_sum {
-            bound = q;
-            off_q = 1;
-        } else {
-            bound *= 2;
-            off_q *= 2;
+    }
+    for tile in 0..4 {
+        g.transpose(P + 8 * tile);
+    }
+    let mut t = 16;
+    while t <= 256 {
+        let ts = (t / 16) as u8;
+        for i in 0..N / (2 * t) {
+            let w_abs = g.twiddle_bcast(twiddle(psi_neg, t, i));
+            let base = (2 * i * t / 16) as u8;
+            for k in 0..ts {
+                g.gs(P + base + k, P + base + ts + k, w_abs);
+            }
         }
-        t <<= 1;
-        m >>= 1;
+        t *= 2;
     }
-    // s1 = c - s2 * h (c < 5Q unreduced candidates, m < bound) and ||s1||^2
-    assert!(bound <= 2 * q);
-    for s in 0..64u8 {
-        g.op(Op::Add(T3, C + s, Q2));
-        g.op(Op::Sub(T3, T3, P + s));
-        g.reduce(T3, T3, 7 * q);
-        g.op(Op::Sub(T2, Q1, T3));
-        g.op(Op::Minu(T3, T3, T2));
-        g.op(Op::Mullo(T3, T3, T3));
-        g.op(Op::Add(ACC1, ACC1, T3));
+    // s1 = c - m: c (u16 < 5q) to [0, 2q), u = c + q - m in [0, 4q) (m reduced below q), u to
+    // [0, q), |s1| = min(u, q - u), squares summed in pairs into u32 lanes
+    for s in 0..32u8 {
+        let (cs, m) = (C + s, P + s);
+        g.reduce_if(m, QI);
+        assert!(g.bound[m as usize] <= QI);
+        g.op(Op::Sub16(T2, cs, Q4V));
+        g.op(Op::Minu16(T2, cs, T2)); // [0, 4q) (5q > 4q values wrapped below q)
+        g.op(Op::Sub16(T1, T2, Q2V));
+        g.op(Op::Minu16(T2, T2, T1)); // [0, 2q)
+        g.op(Op::Add16(T2, T2, QV));
+        g.op(Op::Sub16(T2, T2, m)); // [0, 4q)
+        g.op(Op::Sub16(T1, T2, Q2V));
+        g.op(Op::Minu16(T2, T2, T1)); // [0, 2q)
+        g.op(Op::Sub16(T1, T2, QV));
+        g.op(Op::Minu16(T2, T2, T1)); // [0, q)
+        g.op(Op::Sub16(T1, QV, T2));
+        g.op(Op::Minu16(T2, T2, T1)); // [0, q / 2]
+        g.op(Op::Madd16(T1, T2, T2));
+        g.op(Op::Add(ACC1, ACC1, T1));
     }
-    g.ops
+    (g.ops, g.tables, g.checks)
 }
 
 /// Executes the op stream on a model of the vector region
@@ -329,12 +416,31 @@ fn simulate(ops: &[Op], region: &mut [[u32; 8]; 256], tables: &dyn Fn(&str, usiz
         let lanes = |r: &[[u32; 8]; 256], a: u8, b: u8, f: &dyn Fn(u32, u32) -> u32| -> [u32; 8] {
             std::array::from_fn(|i| f(r[a as usize][i], r[b as usize][i]))
         };
+        let words16 = |r: &[[u32; 8]; 256], a: u8, b: u8, f: &dyn Fn(u16, u16) -> u16| -> [u32; 8] {
+            std::array::from_fn(|i| {
+                let (x, y) = (r[a as usize][i], r[b as usize][i]);
+                f(x as u16, y as u16) as u32 | (f((x >> 16) as u16, (y >> 16) as u16) as u32) << 16
+            })
+        };
         match *op {
+            Op::Add16(d, a, b) => region[d as usize] = words16(region, a, b, &|x, y| x.wrapping_add(y)),
+            Op::Sub16(d, a, b) => region[d as usize] = words16(region, a, b, &|x, y| x.wrapping_sub(y)),
+            Op::Mullo16(d, a, b) => region[d as usize] = words16(region, a, b, &|x, y| x.wrapping_mul(y)),
+            Op::Mulhi16(d, a, b) => region[d as usize] = words16(region, a, b, &|x, y| ((x as i16 as i32 * y as i16 as i32) >> 16) as u16),
+            Op::Minu16(d, a, b) => region[d as usize] = words16(region, a, b, &|x, y| x.min(y)),
+            Op::Madd16(d, a, b) => {
+                let (x, y) = (region[a as usize], region[b as usize]);
+                let p = |v: u32, w: u32, sh: u32| (v >> sh) as u16 as i16 as i32 * (w >> sh) as u16 as i16 as i32;
+                region[d as usize] = std::array::from_fn(|i| p(x[i], y[i], 0).wrapping_add(p(x[i], y[i], 16)) as u32);
+            }
+            Op::Blendw(d, a, b, m) => {
+                let (x, y) = (region[a as usize], region[b as usize]);
+                region[d as usize] = std::array::from_fn(|i| {
+                    let pick = |h: usize| if (m >> ((2 * i + h) % 8)) & 1 != 0 { y[i] } else { x[i] };
+                    (pick(0) & 0xffff) | (pick(1) & 0xffff_0000)
+                });
+            }
             Op::Add(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| x.wrapping_add(y)),
-            Op::Sub(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| x.wrapping_sub(y)),
-            Op::Mullo(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| x.wrapping_mul(y)),
-            Op::Minu(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| x.min(y)),
-            Op::And(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| x & y),
             Op::Srl(d, a, n) => region[d as usize] = region[a as usize].map(|x| x >> n),
             Op::Mov(d, a) => region[d as usize] = region[a as usize],
             Op::Bcast(d, v) => region[d as usize] = [v; 8],
@@ -347,28 +453,32 @@ fn simulate(ops: &[Op], region: &mut [[u32; 8]; 256], tables: &dyn Fn(&str, usiz
             }
             Op::Load(d, table, row) => region[d as usize] = tables(table, row),
             Op::Xor(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| x ^ y),
-            Op::Or(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| x | y),
-            Op::Andn(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| !x & y),
             Op::Permd(d, a, idx) => {
                 let (data, idx) = (region[a as usize], region[idx as usize]);
                 region[d as usize] = std::array::from_fn(|i| data[(idx[i] & 7) as usize]);
             }
             Op::Ror(d, a, n) => region[d as usize] = region[a as usize].map(|x| x.rotate_right(n as u32)),
             Op::Sll(d, a, n) => region[d as usize] = region[a as usize].map(|x| x << n),
-            Op::Sllv(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| if y > 31 { 0 } else { x << y }),
-            Op::Srlv(d, a, b) => region[d as usize] = lanes(region, a, b, &|x, y| if y > 31 { 0 } else { x >> y }),
             Op::Blend(d, a, b, m) => {
                 let (x, y) = (region[a as usize], region[b as usize]);
                 region[d as usize] = std::array::from_fn(|i| if (m >> i) & 1 != 0 { y[i] } else { x[i] });
             }
+            Op::Rolv(d, a, b) => {
+                let shl = |x: u32, n: u32| if n > 31 { 0 } else { x << n };
+                let shr = |x: u32, n: u32| if n > 31 { 0 } else { x >> n };
+                region[d as usize] = lanes(region, a, b, &|x, n| shl(x, n) | shr(x, 32u32.wrapping_sub(n)));
+            }
+            Op::Tern(d, a, b, imm) => {
+                let pick = |x: u32, set: bool| if set { x } else { !x };
+                let (dv, av, bv) = (region[d as usize], region[a as usize], region[b as usize]);
+                region[d as usize] = std::array::from_fn(|i| {
+                    (0..8u32).filter(|k| (imm >> k) & 1 != 0).fold(0, |r, k| {
+                        r | (pick(dv[i], k & 4 != 0) & pick(av[i], k & 2 != 0) & pick(bv[i], k & 1 != 0))
+                    })
+                });
+            }
         }
     }
-}
-
-/// Splits the output of the forward NTT into the tile layout of the vector code:
-/// coefficient 64T + 8k + e lives in slot 8T + e, lane k
-fn to_tile_layout(x: &[u32; N]) -> Vec<[u32; 8]> {
-    (0..64).map(|slot| std::array::from_fn(|k| x[64 * (slot / 8) + 8 * k + slot % 8])).collect()
 }
 
 fn decode_pubkey(pk: &[u8]) -> [u32; N] {
@@ -389,15 +499,26 @@ fn decode_pubkey(pk: &[u8]) -> [u32; N] {
     h
 }
 
+
+/// NTT(h) / N in Montgomery form, laid out like the forward NTT output: rows (H, H q^-1) per slot
 fn prepare(h: &[u32; N], psi_pos: &[u32; N]) -> Vec<[u32; 8]> {
     let mut hn = *h;
     ntt_ref(&mut hn, psi_pos);
-    let n_inv = pow_mod(N as u64, Q as u64 - 2, Q as u64);
-    let folded: [u32; N] = std::array::from_fn(|i| to_mont((hn[i] as u64 * n_inv % Q as u64) as u32));
-    to_tile_layout(&folded)
+    let n_inv = pow_mod(N as u64, Q as u64 - 2, Q as u64) as i64;
+    let mut words = [[0i64; 16]; 32];
+    for j in 0..N {
+        let (slot, word) = transposed_pos(j);
+        words[slot][word] = mont_centered(hn[j] as i64 * n_inv);
+    }
+    let mut rows = Vec::new();
+    for w in words {
+        rows.push(std::array::from_fn(|i| pair(w[2 * i], w[2 * i + 1])));
+        rows.push(std::array::from_fn(|i| pair(mont_prime(w[2 * i]), mont_prime(w[2 * i + 1]))));
+    }
+    rows
 }
 
-fn self_test(ops: &[Op], psi_pos: &[u32; N], twf: &[[u32; 8]], twi: &[[u32; 8]]) {
+fn self_test(ops: &[Op], tables: &Tables, checks: &[(usize, u8, i64)], psi_pos: &[u32; N]) {
     let mut seed = 0x1234_5678_9abc_def0u64;
     let mut rand = |m: u32| {
         seed ^= seed << 13;
@@ -405,44 +526,75 @@ fn self_test(ops: &[Op], psi_pos: &[u32; N], twf: &[[u32; 8]], twi: &[[u32; 8]])
         seed ^= seed << 17;
         (seed % m as u64) as u32
     };
-    for round in 0..4 {
+    for round in 0..6 {
         let h: [u32; N] = std::array::from_fn(|_| rand(Q));
-        let s2: [u32; N] = std::array::from_fn(|i| if round == 0 && i > 3 { 0 } else { rand(Q) });
-        let c: [u32; N] = std::array::from_fn(|_| rand(5 * Q));
+        // Signed s2 with |s2| < 2048: random, sparse, and the extremes
+        let s2: [i64; N] = std::array::from_fn(|i| match round {
+            0 if i > 3 => 0,
+            1 => 2047,
+            2 => if i % 2 == 0 { -2047 } else { 2047 },
+            _ => rand(4095) as i64 - 2047,
+        });
+        let c: [u32; N] = std::array::from_fn(|i| if round == 1 { 5 * Q - 1 - (i as u32 % 3) } else { rand(5 * Q) });
         let h_prep = prepare(&h, psi_pos);
         let mut region = [[0u32; 8]; 256];
-        for i in 0..N {
-            region[P as usize + i / 8][i % 8] = s2[i];
-            region[C as usize + i / 8][i % 8] = c[i];
-        }
-        let tables = |name: &str, row: usize| match name {
-            "TWF" => twf[row],
-            "TWI" => twi[row],
-            _ => h_prep[row],
+        let mut put = |slot: u8, i: usize, v: u16| {
+            let lane = &mut region[slot as usize + i / 16][(i % 16) / 2];
+            *lane = if i % 2 == 0 { (*lane & 0xffff_0000) | v as u32 } else { (*lane & 0xffff) | (v as u32) << 16 };
         };
-        simulate(ops, &mut region, &tables);
+        for i in 0..N {
+            put(P, i, s2[i] as i16 as u16);
+            put(C, i, c[i] as u16);
+        }
+        let lookup = |name: &str, row: usize| if name == "H_PREP" { h_prep[row] } else { tables[name][row] };
+        // Signed 16 bit overflow check of the NTT part (the final stage wraps on purpose)
+        let ntt_end = ops.iter().position(|op| matches!(*op, Op::Sub16(_, a, _) if a == C)).unwrap();
+        for (k, op) in ops[..ntt_end].iter().enumerate() {
+            if let Op::Add16(_, a, b) | Op::Sub16(_, a, b) = *op {
+                let sub = matches!(op, Op::Sub16(..));
+                for lane in 0..8 {
+                    for h in 0..2 {
+                        let x = (region[a as usize][lane] >> (16 * h)) as u16 as i16 as i32;
+                        let y = (region[b as usize][lane] >> (16 * h)) as u16 as i16 as i32;
+                        let r = if sub { x - y } else { x + y };
+                        assert!(r == r as i16 as i32, "overflow at op {k} {op:?} round {round}: {x} {y}");
+                    }
+                }
+            }
+            simulate(std::slice::from_ref(op), &mut region, &lookup);
+            for &(_, slot, bound) in checks.iter().filter(|c| c.0 == k + 1) {
+                for lane in 0..8 {
+                    for h in 0..2 {
+                        let x = (region[slot as usize][lane] >> (16 * h)) as u16 as i16 as i64;
+                        assert!(x.abs() <= bound, "slot {slot} = {x} exceeds bound {bound} after op {k} {op:?} round {round}");
+                    }
+                }
+            }
+        }
+        simulate(&ops[ntt_end..], &mut region, &lookup);
         // Schoolbook s2 * h mod (x^N + 1, Q)
         let mut prod = [0i64; N];
         for i in 0..N {
             for j in 0..N {
-                let v = s2[i] as i64 * h[j] as i64;
+                let v = s2[i] * h[j] as i64;
                 if i + j < N { prod[i + j] += v } else { prod[i + j - N] -= v }
             }
         }
         let centered = |x: i64| {
-            let x = x.rem_euclid(Q as i64);
-            if x > Q as i64 / 2 { x - Q as i64 } else { x }
+            let x = x.rem_euclid(QI);
+            if x > QI / 2 { x - QI } else { x }
         };
         let norm1: i64 = (0..N).map(|i| centered(c[i] as i64 - prod[i]).pow(2)).sum();
-        let norm2: i64 = (0..N).map(|i| centered(s2[i] as i64).pow(2)).sum();
+        let norm2: i64 = (0..N).map(|i| s2[i].pow(2)).sum();
         let got1: i64 = region[ACC1 as usize].iter().map(|x| *x as i64).sum();
         let got2: i64 = region[ACC2 as usize].iter().map(|x| *x as i64).sum();
+        let word = |slot: u8, i: usize| (region[slot as usize + i / 16][(i % 16) / 2] >> (16 * (i % 2))) as u16 as i16 as i64;
+        let bad: Vec<usize> = (0..N).filter(|&i| (word(P, i) - prod[i]).rem_euclid(QI) != 0).collect();
+        if !bad.is_empty() {
+            panic!("m mismatch round {round}: {} bad, first {:?}", bad.len(), &bad[..bad.len().min(20)]);
+        }
         assert_eq!(got2, norm2, "s2 norm mismatch (round {round})");
         assert_eq!(got1, norm1, "s1 norm mismatch (round {round})");
-        // The working polynomial holds m = s2 * h (mod Q, < 2Q)
-        for i in 0..N {
-            assert_eq!(region[P as usize + i / 8][i % 8] as i64 % Q as i64, prod[i].rem_euclid(Q as i64), "m[{i}]");
-        }
     }
 }
 
@@ -461,24 +613,25 @@ fn emit_fn(s: &mut String, name: &str, ops: &[Op]) {
     for op in ops {
         match *op {
             Op::Add(d, a, b) => writeln!(s, "    add({d}, {a}, {b});"),
-            Op::Sub(d, a, b) => writeln!(s, "    sub({d}, {a}, {b});"),
-            Op::Mullo(d, a, b) => writeln!(s, "    mullo({d}, {a}, {b});"),
-            Op::Minu(d, a, b) => writeln!(s, "    minu({d}, {a}, {b});"),
-            Op::And(d, a, b) => writeln!(s, "    and({d}, {a}, {b});"),
             Op::Srl(d, a, n) => writeln!(s, "    srl({d}, {a}, {n});"),
             Op::Mov(d, a) => writeln!(s, "    mov({d}, {a});"),
             Op::Bcast(d, v) => writeln!(s, "    bcast({d}, {v});"),
             Op::Transpose(d) => writeln!(s, "    transpose({d});"),
             Op::Load(d, t, row) => writeln!(s, "    load({d}, {t}.0[{row}].as_ptr());"),
             Op::Xor(d, a, b) => writeln!(s, "    xor({d}, {a}, {b});"),
-            Op::Or(d, a, b) => writeln!(s, "    or({d}, {a}, {b});"),
-            Op::Andn(d, a, b) => writeln!(s, "    andn({d}, {a}, {b});"),
             Op::Permd(d, a, i) => writeln!(s, "    permd({d}, {a}, {i});"),
             Op::Ror(d, a, n) => writeln!(s, "    ror({d}, {a}, {n});"),
             Op::Sll(d, a, n) => writeln!(s, "    sll({d}, {a}, {n});"),
-            Op::Sllv(d, a, b) => writeln!(s, "    sllv({d}, {a}, {b});"),
-            Op::Srlv(d, a, b) => writeln!(s, "    srlv({d}, {a}, {b});"),
             Op::Blend(d, a, b, m) => writeln!(s, "    blend({d}, {a}, {b}, {m});"),
+            Op::Rolv(d, a, b) => writeln!(s, "    rolv({d}, {a}, {b});"),
+            Op::Add16(d, a, b) => writeln!(s, "    add16({d}, {a}, {b});"),
+            Op::Sub16(d, a, b) => writeln!(s, "    sub16({d}, {a}, {b});"),
+            Op::Mullo16(d, a, b) => writeln!(s, "    mullo16({d}, {a}, {b});"),
+            Op::Mulhi16(d, a, b) => writeln!(s, "    mulhi16({d}, {a}, {b});"),
+            Op::Minu16(d, a, b) => writeln!(s, "    minu16({d}, {a}, {b});"),
+            Op::Madd16(d, a, b) => writeln!(s, "    madd16({d}, {a}, {b});"),
+            Op::Blendw(d, a, b, m) => writeln!(s, "    blendw({d}, {a}, {b}, {m});"),
+            Op::Tern(d, a, b, imm) => writeln!(s, "    tern({d}, {a}, {b}, {imm});"),
         }
         .unwrap();
     }
@@ -493,41 +646,48 @@ fn emit_fn(s: &mut String, name: &str, ops: &[Op]) {
 // 5 x 5 used:
 //   R layout: slot y = row y, lane x        (theta, rho)
 //   C layout: slot x = column x, lane y     (chi, iota)
-// pi maps the R layout to the C layout with one lane permutation per slot, chi writes into the
-// other tile pair, and an 8 x 8 transpose returns to the R layout for the next round. Lanes and
-// slots 5..8 of a tile only ever hold values that never flow into lanes 0..5.
+// pi maps the R layout to the C layout with one lane permutation per slot, chi runs in place
+// (three input logic, d ^ (!a & b)), and an 8 x 8 transpose returns to the R layout for the next
+// round. Theta's parity and its application use three input xors, rho one variable rotate per
+// half. Lanes and slots 5..8 of a tile only ever hold values that never flow into lanes 0..5.
 
 mod shake {
     #![allow(dead_code)]
     include!("src/shake.rs");
 }
 
-const K_TILES: [(u8, u8); 2] = [(0, 8), (16, 24)]; // (E, O) tile pairs
+const K_TILES: [(u8, u8); 1] = [(0, 8)]; // (E, O) tiles
 const KT0: u8 = 32;
 const KT1: u8 = 33;
 const K_CE: u8 = 36;
 const K_CO: u8 = 37;
-const K_DE: u8 = 38;
-const K_DO: u8 = 39;
 const K_IN_E: u8 = 40; // absorb buffer rows 0..4
 const K_IN_O: u8 = 44;
 const K_OUT_L: u8 = 48; // squeezed words rows 0..4
 const K_OUT_H: u8 = 52;
+// Constants used by three input ops must be below slot 128 (7 bit operand fields)
+const K_M16: u8 = 16;
+const K_MH16: u8 = 17;
+const K_S8: u8 = 18;
+const K_S4: u8 = 19;
+const K_S2: u8 = 20;
+const K_S1: u8 = 21;
 const K_RC_E: u8 = 142; // 24 slots
 const K_RC_O: u8 = 166; // 24 slots
 const K_PM1: u8 = 190;
 const K_PP1: u8 = 191;
 const K_PI: u8 = 192; // 5 slots
-const K_AE: u8 = 197; // rotation amounts, 5 slots each
-const K_AEC: u8 = 202;
-const K_AO: u8 = 207;
-const K_AOC: u8 = 212;
-const K_M16: u8 = 217;
-const K_MH16: u8 = 218;
-const K_S8: u8 = 219;
-const K_S4: u8 = 220;
-const K_S2: u8 = 221;
-const K_S1: u8 = 222;
+const K_AE: u8 = 197; // rotation amounts of the E and O halves, 5 slots each
+const K_AO: u8 = 202;
+
+/// d ^ a ^ b
+const XOR3: u8 = 0x96;
+/// d ^ (!a & b)
+const CHI: u8 = 0xd2;
+/// (d ^ a) & b
+const XOR_AND: u8 = 0x28;
+/// d | (a & b)
+const OR_AND: u8 = 0xf8;
 
 fn keccak_rho_offsets() -> [[u32; 5]; 5] {
     let mut r = [[0u32; 5]; 5];
@@ -582,7 +742,7 @@ fn interleave(e: u32, o: u32) -> u64 {
     (0..32).fold(0u64, |x, i| x | ((e as u64 >> i) & 1) << (2 * i) | ((o as u64 >> i) & 1) << (2 * i + 1))
 }
 
-/// Rows of the Keccak constant table (loaded into slots K_RC_E..K_AOC by keccak_init)
+/// Rows of the Keccak constant table (loaded into slots K_RC_E..K_AO + 5 by keccak_init)
 fn keccak_table() -> Vec<[u32; 8]> {
     let lane0 = |v: u32| -> [u32; 8] { std::array::from_fn(|i| if i == 0 { v } else { 0 }) };
     let idx = |f: &dyn Fn(u32) -> u32| -> [u32; 8] { std::array::from_fn(|i| if i < 5 { f(i as u32) } else { i as u32 }) };
@@ -596,17 +756,12 @@ fn keccak_table() -> Vec<[u32; 8]> {
         rows.push(idx(&|y| (big_x + 3 * y) % 5));
     }
     let r = keccak_rho_offsets();
-    let amounts = |f: &dyn Fn(u32) -> u32, y: usize, complement: bool| -> [u32; 8] {
-        std::array::from_fn(|x| {
-            let a = if x < 5 { f(r[x][y]) } else { 0 };
-            if complement { 32 - a } else { a }
-        })
-    };
+    let amounts = |f: &dyn Fn(u32) -> u32, y: usize| -> [u32; 8] { std::array::from_fn(|x| if x < 5 { f(r[x][y]) } else { 0 }) };
     let ae = |r: u32| if r % 2 == 0 { r / 2 } else { (r + 1) / 2 };
     let ao = |r: u32| if r % 2 == 0 { r / 2 } else { (r - 1) / 2 };
-    for (f, complement) in [(&ae as &dyn Fn(u32) -> u32, false), (&ae, true), (&ao, false), (&ao, true)] {
+    for f in [&ae as &dyn Fn(u32) -> u32, &ao] {
         for y in 0..5 {
-            rows.push(amounts(f, y, complement));
+            rows.push(amounts(f, y));
         }
     }
     rows
@@ -628,26 +783,24 @@ fn keccak_absorb_ops() -> Vec<Op> {
 fn keccak_f_ops() -> Vec<Op> {
     let r = keccak_rho_offsets();
     let mut ops = Vec::new();
-    let (mut cur, mut alt) = (K_TILES[0], K_TILES[1]);
+    let (e, o) = K_TILES[0];
     for round in 0..24u8 {
-        let (e, o) = cur;
-        // theta
+        // theta: column parities C, D[x] = C[x - 1] ^ rotl(C[x + 1], 1)
         for (c, t) in [(K_CE, e), (K_CO, o)] {
             ops.push(Op::Xor(c, t, t + 1));
-            for y in 2..5 {
-                ops.push(Op::Xor(c, c, t + y));
-            }
+            ops.push(Op::Tern(c, t + 2, t + 3, XOR3));
+            ops.push(Op::Xor(c, c, t + 4));
         }
         ops.push(Op::Permd(KT0, K_CE, K_PM1));
         ops.push(Op::Permd(KT1, K_CO, K_PP1));
         ops.push(Op::Ror(KT1, KT1, 31));
-        ops.push(Op::Xor(K_DE, KT0, KT1));
+        for y in 0..5 {
+            ops.push(Op::Tern(e + y, KT0, KT1, XOR3));
+        }
         ops.push(Op::Permd(KT0, K_CO, K_PM1));
         ops.push(Op::Permd(KT1, K_CE, K_PP1));
-        ops.push(Op::Xor(K_DO, KT0, KT1));
         for y in 0..5 {
-            ops.push(Op::Xor(e + y, e + y, K_DE));
-            ops.push(Op::Xor(o + y, o + y, K_DO));
+            ops.push(Op::Tern(o + y, KT0, KT1, XOR3));
         }
         // rho: lanes with an odd offset swap halves first
         for y in 0..5u8 {
@@ -660,13 +813,8 @@ fn keccak_f_ops() -> Vec<Op> {
             } else {
                 ey
             };
-            // C is free after theta
-            ops.push(Op::Sllv(KT1, src, K_AE + y));
-            ops.push(Op::Srlv(K_CE, src, K_AEC + y));
-            ops.push(Op::Or(ey, KT1, K_CE));
-            ops.push(Op::Sllv(KT1, oy, K_AO + y));
-            ops.push(Op::Srlv(K_CE, oy, K_AOC + y));
-            ops.push(Op::Or(oy, KT1, K_CE));
+            ops.push(Op::Rolv(ey, src, K_AE + y));
+            ops.push(Op::Rolv(oy, oy, K_AO + y));
         }
         // pi: row X becomes column X
         for t in [e, o] {
@@ -674,22 +822,22 @@ fn keccak_f_ops() -> Vec<Op> {
                 ops.push(Op::Permd(t + x, t + x, K_PI + x));
             }
         }
-        // chi into the other tiles
-        for (src, dst) in [(e, alt.0), (o, alt.1)] {
+        // chi in place: columns 0 and 1 are needed after they are overwritten
+        for t in [e, o] {
+            ops.push(Op::Mov(KT0, t));
+            ops.push(Op::Mov(KT1, t + 1));
             for x in 0..5u8 {
-                ops.push(Op::Andn(KT0, src + (x + 1) % 5, src + (x + 2) % 5));
-                ops.push(Op::Xor(dst + x, src + x, KT0));
+                let col = |c: u8| if x + c < 5 { t + x + c } else if x + c == 5 { KT0 } else { KT1 };
+                ops.push(Op::Tern(t + x, col(1), col(2), CHI));
             }
         }
         // iota
-        ops.push(Op::Xor(alt.0, alt.0, K_RC_E + round));
-        ops.push(Op::Xor(alt.1, alt.1, K_RC_O + round));
+        ops.push(Op::Xor(e, e, K_RC_E + round));
+        ops.push(Op::Xor(o, o, K_RC_O + round));
         // back to the R layout
-        ops.push(Op::Transpose(alt.0));
-        ops.push(Op::Transpose(alt.1));
-        (cur, alt) = (alt, cur);
+        ops.push(Op::Transpose(e));
+        ops.push(Op::Transpose(o));
     }
-    assert_eq!(cur, K_TILES[0]);
     ops
 }
 
@@ -700,24 +848,48 @@ fn keccak_squeeze_ops() -> Vec<Op> {
     for y in 0..4u8 {
         for (dst, hi) in [(K_OUT_L + y, false), (K_OUT_H + y, true)] {
             if hi {
-                ops.push(Op::Srl(KT0, e + y, 16));
-                ops.push(Op::And(KT1, o + y, K_MH16));
+                ops.push(Op::Srl(dst, e + y, 16));
+                ops.push(Op::Tern(dst, o + y, K_MH16, OR_AND));
             } else {
-                ops.push(Op::And(KT0, e + y, K_M16));
-                ops.push(Op::Sll(KT1, o + y, 16));
+                ops.push(Op::Sll(dst, o + y, 16));
+                ops.push(Op::Tern(dst, e + y, K_M16, OR_AND));
             }
-            ops.push(Op::Or(dst, KT0, KT1));
+            // delta swaps: t = ((x >> s) ^ x) & mask; x ^= t ^ (t << s)
             for (shift, mask) in [(8u8, K_S8), (4, K_S4), (2, K_S2), (1, K_S1)] {
                 ops.push(Op::Srl(KT0, dst, shift));
-                ops.push(Op::Xor(KT0, KT0, dst));
-                ops.push(Op::And(KT0, KT0, mask));
-                ops.push(Op::Xor(dst, dst, KT0));
-                ops.push(Op::Sll(KT0, KT0, shift));
-                ops.push(Op::Xor(dst, dst, KT0));
+                ops.push(Op::Tern(KT0, dst, mask, XOR_AND));
+                ops.push(Op::Sll(KT1, KT0, shift));
+                ops.push(Op::Tern(dst, KT0, KT1, XOR3));
             }
         }
     }
     ops
+}
+
+/// Region byte offsets of the 68 samples of a squeezed block, in stream order: sample 4L + j is
+/// bytes 2j..2j + 2 of rate lane L = 5y + x, i.e. half j % 2 of word j / 2 of that lane
+fn sample_offsets() -> Vec<usize> {
+    (0..shake::RATE_LANES * 4)
+        .map(|i| {
+            let (lane, j) = (i / 4, i % 4);
+            let slot = if j < 2 { K_OUT_L } else { K_OUT_H } as usize + lane / 5;
+            32 * slot + 4 * (lane % 5) + 2 * (j % 2)
+        })
+        .collect()
+}
+
+fn emit_take(s: &mut String) {
+    // A cold call keeps the rare rejection out of line, so the common path is a not taken branch
+    // instead of a select
+    writeln!(s, "#[cold]\n#[inline(never)]\nfn rejected(p: *mut u16) -> *mut u16 {{\n    unsafe {{ p.sub(1) }}\n}}").unwrap();
+    writeln!(s, "/// Appends the accepted samples of a squeezed block at `p` (see shake::Sponge::take)").unwrap();
+    writeln!(s, "#[inline(always)]\npub unsafe fn take_candidates(mut p: *mut u16) -> *mut u16 {{").unwrap();
+    // An opaque base keeps the addresses as base + constant offset instead of 64 bit immediates
+    writeln!(s, "    let b = core::hint::black_box(0x6_0000_0000u64) as *const u8;").unwrap();
+    for off in sample_offsets() {
+        writeln!(s, "    let v = u16::from_be((b.add({off}) as *const u16).read_volatile()); p.write_volatile(v); p = p.add(1); if v >= {} {{ p = rejected(p); }}", 5 * Q).unwrap();
+    }
+    writeln!(s, "    p\n}}").unwrap();
 }
 
 struct SimSponge<'a> {
@@ -754,12 +926,16 @@ impl shake::Sponge for SimSponge<'_> {
         let s = self.squeeze;
         self.run(s);
     }
-    fn out_word(&self, lane: usize, hi: bool) -> u32 {
-        self.region[(if hi { K_OUT_H } else { K_OUT_L }) as usize + lane / 5][lane % 5]
-    }
-    fn put_candidate(&mut self, i: usize, value: u32) {
-        assert_eq!(i, self.out.len());
-        self.out.push(value);
+    fn take(&mut self, n: usize) -> usize {
+        assert_eq!(n, self.out.len());
+        let bytes: Vec<u8> = self.region.iter().flat_map(|slot| slot.iter().flat_map(|w| w.to_le_bytes())).collect();
+        for off in sample_offsets() {
+            let v = u16::from_be_bytes([bytes[off], bytes[off + 1]]) as u32;
+            if v < 5 * Q {
+                self.out.push(v);
+            }
+        }
+        self.out.len()
     }
 }
 
@@ -822,7 +998,7 @@ fn keccak_self_test(f: &[Op], absorb: &[Op], squeeze: &[Op], init: &[Op]) {
         shake::hash_to_point(&mut sponge, &nonce, &msg);
         let stream = shake256_ref(&[nonce.clone(), msg].concat(), 8 * 136 * 4);
         let expected: Vec<u32> = stream.chunks(2).map(|p| (p[0] as u32) << 8 | p[1] as u32).filter(|w| *w < 5 * Q).take(N).collect();
-        assert_eq!(sponge.out, expected, "hash_to_point, message length {msg_len}");
+        assert_eq!(sponge.out[..N], expected[..], "hash_to_point, message length {msg_len}");
     }
 }
 
@@ -830,27 +1006,28 @@ fn main() {
     let pk_path = std::env::var("FALCON_PK").unwrap_or_else(|_| "../fixtures/falcon.pk".to_string());
     println!("cargo:rerun-if-changed={pk_path}");
     println!("cargo:rerun-if-changed=build.rs");
+    // take_candidates may write 68 values past the 512 candidates, into slots nothing else uses
+    assert!(16 * C as usize + N + 68 <= 16 * C_OVERRUN_END as usize && C_OVERRUN_END <= QV);
     let (psi_pos, psi_neg) = twiddles();
-    let twf = tile_table(&psi_pos);
-    let twi = tile_table(&psi_neg);
-    let ops = generate(&psi_pos, &psi_neg);
-    self_test(&ops, &psi_pos, &twf, &twi);
+    let (ops, mut tables, checks) = generate(&psi_pos, &psi_neg);
+    self_test(&ops, &tables, &checks, &psi_pos);
     let h = decode_pubkey(&std::fs::read(&pk_path).expect("pubkey fixture"));
-    let h_prep = prepare(&h, &psi_pos);
+    tables.insert("H_PREP", prepare(&h, &psi_pos));
     let (k_init, k_absorb, k_f, k_squeeze) = (keccak_init_ops(), keccak_absorb_ops(), keccak_f_ops(), keccak_squeeze_ops());
     keccak_self_test(&k_f, &k_absorb, &k_squeeze, &k_init);
     let mut s = String::new();
-    emit_table(&mut s, "H_PREP", &h_prep);
-    emit_table(&mut s, "TWF", &twf);
-    emit_table(&mut s, "TWI", &twi);
+    for (name, rows) in &tables {
+        emit_table(&mut s, name, rows);
+    }
     emit_table(&mut s, "KC", &keccak_table());
     writeln!(s, "pub const ACC1: usize = {ACC1};\npub const ACC2: usize = {ACC2};\npub const C_SLOT: usize = {C};\npub const P_SLOT: usize = {P};").unwrap();
-    writeln!(s, "pub const K_IN_E: usize = {K_IN_E};\npub const K_IN_O: usize = {K_IN_O};\npub const K_OUT_L: usize = {K_OUT_L};\npub const K_OUT_H: usize = {K_OUT_H};").unwrap();
+    writeln!(s, "pub const K_IN_E: usize = {K_IN_E};\npub const K_IN_O: usize = {K_IN_O};").unwrap();
     emit_fn(&mut s, "vector_core", &ops);
     emit_fn(&mut s, "keccak_init", &k_init);
     emit_fn(&mut s, "keccak_absorb", &k_absorb);
     emit_fn(&mut s, "keccak_f", &k_f);
     emit_fn(&mut s, "keccak_squeeze", &k_squeeze);
+    emit_take(&mut s);
     let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("vector_core.rs");
     std::fs::write(out, s).unwrap();
     println!("cargo:rerun-if-changed=src/shake.rs");

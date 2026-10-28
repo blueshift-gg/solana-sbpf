@@ -1,5 +1,5 @@
 //! Falcon-512 verification (compressed signatures, compile time prepared pubkey) using vector
-//! intrinsics for the NTT, the pointwise product and the norm. Same instruction format and
+//! intrinsics for SHAKE-256, the NTT, the pointwise product and the norm. Same instruction format and
 //! entrypoint as blueshift-gg/solana-falcon512's example program.
 
 #![no_std]
@@ -59,13 +59,13 @@ impl shake::Sponge for VectorSponge {
         generated::keccak_squeeze();
     }
     #[inline(always)]
-    fn out_word(&self, lane: usize, hi: bool) -> u32 {
-        let base = if hi { generated::K_OUT_H } else { generated::K_OUT_L };
-        unsafe { slot_ptr(base + lane / 5).add(lane % 5).read_volatile() }
-    }
-    #[inline(always)]
-    fn put_candidate(&mut self, i: usize, value: u32) {
-        unsafe { slot_ptr(generated::C_SLOT).add(i).write_volatile(value) };
+    fn take(&mut self, n: usize) -> usize {
+        // The candidates may run up to 68 values past the 512 of C, into slots which the vector code
+        // initializes before reading (see build.rs)
+        unsafe {
+            let start = slot_ptr(generated::C_SLOT) as *mut u16;
+            generated::take_candidates(start.add(n)).offset_from(start) as usize
+        }
     }
 }
 
@@ -75,11 +75,11 @@ fn verify(sig: &[u8; SIG_LEN], message: &[u8]) -> bool {
         return false;
     }
     let nonce = &sig[1..1 + NONCE_LEN];
-    let comp = &sig[1 + NONCE_LEN..];
+    let comp: &[u8; codec::COMP_LEN] = sig[1 + NONCE_LEN..].try_into().unwrap();
     // SHAKE-256 first: its state lives in the slots the polynomial uses afterwards
     generated::keccak_init();
     shake::hash_to_point(&mut VectorSponge, nonce, message);
-    if !codec::decompress_signature(comp, slot_ptr(generated::P_SLOT)) {
+    if !codec::decompress_signature(comp, slot_ptr(generated::P_SLOT) as *mut u16) {
         return false;
     }
     generated::vector_core();

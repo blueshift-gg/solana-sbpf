@@ -69,22 +69,45 @@ mov64 r1, <packed operands>       ; compile time constant
 call  sol_vadd32x8                ; CALL_IMM, src = 0, imm = murmur32("sol_vadd32x8")
 ```
 
-* **Encoding:** one static call identifier per operation, `sol_<mnemonic>` (21 of them, including
-  `sol_vsub32x8`, `sol_vmullo32x8`, `sol_vminu32x8`, `sol_vsrl32x8`, `sol_vsll32x8`,
-  `sol_vsllv32x8`, `sol_vsrlv32x8`, `sol_vandn256`, which exist only for compiled programs such as the
-  Falcon verifier). `dst`, `src` and `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF.
+* **Encoding:** one static call identifier per operation, `sol_<mnemonic>` (30 of them).
+  `dst`, `src` and `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF. Besides the
+  BLAKE3 set there are ops for compiled programs such as the Falcon verifier:
+
+  | Operation | Semantics | AVX2 lowering |
+  |---|---|---|
+  | `sol_vsub32x8`, `sol_vmullo32x8`, `sol_vminu32x8` | u32 lanes | `vpsubd`, `vpmulld`, `vpminud` |
+  | `sol_vsrl32x8`, `sol_vsll32x8` | shift by imm8 | `vpsrld`, `vpslld` |
+  | `sol_vsllv32x8`, `sol_vsrlv32x8` | per lane shift, 0 above 31 | `vpsllvd`, `vpsrlvd` |
+  | `sol_vandn256` | `!a & b` | `vpandn` |
+  | `sol_vrolv32x8` | `a << b \| a >> (32 - b)`: rotate left by 0..=32, vpsllvd / vpsrlvd rules otherwise | 5 instructions (`vprolvd` on AVX-512) |
+  | `sol_vternlog256` | `d = f(d, a, b)`, truth table imm8 (vpternlogd) | 1 to 6 instructions (`vpternlogd` on AVX-512) |
+  | `sol_vadd16x16`, `sol_vsub16x16`, `sol_vmullo16x16` | u16 lanes, wrapping | `vpaddw`, `vpsubw`, `vpmullw` |
+  | `sol_vmulhi16x16` | high half of signed i16 products | `vpmulhw` |
+  | `sol_vminu16x16` | u16 minimum | `vpminuw` |
+  | `sol_vmadd16x16` | i16 products summed in pairs into i32 lanes | `vpmaddwd` |
+  | `sol_vblendw` | word blend, imm8 per 128 bit half | `vpblendw` |
+
+  `vternlog` is lowered as `g_lo(a, b) ^ (d & (g_lo ^ g_hi)(a, b))` with the two input functions
+  `g` of the truth table halves, each one or two instructions; aliased operands fold into a two
+  input function first.
 * **ABI:** `r1` holds the packed operands, `r2` the scalar operand (vload/vstore address, vbcast
   value). A Rust wrapper `sol_vadd32x8(ops(V0, V0, V1))` compiles to exactly `mov64 r1, imm` +
   `call`, and compilers reload `r1` before every call because it is caller saved.
 * **Packing:** 8 bit slot numbers (256 slots, 8 KiB region): `vd | va << 8 | vb << 16`, an imm8 in
-  bits 16..24 for one-source ops, a 16 bit offset in bits 8..24 for vload/vstore. `vblendd` uses
-  7 bit slots (`vd | va << 7 | vb << 14 | imm8 << 21`). Every value is below `2^29`.
+  bits 16..24 for one-source ops, a 16 bit offset in bits 8..24 for vload/vstore. `vblendd`,
+  `vblendw` and `vternlog` use 7 bit slots (`vd | va << 7 | vb << 14 | imm8 << 21`). Every value is
+  below `2^29`.
 * **Results:** `r0 = 0`, every other register unchanged, 1 CU for the `CALL_IMM`, so each vector
   op costs 2 CUs including the `mov64`.
 * **Execution:** every engine runs the reference semantics. The JIT's `codegen` hook checks a block
   local constant tracker. If `r1` holds a valid constant it emits the AVX2 code of the opcode form,
   register caching included, plus `mov eax, 0`. Otherwise it emits a regular syscall to the
   reference implementation. Results and CUs are identical either way.
+* **Loads from .rodata:** the tracker also follows `lddw` and `add64 imm`. A `vload256` whose
+  address in `r2` is a known constant inside the read-only section (a twiddle table, say) is
+  translated at compile time: the section is immutable and always mapped at its address, so the JIT
+  emits a plain `vmovdqu` from the host address, with no runtime translation and no register cache
+  flush. Any other address takes the regular path.
 * **Compatibility:** a runtime that doesn't know the identifiers rejects the program at deployment
   (`LocalVerifier`, `InvalidSyscall`), and an unregistered call fails with `UnsupportedInstruction`.
 

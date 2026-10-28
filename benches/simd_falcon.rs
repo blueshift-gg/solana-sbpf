@@ -95,7 +95,7 @@ fn main() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("simd-falcon/fixtures");
     let programs = [
         Program { id: "blueshift", label: "blueshift-gg/solana-falcon512 (scalar sBPF)", elf: std::fs::read(dir.join("falcon_blueshift.so")).unwrap() },
-        Program { id: "simd", label: "Firedancer NTT with vector intrinsics", elf: std::fs::read(dir.join("falcon_simd.so")).unwrap() },
+        Program { id: "simd", label: "Firedancer Falcon-512 with vector intrinsics (16 bit NTT, vector SHAKE)", elf: std::fs::read(dir.join("falcon_simd.so")).unwrap() },
     ];
     let sigs = load_sigs(&dir.join("sigs.bin"));
     let quick = std::env::var("SIMD_BENCH_QUICK").is_ok_and(|v| v == "1");

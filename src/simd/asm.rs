@@ -246,6 +246,33 @@ impl Asm {
     pub fn vandn(&mut self, vd: u8, va: u8, vb: u8) {
         self.vop(VANDN, vd, va, vb, 0, 0);
     }
+    pub fn vrolv(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VROLV32, vd, va, vb, 0, 0);
+    }
+    pub fn vternlog(&mut self, vd: u8, va: u8, vb: u8, imm: i16) {
+        self.vop(VTERNLOG, vd, va, vb, 0, imm);
+    }
+    pub fn vadd16(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VADD16, vd, va, vb, 0, 0);
+    }
+    pub fn vsub16(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VSUB16, vd, va, vb, 0, 0);
+    }
+    pub fn vmullo16(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VMULLO16, vd, va, vb, 0, 0);
+    }
+    pub fn vmulhi16(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VMULHI16, vd, va, vb, 0, 0);
+    }
+    pub fn vminu16(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VMINU16, vd, va, vb, 0, 0);
+    }
+    pub fn vmadd16(&mut self, vd: u8, va: u8, vb: u8) {
+        self.vop(VMADD16, vd, va, vb, 0, 0);
+    }
+    pub fn vblendw(&mut self, vd: u8, va: u8, vb: u8, mask: i16) {
+        self.vop(VBLENDW, vd, va, vb, 0, mask);
+    }
     pub fn vblendd(&mut self, vd: u8, va: u8, vb: u8, mask: i16) {
         self.vop(VBLENDD, vd, va, vb, 0, mask);
     }

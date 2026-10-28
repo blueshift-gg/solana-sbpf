@@ -156,7 +156,11 @@ const ANCHOR_TRANSLATE_MEMORY_ADDRESS: usize = 21;
 const ANCHOR_SIMD_ROT16: usize = 33;
 #[cfg(feature = "simd-experiment")]
 const ANCHOR_SIMD_ROT8: usize = 34;
-const ANCHOR_COUNT: usize = 35; // Update me when adding or removing anchors
+#[cfg(feature = "simd-experiment")]
+const ANCHOR_SIMD_C32: usize = 35;
+#[cfg(feature = "simd-experiment")]
+const ANCHOR_SIMD_ONES: usize = 36;
+const ANCHOR_COUNT: usize = 37; // Update me when adding or removing anchors
 
 #[cfg(feature = "simd-experiment")]
 #[path = "simd_jit.rs"]

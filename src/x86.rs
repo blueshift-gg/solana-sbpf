@@ -906,6 +906,10 @@ impl VexInstruction {
     pub const fn store(src: u8, base: X86Register, disp: i32) -> Self {
         Self::ymm(2, 1, 0x7f, src, 0, VexRm::Mem(base, disp), None)
     }
+    /// vmovdqu ymm, [rip + target]
+    pub const fn load_rip(dst: u8, target: *const u8) -> Self {
+        Self::ymm(2, 1, 0x6f, dst, 0, VexRm::Rip(target), None)
+    }
     /// vmovdqa ymm, ymm
     pub const fn mov(dst: u8, src: u8) -> Self {
         Self::ymm(1, 1, 0x6f, dst, 0, VexRm::Reg(src), None)
@@ -942,6 +946,14 @@ impl VexInstruction {
     /// vpblendd ymm, ymm, ymm/m256, imm8
     pub const fn pblendd(dst: u8, src1: u8, src2: VexRm, imm: u8) -> Self {
         Self::ymm(1, 3, 0x02, dst, src1, src2, Some(imm))
+    }
+    /// vpblendw ymm, ymm, ymm/m256, imm8
+    pub const fn pblendw(dst: u8, src1: u8, src2: VexRm, imm: u8) -> Self {
+        Self::ymm(1, 3, 0x0e, dst, src1, src2, Some(imm))
+    }
+    /// vpcmpeqd ymm, ymm, ymm/m256
+    pub const fn pcmpeqd(dst: u8, src1: u8, src2: VexRm) -> Self {
+        Self::ymm(1, 1, 0x76, dst, src1, src2, None)
     }
     /// vperm2i128 ymm, ymm, ymm/m256, imm8
     pub const fn perm2i128(dst: u8, src1: u8, src2: VexRm, imm: u8) -> Self {
