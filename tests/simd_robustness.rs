@@ -976,3 +976,122 @@ fn scalar_instructions_between_vector_ops() {
         format!("{valid} valid instructions, {cases} cases, {completed} ran to the end")
     );
 }
+
+/// Cross-program invocations (a syscall which runs another program in its own VM, like Agave's CPI):
+/// the callee starts with a zeroed vector file every time (also on its second invocation, after
+/// leaving dirty slots behind), the caller's vector file (including slots dirty in the JIT's
+/// register cache at the call) is exactly as without the invocation, for every combination of
+/// engines and JIT strategies of caller and callee, with an attached or a VM owned vector file.
+#[test]
+fn cross_program_invocations_keep_vector_files_apart() {
+    use simd::{
+        harness::{Callee, Engine},
+        *,
+    };
+    let init = vector_init(18);
+    let invoke = ebpf::hash_symbol_name(b"sol_test_invoke_") as i32 as i64;
+    // Caller: random slots, dirty cached results, two invocations, then every slot to the heap
+    let caller = {
+        let mut a = Asm::new(VecMode::Call);
+        prologue(&mut a, 0x1234_5678, u64::MAX);
+        for s in [8u8, 12, 16, 20, 254] {
+            a.vop_full(VADD32, false, s, s, 1, 0, 0, 0);
+        }
+        a.vop_full(VXOR, true, 40, 8, 12, 0, 0, 0);
+        a.raw(ebpf::CALL_IMM, 0, 0, 0, invoke);
+        a.mov64(6, 0); // the callee's r0
+        a.vop_full(VADD32, false, 9, 8, 255, 0, 0, 0);
+        a.raw(ebpf::CALL_IMM, 0, 0, 0, invoke);
+        a.vop_full(VADD32, false, 10, 9, 20, 0, 0, 0);
+        a.lddw(7, ebpf::MM_HEAP_START);
+        for k in 0..8u8 {
+            a.vstore_n(7, 1024 * k as i16, 32 * k, 32);
+        }
+        a.mov64(0, 6);
+        a.exit();
+        a.finish()
+    };
+    // Callee: its slots to the heap (must be zero), then dirty slots of its own, r0 = 42
+    let callee = {
+        let mut a = Asm::new(VecMode::Call);
+        a.lddw(7, ebpf::MM_HEAP_START);
+        for k in 0..8u8 {
+            a.vstore_n(7, 1024 * k as i16, 32 * k, 32);
+        }
+        a.mov64_imm(2, -1);
+        for s in [0u8, 8, 9, 12, 254, 255] {
+            a.vop_full(VBCAST32, false, s, 0, 0, 0, SCALAR_REG, 0);
+        }
+        a.vop_full(VADD32, true, 40, 40, 40, 0, 0, 0);
+        a.mov64_imm(0, 42);
+        a.exit();
+        a.finish()
+    };
+    let input = input_for(&init, 0);
+    let engines: Vec<(Engine, SimdJitStrategy)> = {
+        #[allow(unused_mut)] // only extended on x86-64
+        let mut engines = vec![(Engine::Interpreter, SimdJitStrategy::Direct)];
+        #[cfg(target_arch = "x86_64")]
+        engines.extend([
+            (Engine::Jit, SimdJitStrategy::RegisterCached),
+            (Engine::Jit, SimdJitStrategy::Direct),
+        ]);
+        engines
+    };
+    let runner = |program: &[u8], engine: Engine, strategy| {
+        let runner = Runner::new(program, &input, HEAP_LEN, config(strategy)).unwrap();
+        if engine == Engine::Jit {
+            runner.jit_compile().unwrap();
+        }
+        runner
+    };
+    // The caller without invocations (the syscall returns 0, nothing else happens)
+    let mut alone = runner(&caller, Engine::Interpreter, SimdJitStrategy::Direct);
+    let (alone_cus, result) = alone.run(Engine::Interpreter);
+    assert_eq!(format!("{result:?}"), "Ok(0)");
+    let expected_slots = alone.heap()[..ebpf::VECTOR_MEMORY_SIZE].to_vec();
+    let mut reference = None;
+    for &(caller_engine, caller_strategy) in &engines {
+        for &(callee_engine, callee_strategy) in &engines {
+            for detached in [false, true] {
+                let label = format!("caller {caller_engine:?} {caller_strategy:?}, callee {callee_engine:?} {callee_strategy:?}, detached {detached}");
+                let mut outer = runner(&caller, caller_engine, caller_strategy);
+                outer.set_callee(Some(Callee {
+                    runner: Box::new(runner(&callee, callee_engine, callee_strategy)),
+                    engine: callee_engine,
+                    detached,
+                    invocations: 0,
+                }));
+                let (cus, result) = if detached {
+                    outer.run_detached(caller_engine)
+                } else {
+                    outer.run(caller_engine)
+                };
+                assert_eq!(format!("{result:?}"), "Ok(42)", "{}", label);
+                let inner = outer.take_callee().unwrap();
+                assert_eq!(inner.invocations, 2, "{}", label);
+                // The callee saw a zeroed vector file (on its second invocation too)
+                assert!(
+                    inner.runner.heap()[..ebpf::VECTOR_MEMORY_SIZE]
+                        .iter()
+                        .all(|b| *b == 0),
+                    "{}",
+                    label
+                );
+                // The caller's slots are as without the invocations
+                assert!(
+                    outer.heap()[..ebpf::VECTOR_MEMORY_SIZE] == expected_slots[..],
+                    "{}",
+                    label
+                );
+                assert!(cus > alone_cus, "{}", label);
+                // Same CUs and memory in every combination
+                let outcome = (cus, outer.heap().to_vec(), inner.runner.heap().to_vec());
+                match &reference {
+                    None => reference = Some(outcome),
+                    Some(r) => assert!(*r == outcome, "{}", label),
+                }
+            }
+        }
+    }
+}

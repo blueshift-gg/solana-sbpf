@@ -473,7 +473,9 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
 
     /// Attaches host memory for the experimental vector file, instead of the one the VM would
     /// allocate itself (e.g. to inspect the slots after a run). The vector file is private VM
-    /// state, it is never mapped into the guest address space.
+    /// state, it is never mapped into the guest address space. The buffer belongs to this VM's
+    /// invocations: a nested invocation (a CPI callee) must get its own, the callee's VM zeroes its
+    /// vector file when it starts.
     ///
     /// # Safety
     ///

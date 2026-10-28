@@ -19,6 +19,18 @@ use std::{ptr::NonNull, sync::Arc};
 pub struct HarnessContext {
     pub remaining: u64,
     pub mapping: MemoryMapping,
+    /// The program `sol_test_invoke_` runs (a stand-in for a cross-program invocation)
+    pub callee: Option<Callee>,
+}
+
+/// A program invoked through `sol_test_invoke_` in its own VM, like a CPI callee
+pub struct Callee {
+    pub runner: Box<Runner>,
+    pub engine: Engine,
+    /// Let the callee's VM allocate its own vector file (like a runtime which doesn't attach one)
+    /// instead of attaching the runner's
+    pub detached: bool,
+    pub invocations: usize,
 }
 
 impl ContextObject for HarnessContext {
@@ -71,6 +83,37 @@ crate::declare_builtin_function!(
             unsafe { std::ptr::copy(s.ptr_mut().cast::<u8>().cast_const(), d.ptr_mut().cast::<u8>(), n as usize) };
         }
         Ok(0)
+    }
+);
+
+crate::declare_builtin_function!(
+    /// `sol_test_invoke_()`: runs [HarnessContext::callee] in a new VM, charges its CUs, returns its
+    /// r0 (0 without a callee)
+    SyscallTestInvoke,
+    fn rust(
+        context: &mut HarnessContext,
+        _arg1: u64,
+        _arg2: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let Some(mut callee) = context.callee.take() else {
+            return Ok(0);
+        };
+        callee.runner.budget = context.remaining;
+        let (cus, result) = if callee.detached {
+            callee.runner.run_detached(callee.engine)
+        } else {
+            callee.runner.run(callee.engine)
+        };
+        callee.invocations += 1;
+        context.consume(cus);
+        context.callee = Some(callee);
+        match result {
+            ProgramResult::Ok(value) => Ok(value),
+            ProgramResult::Err(err) => Err(Box::new(err)),
+        }
     }
 );
 
@@ -155,6 +198,9 @@ impl Runner {
         loader
             .register_definition::<SyscallMemcpy>("sol_memcpy_")
             .map_err(EbpfError::ElfError)?;
+        loader
+            .register_definition::<SyscallTestInvoke>("sol_test_invoke_")
+            .map_err(EbpfError::ElfError)?;
         Ok(Arc::new(loader))
     }
 
@@ -172,6 +218,7 @@ impl Runner {
             vector: VectorMemory::new(),
             call_frames: vec![CallFrame::default(); config.max_call_depth],
             context: Box::new(HarnessContext {
+                callee: None,
                 remaining: 0,
                 mapping: unsafe {
                     MemoryMapping::new(vec![], &Config::default(), SBPFVersion::Reserved)?
@@ -261,6 +308,16 @@ impl Runner {
 
     pub fn heap(&self) -> &[u8] {
         self.heap.as_slice()
+    }
+
+    /// Sets the program `sol_test_invoke_` runs
+    pub fn set_callee(&mut self, callee: Option<Callee>) {
+        self.context.callee = callee;
+    }
+
+    /// The callee after the run (to inspect its memory)
+    pub fn take_callee(&mut self) -> Option<Callee> {
+        self.context.callee.take()
     }
 }
 

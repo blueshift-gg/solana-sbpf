@@ -294,6 +294,13 @@ register cache stays on for programs with `callx`.
   (`SimdAnalysis::vector_instructions`) and zeroes it on every invocation. An embedder may attach
   its own buffer with `EbpfVm::set_vector_memory` instead (the test harness does, to inspect the
   slots).
+* **Cross-program invocations.** The vector file belongs to one invocation, like the scalar
+  registers: a CPI callee runs in its own VM with its own zeroed vector file and can't see the
+  caller's; the caller's file is unchanged when the CPI returns. The JIT writes its register cache
+  back before every syscall (a CPI is one) and reloads afterwards. An embedder which attaches buffers
+  must give every nested invocation its own (like stack and heap): a shared one would be zeroed by
+  the callee. `cross_program_invocations_keep_vector_files_apart` runs a callee from a syscall in the
+  middle of vector code, for every combination of engines.
 * The opcode form addresses slots 0..64 (6 bit fields), the intrinsic call form all 256.
 
 Why private: a mapped region costs an entry in every memory mapping, makes every guest pointer a
