@@ -31,13 +31,17 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 /// Rows of 8 u32 lanes, the memory image of consecutive slots
 type Rows<const R: usize> = [[u32; 8]; R];
 
+/// The memory image of four slot pairs as u64 lanes
+#[repr(align(32))]
+struct Lanes([u64; 32]);
+
 /// The Keccak state lives in the vector file (see build.rs), the absorb input and the squeezed
-/// words go through these buffers
+/// rate go through these buffers: rate rows 0..4 as slot pairs, lane x of row y at u64 8 y + x
 struct VectorSponge<'a> {
-    /// Absorb buffer rows (E rows 0..4, O rows 0..4), slots K_IN_E..K_IN_E + 8
-    input: Rows<8>,
-    /// Squeezed words, slots K_OUT_L..K_OUT_L + 8
-    output: Rows<8>,
+    /// Absorb buffer, slots K_IN..K_IN + 8
+    input: Lanes,
+    /// Squeezed rate, slots K_STATE..K_STATE + 8
+    output: Lanes,
     /// hash_to_point candidates (u16 < 5q)
     candidates: &'a mut Candidates,
 }
@@ -48,13 +52,12 @@ struct Candidates([u16; N + 68]);
 
 impl shake::Sponge for VectorSponge<'_> {
     #[inline(always)]
-    fn set_input(&mut self, lane: usize, even: u32, odd: u32) {
-        self.input[lane / 5][lane % 5] = even;
-        self.input[4 + lane / 5][lane % 5] = odd;
+    fn set_input(&mut self, lane: usize, value: u64) {
+        self.input.0[8 * (lane / 5) + lane % 5] = value;
     }
     #[inline(always)]
     fn absorb_permute(&mut self) {
-        iv::load(generated::K_IN_E, 8, self.input.as_ptr().cast());
+        iv::load(generated::K_IN, 8, self.input.0.as_ptr().cast());
         generated::keccak_absorb();
         generated::keccak_f();
     }
@@ -64,14 +67,13 @@ impl shake::Sponge for VectorSponge<'_> {
     }
     #[inline(always)]
     fn squeeze(&mut self) {
-        generated::keccak_squeeze();
-        iv::store(self.output.as_mut_ptr().cast(), generated::K_OUT_L, 8);
+        iv::store(self.output.0.as_mut_ptr().cast(), generated::K_STATE, 8);
     }
     #[inline(always)]
     fn take(&mut self, n: usize) -> usize {
         unsafe {
             let start = self.candidates.0.as_mut_ptr();
-            generated::take_candidates(self.output.as_ptr().cast(), start.add(n)).offset_from(start) as usize
+            generated::take_candidates(self.output.0.as_ptr().cast(), start.add(n)).offset_from(start) as usize
         }
     }
 }
@@ -87,7 +89,7 @@ fn verify(sig: &[u8; SIG_LEN], message: &[u8]) -> bool {
     // and then s2 share one buffer.
     let mut buffer = Candidates([0; N + 68]);
     generated::keccak_init();
-    let mut sponge = VectorSponge { input: [[0; 8]; 8], output: [[0; 8]; 8], candidates: &mut buffer };
+    let mut sponge = VectorSponge { input: Lanes([0; 32]), output: Lanes([0; 32]), candidates: &mut buffer };
     shake::hash_to_point(&mut sponge, nonce, message);
     iv::load(generated::C_SLOT, 32, buffer.0.as_ptr().cast());
     if !codec::decompress_signature(comp, buffer.0.as_mut_ptr()) {

@@ -116,6 +116,41 @@ enum Op {
     Blendw(u8, u8, u8, u8),
     /// Load consecutive generated table rows: (first slot, table, first row, rows)
     Load(u8, &'static str, usize, u8),
+    /// u64 lanes: d = a.rotate_left(b % 64)
+    Rolv64(u8, u8, u8),
+    /// 512 bit form of a lane-wise op on the slot pairs (all slots even)
+    W(&'static Op),
+    /// 512 bit cross lane permutation of the 16 u32 lanes of the pairs: (dst, data, indices)
+    PermdW(u8, u8, u8),
+    /// Transposes the 8 x 8 u64 matrix of the 8 pairs from the slot
+    TransposeQW(u8),
+}
+
+/// The 512 bit form of a lane-wise op
+fn w(op: Op) -> Op {
+    Op::W(Box::leak(Box::new(op)))
+}
+
+/// A lane-wise op moved to the high halves of its pairs
+fn shifted(op: Op, h: u8) -> Op {
+    use Op::*;
+    match op {
+        Add(d, a, b) => Add(d + h, a + h, b + h),
+        Xor(d, a, b) => Xor(d + h, a + h, b + h),
+        Add16(d, a, b) => Add16(d + h, a + h, b + h),
+        Sub16(d, a, b) => Sub16(d + h, a + h, b + h),
+        Mullo16(d, a, b) => Mullo16(d + h, a + h, b + h),
+        Mulhi16(d, a, b) => Mulhi16(d + h, a + h, b + h),
+        Minu16(d, a, b) => Minu16(d + h, a + h, b + h),
+        Madd16(d, a, b) => Madd16(d + h, a + h, b + h),
+        Rolv64(d, a, b) => Rolv64(d + h, a + h, b + h),
+        Tern(d, a, b, imm) => Tern(d + h, a + h, b + h, imm),
+        Blendw(d, a, b, m) => Blendw(d + h, a + h, b + h, m),
+        Ror(d, a, n) => Ror(d + h, a + h, n),
+        Mov(d, a) => Mov(d + h, a + h),
+        Bcast(d, v) => Bcast(d + h, v),
+        _ => panic!("{op:?} has no 512 bit form here"),
+    }
 }
 
 
@@ -449,6 +484,42 @@ fn simulate(ops: &[Op], region: &mut [[u32; 8]; 256], tables: &dyn Fn(&str, usiz
                     region[d + r] = std::array::from_fn(|c| tile[c][r]);
                 }
             }
+            Op::Rolv64(d, a, b) => {
+                let q = |x: &[u32; 8], i: usize| x[2 * i] as u64 | (x[2 * i + 1] as u64) << 32;
+                let (x, y) = (region[a as usize], region[b as usize]);
+                let mut out = [0u32; 8];
+                for i in 0..4 {
+                    let r = q(&x, i).rotate_left((q(&y, i) % 64) as u32);
+                    (out[2 * i], out[2 * i + 1]) = (r as u32, (r >> 32) as u32);
+                }
+                region[d as usize] = out;
+            }
+            Op::W(inner) => {
+                for h in 0..2 {
+                    simulate(&[shifted(*inner, h)], region, tables);
+                }
+            }
+            Op::PermdW(d, a, idx) => {
+                let get = |r: &[[u32; 8]; 256], s: u8, i: usize| r[s as usize + i / 8][i % 8];
+                let out: [u32; 16] = std::array::from_fn(|i| get(region, a, (get(region, idx, i) & 15) as usize));
+                for i in 0..16 {
+                    region[d as usize + i / 8][i % 8] = out[i];
+                }
+            }
+            Op::TransposeQW(d) => {
+                let q = |r: &[[u32; 8]; 256], row: usize, c: usize| {
+                    let s = &r[d as usize + 2 * row + c / 4];
+                    s[2 * (c % 4)] as u64 | (s[2 * (c % 4) + 1] as u64) << 32
+                };
+                let m: Vec<u64> = (0..64).map(|i| q(region, i / 8, i % 8)).collect();
+                for row in 0..8 {
+                    for c in 0..8 {
+                        let v = m[8 * c + row];
+                        let s = &mut region[d as usize + 2 * row + c / 4];
+                        (s[2 * (c % 4)], s[2 * (c % 4) + 1]) = (v as u32, (v >> 32) as u32);
+                    }
+                }
+            }
             Op::Load(d, table, row, n) => {
                 for i in 0..n as usize {
                     region[d as usize + i] = tables(table, row + i);
@@ -620,6 +691,26 @@ fn emit_fn(s: &mut String, name: &str, ops: &[Op]) {
             Op::Bcast(d, v) => writeln!(s, "    bcast({d}, {v});"),
             Op::Transpose(d) => writeln!(s, "    transpose({d});"),
             Op::Load(d, t, row, n) => writeln!(s, "    load({d}, {n}, {t}.0[{row}].as_ptr());"),
+            Op::Rolv64(d, a, b) => writeln!(s, "    rolv64(false, {d}, {a}, {b});"),
+            Op::PermdW(d, a, i) => writeln!(s, "    permd512({d}, {a}, {i});"),
+            Op::TransposeQW(d) => writeln!(s, "    transpose8x8q({d});"),
+            Op::W(inner) => match *inner {
+                Op::Xor(d, a, b) => writeln!(s, "    xor512({d}, {a}, {b});"),
+                Op::Tern(d, a, b, imm) => writeln!(s, "    tern512({d}, {a}, {b}, {imm});"),
+                Op::Rolv64(d, a, b) => writeln!(s, "    rolv64(true, {d}, {a}, {b});"),
+                Op::Mov(d, a) => writeln!(s, "    mov512({d}, {a});"),
+                Op::Add(d, a, b) => writeln!(s, "    add32(true, {d}, {a}, {b});"),
+                Op::Add16(d, a, b) => writeln!(s, "    add16(true, {d}, {a}, {b});"),
+                Op::Sub16(d, a, b) => writeln!(s, "    sub16(true, {d}, {a}, {b});"),
+                Op::Mullo16(d, a, b) => writeln!(s, "    mullo16(true, {d}, {a}, {b});"),
+                Op::Mulhi16(d, a, b) => writeln!(s, "    mulhi16(true, {d}, {a}, {b});"),
+                Op::Minu16(d, a, b) => writeln!(s, "    minu16(true, {d}, {a}, {b});"),
+                Op::Madd16(d, a, b) => writeln!(s, "    madd16(true, {d}, {a}, {b});"),
+                Op::Blendw(d, a, b, m) => writeln!(s, "    blendw512({d}, {a}, {b}, {m});"),
+                Op::Ror(d, a, n) => writeln!(s, "    ror512({d}, {a}, {n});"),
+                Op::Bcast(d, v) => writeln!(s, "    bcast512({d}, {v});"),
+                other => panic!("no 512 bit emission for {other:?}"),
+            },
             Op::Xor(d, a, b) => writeln!(s, "    xor({d}, {a}, {b});"),
             Op::Permd(d, a, i) => writeln!(s, "    permd({d}, {a}, {i});"),
             Op::Ror(d, a, n) => writeln!(s, "    ror({d}, {a}, {n});"),
@@ -641,55 +732,41 @@ fn emit_fn(s: &mut String, name: &str, ops: &[Op]) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Keccak-f[1600] on the vector intrinsics
+// Keccak-f[1600] on the vector intrinsics, 512 bit operations on 64 bit lanes
 //
-// Lanes are bit-interleaved: a 64 bit lane is stored as its even bits (E) and its odd bits (O),
-// so 64 bit rotations become 32 bit rotations. The state is two 8 x 8 tiles (E and O) of slots,
-// 5 x 5 used:
-//   R layout: slot y = row y, lane x        (theta, rho)
-//   C layout: slot x = column x, lane y     (chi, iota)
-// pi maps the R layout to the C layout with one lane permutation per slot, chi runs in place
-// (three input logic, d ^ (!a & b)), and an 8 x 8 transpose returns to the R layout for the next
-// round. Theta's parity and its application use three input xors, rho one variable rotate per
-// half. Lanes and slots 5..8 of a tile only ever hold values that never flow into lanes 0..5.
+// Every row of the state is one slot pair (u64 lane x of pair y = A[x, y]), in 8 pairs so that
+// the 8 x 8 transpose applies; rows 5..8 and lanes 5..8 only ever hold values that never flow into
+// rows / lanes 0..5. A round:
+//   R layout (pair y = row y):    theta (column parity, two lane permutations, one rotation,
+//                                  a three input xor per row), rho (one variable rotation per row)
+//   pi:                           one lane permutation per pair turns the R into the C layout
+//   C layout (pair x = column x): chi in place (three input logic), iota (one xor)
+//   transpose:                    back to the R layout
+// 30 operations per round. The rate rows go to and from guest memory with one load / store.
 
 mod shake {
     #![allow(dead_code)]
     include!("src/shake.rs");
 }
 
-const K_TILES: [(u8, u8); 1] = [(0, 8)]; // (E, O) tiles
-const KT0: u8 = 32;
-const KT1: u8 = 33;
-const K_CE: u8 = 36;
-const K_CO: u8 = 37;
-const K_IN_E: u8 = 40; // absorb buffer rows 0..4
-const K_IN_O: u8 = 44;
-const K_OUT_L: u8 = 48; // squeezed words rows 0..4
-const K_OUT_H: u8 = 52;
-// Constants used by three input ops must be below slot 128 (7 bit operand fields)
-const K_M16: u8 = 16;
-const K_MH16: u8 = 17;
-const K_S8: u8 = 18;
-const K_S4: u8 = 19;
-const K_S2: u8 = 20;
-const K_S1: u8 = 21;
-const K_RC_E: u8 = 142; // 24 slots
-const K_RC_O: u8 = 166; // 24 slots
-const K_PM1: u8 = 190;
-const K_PP1: u8 = 191;
-const K_PI: u8 = 192; // 5 slots
-const K_AE: u8 = 197; // rotation amounts of the E and O halves, 5 slots each
-const K_AO: u8 = 202;
-
+const K_STATE: u8 = 0; // 8 pairs
+const K_C: u8 = 16;
+const K_T0: u8 = 18;
+const K_T1: u8 = 20;
+const K_S0: u8 = 22;
+const K_S1: u8 = 24;
+const K_IN: u8 = 26; // absorb buffer, rate rows 0..4
+const K_TABLE: u8 = 34; // first slot of the constant table (KC)
+const K_IDX_M1: u8 = 34;
+const K_IDX_P1: u8 = 36;
+const K_ONE: u8 = 38;
+const K_RHO: u8 = 40; // 5 pairs
+const K_PI: u8 = 50; // 5 pairs
+const K_RC: u8 = 60; // 24 pairs
 /// d ^ a ^ b
 const XOR3: u8 = 0x96;
 /// d ^ (!a & b)
 const CHI: u8 = 0xd2;
-/// (d ^ a) & b
-const XOR_AND: u8 = 0x28;
-/// d | (a & b)
-const OR_AND: u8 = 0xf8;
 
 fn keccak_rho_offsets() -> [[u32; 5]; 5] {
     let mut r = [[0u32; 5]; 5];
@@ -740,143 +817,93 @@ fn keccak_f_ref(a: &mut [u64; 25]) {
     }
 }
 
-fn interleave(e: u32, o: u32) -> u64 {
-    (0..32).fold(0u64, |x, i| x | ((e as u64 >> i) & 1) << (2 * i) | ((o as u64 >> i) & 1) << (2 * i + 1))
+/// The two slots (rows) of a pair holding the u64 lanes `lanes`
+fn pair_rows(lanes: [u64; 8]) -> [[u32; 8]; 2] {
+    std::array::from_fn(|h| std::array::from_fn(|i| (lanes[4 * h + i / 2] >> (32 * (i % 2))) as u32))
 }
 
-/// Rows of the Keccak constant table (loaded into slots K_RC_E..K_AO + 5 by keccak_init)
+/// u32 indices of a permutation of u64 lanes: lane j <- lane src(j)
+fn lane_permutation(src: &dyn Fn(usize) -> usize) -> [u64; 8] {
+    std::array::from_fn(|j| {
+        let s = src(j) as u64;
+        (2 * s) | (2 * s + 1) << 32
+    })
+}
+
+/// Rows of the Keccak constant table, loaded into the slots K_TABLE.. by keccak_init
 fn keccak_table() -> Vec<[u32; 8]> {
-    let lane0 = |v: u32| -> [u32; 8] { std::array::from_fn(|i| if i == 0 { v } else { 0 }) };
-    let idx = |f: &dyn Fn(u32) -> u32| -> [u32; 8] { std::array::from_fn(|i| if i < 5 { f(i as u32) } else { i as u32 }) };
-    let mut rows = Vec::new();
-    let rc = keccak_round_constants();
-    rows.extend(rc.iter().map(|c| lane0(shake::deinterleave(*c).0)));
-    rows.extend(rc.iter().map(|c| lane0(shake::deinterleave(*c).1)));
-    rows.push(idx(&|x| (x + 4) % 5));
-    rows.push(idx(&|x| (x + 1) % 5));
-    for big_x in 0..5 {
-        rows.push(idx(&|y| (big_x + 3 * y) % 5));
-    }
+    let mut pairs: Vec<[u64; 8]> = Vec::new();
+    let cyclic = |j: usize, k: usize| if j < 5 { (j + k) % 5 } else { j };
+    pairs.push(lane_permutation(&|j| cyclic(j, 4)));
+    pairs.push(lane_permutation(&|j| cyclic(j, 1)));
+    pairs.push([1; 8]);
     let r = keccak_rho_offsets();
-    let amounts = |f: &dyn Fn(u32) -> u32, y: usize| -> [u32; 8] { std::array::from_fn(|x| if x < 5 { f(r[x][y]) } else { 0 }) };
-    let ae = |r: u32| if r % 2 == 0 { r / 2 } else { (r + 1) / 2 };
-    let ao = |r: u32| if r % 2 == 0 { r / 2 } else { (r - 1) / 2 };
-    for f in [&ae as &dyn Fn(u32) -> u32, &ao] {
-        for y in 0..5 {
-            rows.push(amounts(f, y));
-        }
+    for y in 0..5 {
+        pairs.push(std::array::from_fn(|x| if x < 5 { r[x][y] as u64 } else { 0 }));
     }
-    rows
+    for big_x in 0..5 {
+        pairs.push(lane_permutation(&|y| if y < 5 { (big_x + 3 * y) % 5 } else { y }));
+    }
+    for rc in keccak_round_constants() {
+        pairs.push(std::array::from_fn(|i| if i == 0 { rc } else { 0 }));
+    }
+    assert_eq!(K_TABLE as usize + 2 * pairs.len(), K_RC as usize + 48);
+    pairs.into_iter().flat_map(pair_rows).collect()
 }
 
 fn keccak_init_ops() -> Vec<Op> {
     let rows = keccak_table().len();
-    let mut ops: Vec<Op> = (0..rows).step_by(32).map(|row| Op::Load(K_RC_E + row as u8, "KC", row, (rows - row).min(32) as u8)).collect();
-    for (slot, v) in [(K_M16, 0x0000_ffff), (K_MH16, 0xffff_0000), (K_S8, 0x0000_ff00), (K_S4, 0x00f0_00f0), (K_S2, 0x0c0c_0c0c), (K_S1, 0x2222_2222)] {
-        ops.push(Op::Bcast(slot, v));
-    }
-    ops
+    (0..rows).step_by(32).map(|row| Op::Load(K_TABLE + row as u8, "KC", row, (rows - row).min(32) as u8)).collect()
 }
 
 fn keccak_absorb_ops() -> Vec<Op> {
-    let (e, o) = K_TILES[0];
-    (0..4).flat_map(|y| [Op::Xor(e + y, e + y, K_IN_E + y), Op::Xor(o + y, o + y, K_IN_O + y)]).collect()
+    (0..4).map(|y| w(Op::Xor(K_STATE + 2 * y, K_STATE + 2 * y, K_IN + 2 * y))).collect()
 }
 
 fn keccak_f_ops() -> Vec<Op> {
-    let r = keccak_rho_offsets();
+    let row = |y: u8| K_STATE + 2 * y;
     let mut ops = Vec::new();
-    let (e, o) = K_TILES[0];
     for round in 0..24u8 {
-        // theta: column parities C, D[x] = C[x - 1] ^ rotl(C[x + 1], 1)
-        for (c, t) in [(K_CE, e), (K_CO, o)] {
-            ops.push(Op::Xor(c, t, t + 1));
-            ops.push(Op::Tern(c, t + 2, t + 3, XOR3));
-            ops.push(Op::Xor(c, c, t + 4));
-        }
-        ops.push(Op::Permd(KT0, K_CE, K_PM1));
-        ops.push(Op::Permd(KT1, K_CO, K_PP1));
-        ops.push(Op::Ror(KT1, KT1, 31));
+        // theta: C = column parities, D[x] = C[x - 1] ^ rotl(C[x + 1], 1), A[x, y] ^= D[x]
+        ops.push(w(Op::Xor(K_C, row(0), row(1))));
+        ops.push(w(Op::Tern(K_C, row(2), row(3), XOR3)));
+        ops.push(w(Op::Xor(K_C, K_C, row(4))));
+        ops.push(Op::PermdW(K_T0, K_C, K_IDX_M1));
+        ops.push(Op::PermdW(K_T1, K_C, K_IDX_P1));
+        ops.push(w(Op::Rolv64(K_T1, K_T1, K_ONE)));
         for y in 0..5 {
-            ops.push(Op::Tern(e + y, KT0, KT1, XOR3));
+            ops.push(w(Op::Tern(row(y), K_T0, K_T1, XOR3)));
         }
-        ops.push(Op::Permd(KT0, K_CO, K_PM1));
-        ops.push(Op::Permd(KT1, K_CE, K_PP1));
+        // rho
         for y in 0..5 {
-            ops.push(Op::Tern(o + y, KT0, KT1, XOR3));
+            ops.push(w(Op::Rolv64(row(y), row(y), K_RHO + 2 * y)));
         }
-        // rho: lanes with an odd offset swap halves first
-        for y in 0..5u8 {
-            let odd = (0..5).fold(0u8, |m, x| m | (((r[x][y as usize] & 1) as u8) << x));
-            let (ey, oy) = (e + y, o + y);
-            let src = if odd != 0 {
-                ops.push(Op::Blend(KT0, ey, oy, odd));
-                ops.push(Op::Blend(oy, oy, ey, odd));
-                KT0
-            } else {
-                ey
-            };
-            ops.push(Op::Rolv(ey, src, K_AE + y));
-            ops.push(Op::Rolv(oy, oy, K_AO + y));
-        }
-        // pi: row X becomes column X
-        for t in [e, o] {
-            for x in 0..5 {
-                ops.push(Op::Permd(t + x, t + x, K_PI + x));
-            }
+        // pi: pair X lane Y <- lane (X + 3 Y) % 5, now pair x = column x
+        for x in 0..5 {
+            ops.push(Op::PermdW(row(x), row(x), K_PI + 2 * x));
         }
         // chi in place: columns 0 and 1 are needed after they are overwritten
-        for t in [e, o] {
-            ops.push(Op::Mov(KT0, t));
-            ops.push(Op::Mov(KT1, t + 1));
-            for x in 0..5u8 {
-                let col = |c: u8| if x + c < 5 { t + x + c } else if x + c == 5 { KT0 } else { KT1 };
-                ops.push(Op::Tern(t + x, col(1), col(2), CHI));
-            }
+        ops.push(w(Op::Mov(K_S0, row(0))));
+        ops.push(w(Op::Mov(K_S1, row(1))));
+        for x in 0..5u8 {
+            let col = |c: u8| if x + c < 5 { row(x + c) } else if x + c == 5 { K_S0 } else { K_S1 };
+            ops.push(w(Op::Tern(row(x), col(1), col(2), CHI)));
         }
         // iota
-        ops.push(Op::Xor(e, e, K_RC_E + round));
-        ops.push(Op::Xor(o, o, K_RC_O + round));
+        ops.push(w(Op::Xor(row(0), row(0), K_RC + 2 * round)));
         // back to the R layout
-        ops.push(Op::Transpose(e));
-        ops.push(Op::Transpose(o));
+        ops.push(Op::TransposeQW(K_STATE));
     }
     ops
 }
 
-/// Rate rows 0..4 into standard 32 bit words: (E, O) halves -> perfect shuffle of 16 bit halves
-fn keccak_squeeze_ops() -> Vec<Op> {
-    let (e, o) = K_TILES[0];
-    let mut ops = Vec::new();
-    for y in 0..4u8 {
-        for (dst, hi) in [(K_OUT_L + y, false), (K_OUT_H + y, true)] {
-            if hi {
-                ops.push(Op::Srl(dst, e + y, 16));
-                ops.push(Op::Tern(dst, o + y, K_MH16, OR_AND));
-            } else {
-                ops.push(Op::Sll(dst, o + y, 16));
-                ops.push(Op::Tern(dst, e + y, K_M16, OR_AND));
-            }
-            // delta swaps: t = ((x >> s) ^ x) & mask; x ^= t ^ (t << s)
-            for (shift, mask) in [(8u8, K_S8), (4, K_S4), (2, K_S2), (1, K_S1)] {
-                ops.push(Op::Srl(KT0, dst, shift));
-                ops.push(Op::Tern(KT0, dst, mask, XOR_AND));
-                ops.push(Op::Sll(KT1, KT0, shift));
-                ops.push(Op::Tern(dst, KT0, KT1, XOR3));
-            }
-        }
-    }
-    ops
-}
-
-/// Region byte offsets of the 68 samples of a squeezed block, in stream order: sample 4L + j is
-/// bytes 2j..2j + 2 of rate lane L = 5y + x, i.e. half j % 2 of word j / 2 of that lane
+/// Byte offsets of the 68 samples of a squeezed block in the stored rate rows (pairs 0..4), in
+/// stream order: sample 4 L + j is bytes 2 j..2 j + 2 of lane L = 5 y + x, at byte 64 y + 8 x
 fn sample_offsets() -> Vec<usize> {
     (0..shake::RATE_LANES * 4)
         .map(|i| {
             let (lane, j) = (i / 4, i % 4);
-            let slot = if j < 2 { K_OUT_L } else { K_OUT_H } as usize + lane / 5;
-            32 * slot + 4 * (lane % 5) + 2 * (j % 2)
+            64 * (lane / 5) + 8 * (lane % 5) + 2 * j
         })
         .collect()
 }
@@ -885,20 +912,35 @@ fn emit_take(s: &mut String) {
     // A cold call keeps the rare rejection out of line, so the common path is a not taken branch
     // instead of a select
     writeln!(s, "#[cold]\n#[inline(never)]\nfn rejected(p: *mut u16) -> *mut u16 {{\n    unsafe {{ p.sub(1) }}\n}}").unwrap();
-    writeln!(s, "/// Appends the accepted samples of a squeezed block (`b`: the stored slots K_OUT_L..K_OUT_H + 4)").unwrap();
-    writeln!(s, "/// at `p` (see shake::Sponge::take)").unwrap();
+    writeln!(s, "/// Appends the accepted samples of a squeezed block (`b`: the stored rate rows) at `p` (see").unwrap();
+    writeln!(s, "/// shake::Sponge::take)").unwrap();
     writeln!(s, "#[inline(always)]\npub unsafe fn take_candidates(b: *const u8, mut p: *mut u16) -> *mut u16 {{").unwrap();
-    for off in sample_offsets().iter().map(|off| off - 32 * K_OUT_L as usize) {
+    for off in sample_offsets() {
         writeln!(s, "    let v = u16::from_be((b.add({off}) as *const u16).read_volatile()); p.write_volatile(v); p = p.add(1); if v >= {} {{ p = rejected(p); }}", 5 * Q).unwrap();
     }
     writeln!(s, "    p\n}}").unwrap();
+}
+
+/// u64 lane `x` of pair `pair` in the region model
+fn lane_mut(region: &mut [[u32; 8]; 256], pair: u8, x: usize) -> (&mut u32, &mut u32) {
+    let (lo, hi) = region[pair as usize + x / 4].split_at_mut(2 * (x % 4) + 1);
+    (&mut lo[2 * (x % 4)], &mut hi[0])
+}
+
+fn lane_get(region: &[[u32; 8]; 256], pair: u8, x: usize) -> u64 {
+    let s = &region[pair as usize + x / 4];
+    s[2 * (x % 4)] as u64 | (s[2 * (x % 4) + 1] as u64) << 32
+}
+
+fn lane_set(region: &mut [[u32; 8]; 256], pair: u8, x: usize, v: u64) {
+    let (lo, hi) = lane_mut(region, pair, x);
+    (*lo, *hi) = (v as u32, (v >> 32) as u32);
 }
 
 struct SimSponge<'a> {
     region: [[u32; 8]; 256],
     f: &'a [Op],
     absorb: &'a [Op],
-    squeeze: &'a [Op],
     table: Vec<[u32; 8]>,
     out: Vec<u32>,
 }
@@ -911,9 +953,8 @@ impl SimSponge<'_> {
 }
 
 impl shake::Sponge for SimSponge<'_> {
-    fn set_input(&mut self, lane: usize, even: u32, odd: u32) {
-        self.region[(K_IN_E as usize) + lane / 5][lane % 5] = even;
-        self.region[(K_IN_O as usize) + lane / 5][lane % 5] = odd;
+    fn set_input(&mut self, lane: usize, value: u64) {
+        lane_set(&mut self.region, K_IN + 2 * (lane / 5) as u8, lane % 5, value);
     }
     fn absorb_permute(&mut self) {
         let (a, f) = (self.absorb, self.f);
@@ -924,13 +965,10 @@ impl shake::Sponge for SimSponge<'_> {
         let f = self.f;
         self.run(f);
     }
-    fn squeeze(&mut self) {
-        let s = self.squeeze;
-        self.run(s);
-    }
+    fn squeeze(&mut self) {}
     fn take(&mut self, n: usize) -> usize {
         assert_eq!(n, self.out.len());
-        let bytes: Vec<u8> = self.region.iter().flat_map(|slot| slot.iter().flat_map(|w| w.to_le_bytes())).collect();
+        let bytes: Vec<u8> = self.region[K_STATE as usize..K_STATE as usize + 8].iter().flat_map(|slot| slot.iter().flat_map(|w| w.to_le_bytes())).collect();
         for off in sample_offsets() {
             let v = u16::from_be_bytes([bytes[off], bytes[off + 1]]) as u32;
             if v < 5 * Q {
@@ -968,34 +1006,29 @@ fn shake256_ref(data: &[u8], out_len: usize) -> Vec<u8> {
     }
 }
 
-fn keccak_self_test(f: &[Op], absorb: &[Op], squeeze: &[Op], init: &[Op]) {
+fn keccak_self_test(f: &[Op], absorb: &[Op], init: &[Op]) {
     assert_eq!(&shake256_ref(b"", 8), &[0x46, 0xb9, 0xdd, 0x2b, 0x0b, 0xa8, 0x8d, 0x13], "reference SHAKE256");
-    for i in 0..100u64 {
-        let x = i.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(i as u32);
-        let (e, o) = shake::deinterleave(x);
-        assert_eq!(interleave(e, o), x);
-    }
     let table = keccak_table();
-    // The permutation alone
+    // The permutation alone, with garbage in the unused rows and lanes
     let mut region = [[0u32; 8]; 256];
+    for (i, slot) in region[..16].iter_mut().enumerate() {
+        *slot = std::array::from_fn(|l| (i as u32 * 8 + l as u32).wrapping_mul(0x9e37_79b9));
+    }
     simulate(init, &mut region, &|_, row| table[row]);
     let mut a: [u64; 25] = std::array::from_fn(|i| (i as u64 + 1).wrapping_mul(0x0123_4567_89ab_cdef).rotate_left(i as u32 * 7));
     for i in 0..25 {
-        let (e, o) = shake::deinterleave(a[i]);
-        region[(K_TILES[0].0 as usize) + i / 5][i % 5] = e;
-        region[(K_TILES[0].1 as usize) + i / 5][i % 5] = o;
+        lane_set(&mut region, K_STATE + 2 * (i / 5) as u8, i % 5, a[i]);
     }
     simulate(f, &mut region, &|_, row| table[row]);
     keccak_f_ref(&mut a);
     for i in 0..25 {
-        let got = interleave(region[(K_TILES[0].0 as usize) + i / 5][i % 5], region[(K_TILES[0].1 as usize) + i / 5][i % 5]);
-        assert_eq!(got, a[i], "keccak lane {i}");
+        assert_eq!(lane_get(&region, K_STATE + 2 * (i / 5) as u8, i % 5), a[i], "keccak lane {i}");
     }
     // hash_to_point through the driver against the reference
     for msg_len in [0usize, 1, 7, 95, 96, 135, 136, 200, 271, 272, 1000] {
         let nonce: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(37)).collect();
         let msg: Vec<u8> = (0..msg_len).map(|i| (i as u8).wrapping_mul(13) ^ 0x5a).collect();
-        let mut sponge = SimSponge { region: [[0; 8]; 256], f, absorb, squeeze, table: table.clone(), out: Vec::new() };
+        let mut sponge = SimSponge { region: [[0; 8]; 256], f, absorb, table: table.clone(), out: Vec::new() };
         sponge.run(init);
         shake::hash_to_point(&mut sponge, &nonce, &msg);
         let stream = shake256_ref(&[nonce.clone(), msg].concat(), 8 * 136 * 4);
@@ -1008,28 +1041,25 @@ fn main() {
     let pk_path = std::env::var("FALCON_PK").unwrap_or_else(|_| "../fixtures/falcon.pk".to_string());
     println!("cargo:rerun-if-changed={pk_path}");
     println!("cargo:rerun-if-changed=build.rs");
-    assert_eq!(K_IN_O, K_IN_E + 4);
-    assert_eq!(K_OUT_H, K_OUT_L + 4);
     assert_eq!(ACC2, ACC1 + 1);
     let (psi_pos, psi_neg) = twiddles();
     let (ops, mut tables, checks) = generate(&psi_pos, &psi_neg);
     self_test(&ops, &tables, &checks, &psi_pos);
     let h = decode_pubkey(&std::fs::read(&pk_path).expect("pubkey fixture"));
     tables.insert("H_PREP", prepare(&h, &psi_pos));
-    let (k_init, k_absorb, k_f, k_squeeze) = (keccak_init_ops(), keccak_absorb_ops(), keccak_f_ops(), keccak_squeeze_ops());
-    keccak_self_test(&k_f, &k_absorb, &k_squeeze, &k_init);
+    let (k_init, k_absorb, k_f) = (keccak_init_ops(), keccak_absorb_ops(), keccak_f_ops());
+    keccak_self_test(&k_f, &k_absorb, &k_init);
     let mut s = String::new();
     for (name, rows) in &tables {
         emit_table(&mut s, name, rows);
     }
     emit_table(&mut s, "KC", &keccak_table());
     writeln!(s, "pub const ACC1: u8 = {ACC1};\npub const C_SLOT: u8 = {C};\npub const P_SLOT: u8 = {P};").unwrap();
-    writeln!(s, "pub const K_IN_E: u8 = {K_IN_E};\npub const K_OUT_L: u8 = {K_OUT_L};").unwrap();
+    writeln!(s, "pub const K_IN: u8 = {K_IN};\npub const K_STATE: u8 = {K_STATE};").unwrap();
     emit_fn(&mut s, "vector_core", &ops);
     emit_fn(&mut s, "keccak_init", &k_init);
     emit_fn(&mut s, "keccak_absorb", &k_absorb);
     emit_fn(&mut s, "keccak_f", &k_f);
-    emit_fn(&mut s, "keccak_squeeze", &k_squeeze);
     emit_take(&mut s);
     let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("vector_core.rs");
     std::fs::write(out, s).unwrap();

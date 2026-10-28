@@ -49,6 +49,15 @@ define_syscall!(fn sol_avx512_madd16x32(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_add32x16(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_bcast32x16(ops: u64, value: u64) -> u64);
 define_syscall!(fn sol_avx512_permi2d512(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_xor512(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_ternlog512(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_permd512(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_mov512(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_rolv64x4(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_rolv64x8(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_transpose8x8q(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_blendw512(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_ror32x16(ops: u64) -> u64);
 
 /// `n` consecutive slots from `src` (one translation)
 #[inline(always)]
@@ -153,4 +162,47 @@ pub fn bcast512(d: u8, value: u32) {
 #[inline(always)]
 pub fn permi2d512(d: u8, a: u8, b: u8) {
     unsafe { sol_avx512_permi2d512(ops3(d, a, b)) };
+}
+
+/// 512 bit forms on slot pairs (even slots)
+#[inline(always)]
+pub fn xor512(d: u8, a: u8, b: u8) {
+    unsafe { sol_avx512_xor512(ops3(d, a, b)) };
+}
+/// `d = f(d, a, b)` bitwise (see [tern]), slots below 128
+#[inline(always)]
+pub fn tern512(d: u8, a: u8, b: u8, imm: u8) {
+    unsafe { sol_avx512_ternlog512(ops7(d, a, b, imm)) };
+}
+/// `d[i] = data[idx[i] & 15]` over the 16 u32 lanes of the pairs
+#[inline(always)]
+pub fn permd512(d: u8, data: u8, idx: u8) {
+    unsafe { sol_avx512_permd512(ops3(d, data, idx)) };
+}
+#[inline(always)]
+pub fn mov512(d: u8, a: u8) {
+    unsafe { sol_avx512_mov512(ops3(d, a, 0)) };
+}
+/// u64 lanes: `d = a.rotate_left(b % 64)`, 512 bit form if `wide`
+#[inline(always)]
+pub fn rolv64(wide: bool, d: u8, a: u8, b: u8) {
+    if wide {
+        unsafe { sol_avx512_rolv64x8(ops3(d, a, b)) };
+    } else {
+        unsafe { sol_avx512_rolv64x4(ops3(d, a, b)) };
+    }
+}
+/// Transposes the 8 x 8 u64 matrix of the pairs d, d + 2, .., d + 14
+#[inline(always)]
+pub fn transpose8x8q(d: u8) {
+    unsafe { sol_avx512_transpose8x8q(d as u64) };
+}
+/// Word blend on pairs (mask bit i % 8 picks word i from b), slots below 128
+#[inline(always)]
+pub fn blendw512(d: u8, a: u8, b: u8, mask: u8) {
+    unsafe { sol_avx512_blendw512(ops7(d, a, b, mask)) };
+}
+#[inline(always)]
+pub fn ror512(d: u8, a: u8, n: u8) {
+    unsafe { sol_avx512_ror32x16(ops3(d, a, n)) };
 }
