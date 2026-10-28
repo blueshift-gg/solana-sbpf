@@ -94,7 +94,10 @@ fn verify(sig: &[u8; SIG_LEN], message: &[u8]) -> bool {
     // and then s2 share one buffer.
     let mut buffer = Candidates([0; N + 68]);
     generated::keccak_init();
-    let mut sponge = VectorSponge { input: Lanes([0; 32]), candidates: &mut buffer };
+    let mut sponge = VectorSponge {
+        input: Lanes([0; 32]),
+        candidates: &mut buffer,
+    };
     shake::hash_to_point(&mut sponge, nonce, message);
     iv::load(generated::C_SLOT, 32, buffer.0.as_ptr().cast());
     if !codec::decompress_signature(comp, buffer.0.as_mut_ptr()) {

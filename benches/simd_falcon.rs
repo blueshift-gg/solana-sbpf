@@ -51,7 +51,8 @@ fn load_sigs(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn runner(p: &Program, data: &[u8], engine: Engine) -> Runner {
-    let mut r = Runner::from_elf(&p.elf, data, HEAP, config(SimdJitStrategy::RegisterCached)).expect("load");
+    let mut r = Runner::from_elf(&p.elf, data, HEAP, config(SimdJitStrategy::RegisterCached))
+        .expect("load");
     r.budget = 1_400_000;
     if engine == Engine::Jit {
         r.jit_compile().expect("jit");
@@ -94,12 +95,24 @@ fn stats(v: &mut [f64]) -> (f64, f64, f64) {
 fn main() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("simd-falcon/fixtures");
     let programs = [
-        Program { id: "blueshift", label: "blueshift-gg/solana-falcon512 (scalar sBPF)", elf: std::fs::read(dir.join("falcon_blueshift.so")).unwrap() },
-        Program { id: "simd", label: "Firedancer Falcon-512 with vector intrinsics (16 bit NTT, vector SHAKE)", elf: std::fs::read(dir.join("falcon_simd.so")).unwrap() },
+        Program {
+            id: "blueshift",
+            label: "blueshift-gg/solana-falcon512 (scalar sBPF)",
+            elf: std::fs::read(dir.join("falcon_blueshift.so")).unwrap(),
+        },
+        Program {
+            id: "simd",
+            label: "Firedancer Falcon-512 with vector intrinsics (16 bit NTT, vector SHAKE)",
+            elf: std::fs::read(dir.join("falcon_simd.so")).unwrap(),
+        },
     ];
     let sigs = load_sigs(&dir.join("sigs.bin"));
     let quick = std::env::var("SIMD_BENCH_QUICK").is_ok_and(|v| v == "1");
-    let timed = std::env::var("FALCON_BENCH_SIGS").ok().and_then(|v| v.parse().ok()).unwrap_or(sigs.len()).min(sigs.len());
+    let timed = std::env::var("FALCON_BENCH_SIGS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(sigs.len())
+        .min(sigs.len());
     let mut engines = vec![Engine::Interpreter];
     if cfg!(target_arch = "x86_64") {
         engines.push(Engine::Jit);
@@ -108,7 +121,11 @@ fn main() {
         "host: {} {}{}, {} signatures",
         std::env::consts::ARCH,
         std::env::consts::OS,
-        if running_under_rosetta() { " (Rosetta 2)" } else { "" },
+        if running_under_rosetta() {
+            " (Rosetta 2)"
+        } else {
+            ""
+        },
         sigs.len()
     );
 
@@ -117,57 +134,136 @@ fn main() {
     let mut cus: Vec<Vec<u64>> = vec![Vec::new(); programs.len()];
     for (sig, msg) in &sigs {
         let mut bad_msg = msg.clone();
-        if bad_msg.is_empty() { bad_msg.push(1) } else { bad_msg[0] ^= 1 }
+        if bad_msg.is_empty() {
+            bad_msg.push(1)
+        } else {
+            bad_msg[0] ^= 1
+        }
         let mut bad_sig = sig.clone();
         bad_sig[100] ^= 0x10;
         for (pi, p) in programs.iter().enumerate() {
             let mut reference = None;
             for &engine in &engines {
                 let (cu, result) = runner(p, &input(sig, msg), engine).run(engine);
-                assert_eq!(exit_code(&result), Some(0), "{} rejected a valid signature on {:?}: {:?}", p.id, engine, result);
+                assert_eq!(
+                    exit_code(&result),
+                    Some(0),
+                    "{} rejected a valid signature on {:?}: {:?}",
+                    p.id,
+                    engine,
+                    result
+                );
                 match reference {
                     None => reference = Some(cu),
                     Some(r) => assert_eq!(r, cu, "{} CUs differ between engines", p.id),
                 }
                 for bad in [input(sig, &bad_msg), input(&bad_sig, msg)] {
                     let (_, result) = runner(p, &bad, engine).run(engine);
-                    assert_ne!(exit_code(&result), Some(0), "{} accepted a tampered input on {:?}", p.id, engine);
+                    assert_ne!(
+                        exit_code(&result),
+                        Some(0),
+                        "{} accepted a tampered input on {:?}",
+                        p.id,
+                        engine
+                    );
                 }
             }
             cus[pi].push(reference.unwrap());
         }
     }
-    eprintln!("correctness: {} signatures accepted, tampered inputs rejected, by both programs on {:?}", sigs.len(), engines);
+    eprintln!(
+        "correctness: {} signatures accepted, tampered inputs rejected, by both programs on {:?}",
+        sigs.len(),
+        engines
+    );
 
     let mut out = String::new();
-    let _ = write!(out, r#"{{"host":"{} {}","rosetta":{},"signatures":{},"programs":["#, std::env::consts::ARCH, std::env::consts::OS, running_under_rosetta(), sigs.len());
+    let _ = write!(
+        out,
+        r#"{{"host":"{} {}","rosetta":{},"signatures":{},"programs":["#,
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        running_under_rosetta(),
+        sigs.len()
+    );
     for (pi, p) in programs.iter().enumerate() {
         let mut c: Vec<f64> = cus[pi].iter().map(|x| *x as f64).collect();
         let (cmin, cmed, cmax) = stats(&mut c);
-        let _ = write!(out, r#"{}{{"id":"{}","label":"{}","elf_bytes":{},"cus":{{"min":{},"median":{},"max":{}}},"cu_list":{:?},"engines":{{"#, if pi > 0 { "," } else { "" }, p.id, p.label, p.elf.len(), cmin, cmed, cmax, cus[pi]);
+        let _ = write!(
+            out,
+            r#"{}{{"id":"{}","label":"{}","elf_bytes":{},"cus":{{"min":{},"median":{},"max":{}}},"cu_list":{:?},"engines":{{"#,
+            if pi > 0 { "," } else { "" },
+            p.id,
+            p.label,
+            p.elf.len(),
+            cmin,
+            cmed,
+            cmax,
+            cus[pi]
+        );
         for (ei, &engine) in engines.iter().enumerate() {
-            let mut ns: Vec<f64> = sigs[..timed].iter().map(|(sig, msg)| time(&mut runner(p, &input(sig, msg), engine), engine, quick)).collect();
+            let mut ns: Vec<f64> = sigs[..timed]
+                .iter()
+                .map(|(sig, msg)| time(&mut runner(p, &input(sig, msg), engine), engine, quick))
+                .collect();
             let list = ns.clone();
             let (tmin, tmed, tmax) = stats(&mut ns);
             let compile = if engine == Engine::Jit {
-                let r = Runner::from_elf(&p.elf, &input(&sigs[0].0, &sigs[0].1), HEAP, config(SimdJitStrategy::RegisterCached)).unwrap();
-                let mut v: Vec<f64> = (0..5).map(|_| {
-                    let r = Runner::from_elf(&p.elf, &input(&sigs[0].0, &sigs[0].1), HEAP, config(SimdJitStrategy::RegisterCached)).unwrap();
-                    r.jit_compile().unwrap().as_nanos() as f64
-                }).collect();
+                let r = Runner::from_elf(
+                    &p.elf,
+                    &input(&sigs[0].0, &sigs[0].1),
+                    HEAP,
+                    config(SimdJitStrategy::RegisterCached),
+                )
+                .unwrap();
+                let mut v: Vec<f64> = (0..5)
+                    .map(|_| {
+                        let r = Runner::from_elf(
+                            &p.elf,
+                            &input(&sigs[0].0, &sigs[0].1),
+                            HEAP,
+                            config(SimdJitStrategy::RegisterCached),
+                        )
+                        .unwrap();
+                        r.jit_compile().unwrap().as_nanos() as f64
+                    })
+                    .collect();
                 drop(r);
                 stats(&mut v).1
             } else {
                 0.0
             };
-            let name = if engine == Engine::Jit { "jit" } else { "interpreter" };
-            eprintln!("{:10} {:12} CUs median {:>8}  time median {:>10.1} µs (min {:.1}, max {:.1})", p.id, name, cmed, tmed / 1e3, tmin / 1e3, tmax / 1e3);
-            let _ = write!(out, r#"{}"{}":{{"ns":{{"min":{:.1},"median":{:.1},"max":{:.1}}},"ns_list":{:?},"compile_ns":{:.0}}}"#, if ei > 0 { "," } else { "" }, name, tmin, tmed, tmax, list.iter().map(|x| x.round()).collect::<Vec<_>>(), compile);
+            let name = if engine == Engine::Jit {
+                "jit"
+            } else {
+                "interpreter"
+            };
+            eprintln!(
+                "{:10} {:12} CUs median {:>8}  time median {:>10.1} µs (min {:.1}, max {:.1})",
+                p.id,
+                name,
+                cmed,
+                tmed / 1e3,
+                tmin / 1e3,
+                tmax / 1e3
+            );
+            let _ = write!(
+                out,
+                r#"{}"{}":{{"ns":{{"min":{:.1},"median":{:.1},"max":{:.1}}},"ns_list":{:?},"compile_ns":{:.0}}}"#,
+                if ei > 0 { "," } else { "" },
+                name,
+                tmin,
+                tmed,
+                tmax,
+                list.iter().map(|x| x.round()).collect::<Vec<_>>(),
+                compile
+            );
         }
         out.push_str("}}");
     }
     out.push_str("]}");
-    let path = std::env::var("FALCON_BENCH_OUT").unwrap_or_else(|_| "target/simd-bench/falcon.json".to_string());
+    let path = std::env::var("FALCON_BENCH_OUT")
+        .unwrap_or_else(|_| "target/simd-bench/falcon.json".to_string());
     if let Some(parent) = Path::new(&path).parent() {
         std::fs::create_dir_all(parent).unwrap();
     }

@@ -57,7 +57,9 @@ pub fn hash_to_point<S: Sponge>(s: &mut S, nonce: &[u8], message: &[u8]) {
     while pos + RATE <= total {
         if pos >= nonce.len() {
             // Straight from the message
-            let block: &[u8; RATE] = message[pos - nonce.len()..pos - nonce.len() + RATE].try_into().unwrap();
+            let block: &[u8; RATE] = message[pos - nonce.len()..pos - nonce.len() + RATE]
+                .try_into()
+                .unwrap();
             s.absorb_block(block);
         } else {
             // The block with (the rest of) the nonce is put together first
@@ -73,7 +75,11 @@ pub fn hash_to_point<S: Sponge>(s: &mut S, nonce: &[u8], message: &[u8]) {
     let rest = total - pos;
     for lane in 0..RATE_LANES {
         let start = pos + 8 * lane;
-        let mut value = if start < total { read_lane(nonce, message, start) } else { 0 };
+        let mut value = if start < total {
+            read_lane(nonce, message, start)
+        } else {
+            0
+        };
         if start < total && total - start < 8 {
             value &= (1u64 << (8 * (total - start))) - 1;
         }

@@ -47,7 +47,7 @@ crate::declare_builtin_function!(
         context.consume(mem_op_cost(n));
         if n > 0 {
             let buf = Result::from(context.mapping.map(crate::memory_region::AccessType::Store, dst, n))?;
-            unsafe { std::ptr::write_bytes(buf.ptr_mut() as *mut u8, c as u8, n as usize) };
+            unsafe { std::ptr::write_bytes(buf.ptr_mut().cast::<u8>(), c as u8, n as usize) };
         }
         Ok(0)
     }
@@ -68,7 +68,7 @@ crate::declare_builtin_function!(
         if n > 0 {
             let s = Result::from(context.mapping.map(crate::memory_region::AccessType::Load, src, n))?;
             let d = Result::from(context.mapping.map(crate::memory_region::AccessType::Store, dst, n))?;
-            unsafe { std::ptr::copy(s.ptr_mut() as *const u8, d.ptr_mut() as *mut u8, n as usize) };
+            unsafe { std::ptr::copy(s.ptr_mut().cast::<u8>().cast_const(), d.ptr_mut().cast::<u8>(), n as usize) };
         }
         Ok(0)
     }
@@ -156,8 +156,14 @@ impl Runner {
     }
 
     /// Loads a compiled SBPF ELF (e.g. built with `cargo-build-sbf --arch v3`)
-    pub fn from_elf(elf: &[u8], input: &[u8], heap_size: usize, config: Config) -> Result<Self, EbpfError> {
-        let executable = Executable::load(elf, Self::loader(config)?).map_err(EbpfError::ElfError)?;
+    pub fn from_elf(
+        elf: &[u8],
+        input: &[u8],
+        heap_size: usize,
+        config: Config,
+    ) -> Result<Self, EbpfError> {
+        let executable =
+            Executable::load(elf, Self::loader(config)?).map_err(EbpfError::ElfError)?;
         Self::with_executable(executable, input, heap_size)
     }
 
@@ -166,12 +172,20 @@ impl Runner {
         let mut loader = BuiltinProgram::new_loader(config);
         super::intrinsics::register(&mut loader).map_err(EbpfError::ElfError)?;
         // The memory syscalls compiled programs may use
-        loader.register_definition::<SyscallMemset>("sol_memset_").map_err(EbpfError::ElfError)?;
-        loader.register_definition::<SyscallMemcpy>("sol_memcpy_").map_err(EbpfError::ElfError)?;
+        loader
+            .register_definition::<SyscallMemset>("sol_memset_")
+            .map_err(EbpfError::ElfError)?;
+        loader
+            .register_definition::<SyscallMemcpy>("sol_memcpy_")
+            .map_err(EbpfError::ElfError)?;
         Ok(Arc::new(loader))
     }
 
-    fn with_executable(executable: Executable<HarnessContext>, input: &[u8], heap_size: usize) -> Result<Self, EbpfError> {
+    fn with_executable(
+        executable: Executable<HarnessContext>,
+        input: &[u8],
+        heap_size: usize,
+    ) -> Result<Self, EbpfError> {
         executable.verify::<RequisiteVerifier>()?;
         let config = executable.get_config();
         let mut runner = Self {

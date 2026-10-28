@@ -400,7 +400,8 @@ impl<C: ContextObject> Executable<C> {
     /// Control flow facts of the vector experiment (computed once)
     #[cfg(feature = "simd-experiment")]
     pub fn simd_analysis(&self) -> &crate::simd::SimdAnalysis {
-        self.simd_analysis.get_or_init(|| crate::simd::analyze(self))
+        self.simd_analysis
+            .get_or_init(|| crate::simd::analyze(self))
     }
 
     /// Get the JIT compiled program

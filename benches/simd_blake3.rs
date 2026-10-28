@@ -40,7 +40,14 @@ const fn v(
     engine: Engine,
     strategy: SimdJitStrategy,
 ) -> Variant {
-    Variant { id, label, kernel, mode, engine, strategy }
+    Variant {
+        id,
+        label,
+        kernel,
+        mode,
+        engine,
+        strategy,
+    }
 }
 
 use Engine::*;
@@ -50,19 +57,110 @@ const SLOT: VecMode = VecMode::Slot;
 const CALL: VecMode = VecMode::Call;
 
 const VARIANTS: &[Variant] = &[
-    v("A_scalar_jit", "A: scalar sBPF, JIT", Scalar, SLOT, Jit, Direct),
-    v("A0_scalar_interp", "scalar sBPF, interpreter", Scalar, SLOT, Interpreter, Direct),
-    v("B_simd8_interp", "B: SIMD 8-way, interpreter", Simd8, SLOT, Interpreter, Direct),
-    v("B1_simd1_interp", "SIMD 1-state, interpreter", Simd1, SLOT, Interpreter, Direct),
-    v("D_simd8_slot_direct", "D: SIMD 8-way, vector file, JIT uncached", Simd8, SLOT, Jit, Direct),
-    v("E_simd8_slot_cached", "E: SIMD 8-way, vector file, JIT reg-cached", Simd8, SLOT, Jit, RegisterCached),
-    v("D1_simd1_slot_direct", "SIMD 1-state, vector file, JIT uncached", Simd1, SLOT, Jit, Direct),
-    v("E1_simd1_slot_cached", "SIMD 1-state, vector file, JIT reg-cached", Simd1, SLOT, Jit, RegisterCached),
-    v("G_simd8_call_cached", "G: SIMD 8-way, intrinsic calls, JIT reg-cached", Simd8, CALL, Jit, RegisterCached),
-    v("G1_simd1_call_cached", "SIMD 1-state, intrinsic calls, JIT reg-cached", Simd1, CALL, Jit, RegisterCached),
-    v("H_simd8_call_direct", "H: SIMD 8-way, intrinsic calls, JIT uncached", Simd8, CALL, Jit, Direct),
-    v("H1_simd1_call_direct", "SIMD 1-state, intrinsic calls, JIT uncached", Simd1, CALL, Jit, Direct),
-    v("I_simd8_call_interp", "SIMD 8-way, intrinsic calls, interpreter", Simd8, CALL, Interpreter, Direct),
+    v(
+        "A_scalar_jit",
+        "A: scalar sBPF, JIT",
+        Scalar,
+        SLOT,
+        Jit,
+        Direct,
+    ),
+    v(
+        "A0_scalar_interp",
+        "scalar sBPF, interpreter",
+        Scalar,
+        SLOT,
+        Interpreter,
+        Direct,
+    ),
+    v(
+        "B_simd8_interp",
+        "B: SIMD 8-way, interpreter",
+        Simd8,
+        SLOT,
+        Interpreter,
+        Direct,
+    ),
+    v(
+        "B1_simd1_interp",
+        "SIMD 1-state, interpreter",
+        Simd1,
+        SLOT,
+        Interpreter,
+        Direct,
+    ),
+    v(
+        "D_simd8_slot_direct",
+        "D: SIMD 8-way, vector file, JIT uncached",
+        Simd8,
+        SLOT,
+        Jit,
+        Direct,
+    ),
+    v(
+        "E_simd8_slot_cached",
+        "E: SIMD 8-way, vector file, JIT reg-cached",
+        Simd8,
+        SLOT,
+        Jit,
+        RegisterCached,
+    ),
+    v(
+        "D1_simd1_slot_direct",
+        "SIMD 1-state, vector file, JIT uncached",
+        Simd1,
+        SLOT,
+        Jit,
+        Direct,
+    ),
+    v(
+        "E1_simd1_slot_cached",
+        "SIMD 1-state, vector file, JIT reg-cached",
+        Simd1,
+        SLOT,
+        Jit,
+        RegisterCached,
+    ),
+    v(
+        "G_simd8_call_cached",
+        "G: SIMD 8-way, intrinsic calls, JIT reg-cached",
+        Simd8,
+        CALL,
+        Jit,
+        RegisterCached,
+    ),
+    v(
+        "G1_simd1_call_cached",
+        "SIMD 1-state, intrinsic calls, JIT reg-cached",
+        Simd1,
+        CALL,
+        Jit,
+        RegisterCached,
+    ),
+    v(
+        "H_simd8_call_direct",
+        "H: SIMD 8-way, intrinsic calls, JIT uncached",
+        Simd8,
+        CALL,
+        Jit,
+        Direct,
+    ),
+    v(
+        "H1_simd1_call_direct",
+        "SIMD 1-state, intrinsic calls, JIT uncached",
+        Simd1,
+        CALL,
+        Jit,
+        Direct,
+    ),
+    v(
+        "I_simd8_call_interp",
+        "SIMD 8-way, intrinsic calls, interpreter",
+        Simd8,
+        CALL,
+        Interpreter,
+        Direct,
+    ),
 ];
 
 const SIZES: &[usize] = &[64, 1024, 2048, 4096, 8192, 16384, 65536, 1 << 20];
@@ -73,7 +171,7 @@ fn quick() -> bool {
 
 fn selected(id: &str) -> bool {
     let skipped = std::env::var("SIMD_BENCH_SKIP")
-        .map_or(false, |list| list.split(',').any(|s| !s.is_empty() && id.contains(s)));
+        .is_ok_and(|list| list.split(',').any(|s| !s.is_empty() && id.contains(s)));
     !skipped && std::env::var("SIMD_BENCH_FILTER").map_or(true, |f| id.contains(&f))
 }
 
@@ -180,7 +278,11 @@ fn main() {
         "{} {}{}",
         std::env::consts::ARCH,
         std::env::consts::OS,
-        if running_under_rosetta() { " (Rosetta 2 translated)" } else { "" }
+        if running_under_rosetta() {
+            " (Rosetta 2 translated)"
+        } else {
+            ""
+        }
     );
     let cpu = cpu_name();
     eprintln!("host: {host}, cpu: {cpu}");
@@ -205,7 +307,19 @@ fn main() {
                 let m = measure(|| {
                     std::hint::black_box(blake3::hash(std::hint::black_box(&input)));
                 });
-                emit(&mut out, &mut first, &id, "F_native", "F: native blake3 crate (host)", size, &m, None, None, "null", None);
+                emit(
+                    &mut out,
+                    &mut first,
+                    &id,
+                    "F_native",
+                    "F: native blake3 crate (host)",
+                    size,
+                    &m,
+                    None,
+                    None,
+                    "null",
+                    None,
+                );
             }
         }
         for variant in VARIANTS {
@@ -217,11 +331,21 @@ fn main() {
                 emit_unsupported(&mut out, &mut first, &id, variant, size);
                 continue;
             }
-            if quick() && size == 1 << 20 && variant.engine == Interpreter && variant.kernel != Simd8 {
+            if quick()
+                && size == 1 << 20
+                && variant.engine == Interpreter
+                && variant.kernel != Simd8
+            {
                 continue;
             }
             let program = blake3_program::hash_program(variant.kernel, variant.mode);
-            let mut runner = Runner::new(&program, &blake3_program::build_input(&input), HEAP_SIZE, config(variant.strategy)).unwrap();
+            let mut runner = Runner::new(
+                &program,
+                &blake3_program::build_input(&input),
+                HEAP_SIZE,
+                config(variant.strategy),
+            )
+            .unwrap();
             let mut compile_ns = None;
             if variant.engine == Jit {
                 let mut times: Vec<f64> = (0..if quick() { 3 } else { 7 })
@@ -239,7 +363,19 @@ fn main() {
             });
             assert_eq!(runner.heap()[HEAP_OUT..HEAP_OUT + 32], expected, "{}", id);
             let stats = stats_json(&runner);
-            emit(&mut out, &mut first, &id, variant.id, variant.label, size, &m, Some(cus), compile_ns, &stats, Some(variant));
+            emit(
+                &mut out,
+                &mut first,
+                &id,
+                variant.id,
+                variant.label,
+                size,
+                &m,
+                Some(cus),
+                compile_ns,
+                &stats,
+                Some(variant),
+            );
         }
     }
     out.push_str(r#"],"compress":["#);
@@ -248,18 +384,114 @@ fn main() {
     let mut first = true;
     let iterations = 256u64;
     for (kernel, mode, engine, strategy, id, label, compressions) in [
-        (Scalar, SLOT, Jit, Direct, "A_scalar_jit", "scalar, JIT", 1u64),
-        (Scalar, SLOT, Interpreter, Direct, "A0_scalar_interp", "scalar, interpreter", 1),
-        (Simd1, SLOT, Interpreter, Direct, "B1_simd1_interp", "SIMD 1-state, interpreter", 1),
-        (Simd8, SLOT, Interpreter, Direct, "B_simd8_interp", "SIMD 8-way, interpreter", 8),
-        (Simd1, SLOT, Jit, Direct, "D1_simd1_slot_direct", "SIMD 1-state, region, JIT uncached", 1),
-        (Simd8, SLOT, Jit, Direct, "D_simd8_slot_direct", "SIMD 8-way, region, JIT uncached", 8),
-        (Simd1, SLOT, Jit, RegisterCached, "E1_simd1_slot_cached", "SIMD 1-state, region, JIT cached", 1),
-        (Simd8, SLOT, Jit, RegisterCached, "E_simd8_slot_cached", "SIMD 8-way, region, JIT cached", 8),
-        (Simd1, CALL, Jit, RegisterCached, "G1_simd1_call_cached", "SIMD 1-state, intrinsic calls, JIT cached", 1),
-        (Simd8, CALL, Jit, RegisterCached, "G_simd8_call_cached", "SIMD 8-way, intrinsic calls, JIT cached", 8),
-        (Simd1, CALL, Jit, Direct, "H1_simd1_call_direct", "SIMD 1-state, intrinsic calls, JIT uncached", 1),
-        (Simd8, CALL, Jit, Direct, "H_simd8_call_direct", "SIMD 8-way, intrinsic calls, JIT uncached", 8),
+        (
+            Scalar,
+            SLOT,
+            Jit,
+            Direct,
+            "A_scalar_jit",
+            "scalar, JIT",
+            1u64,
+        ),
+        (
+            Scalar,
+            SLOT,
+            Interpreter,
+            Direct,
+            "A0_scalar_interp",
+            "scalar, interpreter",
+            1,
+        ),
+        (
+            Simd1,
+            SLOT,
+            Interpreter,
+            Direct,
+            "B1_simd1_interp",
+            "SIMD 1-state, interpreter",
+            1,
+        ),
+        (
+            Simd8,
+            SLOT,
+            Interpreter,
+            Direct,
+            "B_simd8_interp",
+            "SIMD 8-way, interpreter",
+            8,
+        ),
+        (
+            Simd1,
+            SLOT,
+            Jit,
+            Direct,
+            "D1_simd1_slot_direct",
+            "SIMD 1-state, region, JIT uncached",
+            1,
+        ),
+        (
+            Simd8,
+            SLOT,
+            Jit,
+            Direct,
+            "D_simd8_slot_direct",
+            "SIMD 8-way, region, JIT uncached",
+            8,
+        ),
+        (
+            Simd1,
+            SLOT,
+            Jit,
+            RegisterCached,
+            "E1_simd1_slot_cached",
+            "SIMD 1-state, region, JIT cached",
+            1,
+        ),
+        (
+            Simd8,
+            SLOT,
+            Jit,
+            RegisterCached,
+            "E_simd8_slot_cached",
+            "SIMD 8-way, region, JIT cached",
+            8,
+        ),
+        (
+            Simd1,
+            CALL,
+            Jit,
+            RegisterCached,
+            "G1_simd1_call_cached",
+            "SIMD 1-state, intrinsic calls, JIT cached",
+            1,
+        ),
+        (
+            Simd8,
+            CALL,
+            Jit,
+            RegisterCached,
+            "G_simd8_call_cached",
+            "SIMD 8-way, intrinsic calls, JIT cached",
+            8,
+        ),
+        (
+            Simd1,
+            CALL,
+            Jit,
+            Direct,
+            "H1_simd1_call_direct",
+            "SIMD 1-state, intrinsic calls, JIT uncached",
+            1,
+        ),
+        (
+            Simd8,
+            CALL,
+            Jit,
+            Direct,
+            "H_simd8_call_direct",
+            "SIMD 8-way, intrinsic calls, JIT uncached",
+            8,
+        ),
     ] {
         let full_id = format!("compress/{id}");
         if !selected(&full_id) {
@@ -288,9 +520,18 @@ fn main() {
         let _ = write!(
             out,
             r#"{{"id":"{}","label":"{}","ns_per_compression":{:.2},"cus_per_compression":{:.1},"mad_ns":{:.2},"stats":{}}}"#,
-            id, label, m.median_ns / per, cus as f64 / per, m.mad_ns / per, stats_json(&runner)
+            id,
+            label,
+            m.median_ns / per,
+            cus as f64 / per,
+            m.mad_ns / per,
+            stats_json(&runner)
         );
-        eprintln!("{full_id:40} {:>10.1} ns/compression  {:>8.1} CU/compression", m.median_ns / per, cus as f64 / per);
+        eprintln!(
+            "{full_id:40} {:>10.1} ns/compression  {:>8.1} CU/compression",
+            m.median_ns / per,
+            cus as f64 / per
+        );
     }
     // Native reference for one compression
     {
@@ -303,7 +544,11 @@ fn main() {
         if !first {
             out.push(',');
         }
-        let _ = write!(out, r#"{{"id":"F_native","label":"native blake3, 64 byte hash","ns_per_compression":{:.2},"cus_per_compression":null,"mad_ns":{:.2},"stats":null}}"#, m.median_ns, m.mad_ns);
+        let _ = write!(
+            out,
+            r#"{{"id":"F_native","label":"native blake3, 64 byte hash","ns_per_compression":{:.2},"cus_per_compression":null,"mad_ns":{:.2},"stats":null}}"#,
+            m.median_ns, m.mad_ns
+        );
     }
     out.push_str(r#"],"microbench":["#);
 
@@ -335,7 +580,12 @@ fn main() {
             }
             let (cus, result) = runner.run(engine);
             assert!(result.is_ok(), "{} {:?}", full_id, result);
-            assert_eq!(solana_sbpf::simd::read_lanes(runner.heap()[HEAP_OUT..].as_ptr()), reference, "{}", full_id);
+            assert_eq!(
+                solana_sbpf::simd::read_lanes(&runner.heap()[HEAP_OUT..]),
+                reference,
+                "{}",
+                full_id
+            );
             let m = measure(|| {
                 runner.run(engine);
             });
@@ -347,13 +597,19 @@ fn main() {
             let _ = write!(
                 out,
                 r#"{{"id":"{}","repeat":{},"ns_per_op":{:.3},"ns_per_iteration":{:.2},"cus":{},"stats":{}}}"#,
-                id, repeat, m.median_ns / ops, m.median_ns / iterations as f64, cus, stats_json(&runner)
+                id,
+                repeat,
+                m.median_ns / ops,
+                m.median_ns / iterations as f64,
+                cus,
+                stats_json(&runner)
             );
             eprintln!("{full_id:30} {:>8.3} ns/vector-op", m.median_ns / ops);
         }
     }
     out.push_str("]}");
-    let path = std::env::var("SIMD_BENCH_OUT").unwrap_or_else(|_| "target/simd-bench/results.json".to_string());
+    let path = std::env::var("SIMD_BENCH_OUT")
+        .unwrap_or_else(|_| "target/simd-bench/results.json".to_string());
     if let Some(parent) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
@@ -380,7 +636,13 @@ fn emit(
     }
     *first = false;
     let mib_s = size as f64 / (1 << 20) as f64 / (m.median_ns * 1e-9);
-    let engine = variant.map_or("native", |v| if v.engine == Jit { "jit" } else { "interpreter" });
+    let engine = variant.map_or("native", |v| {
+        if v.engine == Jit {
+            "jit"
+        } else {
+            "interpreter"
+        }
+    });
     let _ = write!(
         out,
         r#"{{"id":"{}","variant":"{}","label":"{}","engine":"{}","size":{},"median_ns":{:.1},"min_ns":{:.1},"mad_ns":{:.1},"ticks":{:.1},"mib_s":{:.3},"cus":{},"compile_ns":{},"samples":{},"runs_per_sample":{},"supported":true,"stats":{}}}"#,
@@ -400,7 +662,10 @@ fn emit(
         m.runs_per_sample,
         stats
     );
-    eprintln!("{id:40} {:>14.1} ns  {:>10.2} MiB/s  CUs {:?}", m.median_ns, mib_s, cus);
+    eprintln!(
+        "{id:40} {:>14.1} ns  {:>10.2} MiB/s  CUs {:?}",
+        m.median_ns, mib_s, cus
+    );
 }
 
 fn emit_unsupported(out: &mut String, first: &mut bool, id: &str, variant: &Variant, size: usize) {

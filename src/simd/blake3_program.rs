@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)] // index loops mirror the reference algorithm
 //! Generators for the BLAKE3 sBPF programs of the SIMD experiment.
 //!
 //! All programs are SBPFv4 and take the input region (`r1`) in the layout produced by
@@ -53,7 +54,7 @@ pub const HEAP_CVS: usize = 0x1000;
 pub const HEAP_SIZE: usize = HEAP_CVS + 32 * 1024 + 0x1000;
 
 // Arguments / locals in the heap
-const A_OUT: i16 = HEAP_ARGS as i16 + 0x00; // compress8 output, hash_chunk output
+const A_OUT: i16 = HEAP_ARGS as i16; // compress8 output, hash_chunk output
 const A_CVIN: i16 = HEAP_ARGS as i16 + 0x08;
 const A_CNT: i16 = HEAP_ARGS as i16 + 0x10; // number of chunk CVs / tree level size
 const A_I: i16 = HEAP_ARGS as i16 + 0x18;
@@ -195,7 +196,10 @@ impl Gen {
         let a = &mut self.a;
         // r6 = input (r1 doesn't survive vector intrinsic calls)
         a.mov64(6, 1);
-        a.lddw(VECTOR_FILE_REG, ebpf::MM_HEAP_START + HEAP_VECTOR_FILE as u64);
+        a.lddw(
+            VECTOR_FILE_REG,
+            ebpf::MM_HEAP_START + HEAP_VECTOR_FILE as u64,
+        );
         if self.kernel != Kernel::Scalar {
             for (slot, entry) in [
                 (S_EVEN, C_EVEN),
@@ -934,7 +938,10 @@ pub fn compress_program(kernel: Kernel, mode: VecMode) -> Vec<u8> {
 /// is stored to [HEAP_OUT].
 pub fn microbench_program(repeat: usize, mode: VecMode) -> Vec<u8> {
     let mut a = Asm::new(mode);
-    a.lddw(VECTOR_FILE_REG, ebpf::MM_HEAP_START + HEAP_VECTOR_FILE as u64);
+    a.lddw(
+        VECTOR_FILE_REG,
+        ebpf::MM_HEAP_START + HEAP_VECTOR_FILE as u64,
+    );
     a.mov64(3, 1);
     for i in 0..5u8 {
         a.vload(i, 3, (INPUT_CONSTANTS + 32 * i as usize) as i16);
@@ -959,7 +966,7 @@ pub fn microbench_program(repeat: usize, mode: VecMode) -> Vec<u8> {
 
 /// Reference result of [microbench_program]
 pub fn microbench_reference(input: &[u8], repeat: usize, iterations: u64) -> [u32; 8] {
-    let lanes = |i: usize| super::read_lanes(input[INPUT_CONSTANTS + 32 * i..].as_ptr());
+    let lanes = |i: usize| super::read_lanes(&input[INPUT_CONSTANTS + 32 * i..]);
     let mut v = [lanes(0), lanes(1), lanes(2), lanes(3), lanes(4)];
     for _ in 0..iterations * repeat as u64 {
         for i in 0..8 {

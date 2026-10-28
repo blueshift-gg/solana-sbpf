@@ -49,7 +49,31 @@ const TAB_TRUNC: usize = TAB_ONE16 + 32;
 const TRUNC_PAIRS: [(u8, u8); 6] = [(1, 0), (2, 0), (3, 0), (2, 1), (3, 1), (3, 2)];
 /// 64 in every u64 lane
 const TAB_C64Q: usize = TAB_TRUNC + 6 * 32;
-const TAB_END: usize = TAB_C64Q + 32;
+/// Index masks 0x1f, 0x3f, 0x7f in every byte (byte table lookups of 2, 4, 8 lanes)
+const TAB_BMASK: usize = TAB_C64Q + 32;
+/// u16 constants: 0x0100, 15, 31, 16, 0x00ff
+const TAB_W0100: usize = TAB_BMASK + 96;
+const TAB_W15: usize = TAB_W0100 + 32;
+const TAB_W31: usize = TAB_W15 + 32;
+const TAB_C16W: usize = TAB_W31 + 32;
+const TAB_W00FF: usize = TAB_C16W + 32;
+/// Parity of the nibble (vpshufb table), 0x1b in every byte, 0xff in every u64
+const TAB_PARITY: usize = TAB_W00FF + 32;
+const TAB_1B: usize = TAB_PARITY + 32;
+const TAB_FFQ: usize = TAB_1B + 32;
+/// Bit k in every byte, 8 rows
+const TAB_BYTEBIT: usize = TAB_FFQ + 32;
+/// gf2p8affine: vpshufb indices broadcasting byte 7 - i of every u64 to its bytes, 8 rows
+const TAB_AFFIDX: usize = TAB_BYTEBIT + 8 * 32;
+/// conflict: u32 lane rotations by k (vpermd indices) and the bits 1 << (i - k), k = 1..8; the
+/// bits for u64 lanes, k = 1..4
+const TAB_CONF_IDX32: usize = TAB_AFFIDX + 8 * 32;
+const TAB_CONF_BIT32: usize = TAB_CONF_IDX32 + 7 * 32;
+const TAB_CONF_BIT64: usize = TAB_CONF_BIT32 + 7 * 32;
+/// 0x0000ffff / 0xffff0000 in every u32
+const TAB_LO16: usize = TAB_CONF_BIT64 + 3 * 32;
+const TAB_HI16: usize = TAB_LO16 + 32;
+const TAB_END: usize = TAB_HI16 + 32;
 /// Upper bound of all constants emitted after the subroutines (shuffle masks, opmask tables, tables)
 pub(super) const CONSTANTS_SIZE: usize = TAB_END + 4096;
 
@@ -256,14 +280,17 @@ impl SimdJitState {
         state.gfni = feature(std::arch::is_x86_feature_detected!("gfni"));
         state.vnni = feature(std::arch::is_x86_feature_detected!("avx512vnni"));
         // VEX forms: also without AVX-512 (e.g. Zen 3)
-        state.vpclmul = !config.simd_force_reference && (state.avx512 && force || std::arch::is_x86_feature_detected!("vpclmulqdq"));
+        state.vpclmul = !config.simd_force_reference
+            && (state.avx512 && force || std::arch::is_x86_feature_detected!("vpclmulqdq"));
         // callx may only enter instructions outside runs of vector code (see simd::SimdAnalysis),
         // so block local state is sound even in programs which contain callx
         state.static_flow = true;
         state.cached = config.simd_jit_strategy == SimdJitStrategy::RegisterCached;
         state.jump_targets = analysis.jump_targets.clone();
         state.intrinsics = simd::intrinsics::hashes();
-        Ok((state, vector_instructions))
+        // Code size units of 1024 bytes: one per vector instruction, a scalar loop over up to 64 lanes
+        // (about 45 bytes each) four more
+        Ok((state, vector_instructions + 4 * analysis.lane_loops))
     }
 }
 
@@ -328,7 +355,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit::<u8>(dword | ((i + rotation) & 3));
             }
         }
-        for (anchor, value) in [(ANCHOR_SIMD_C32, 32u32), (ANCHOR_SIMD_ONES, u32::MAX), (ANCHOR_SIMD_C31, 31)] {
+        for (anchor, value) in [
+            (ANCHOR_SIMD_C32, 32u32),
+            (ANCHOR_SIMD_ONES, u32::MAX),
+            (ANCHOR_SIMD_C31, 31),
+        ] {
             self.set_anchor(anchor);
             for _ in 0..8 {
                 self.emit::<u32>(value);
@@ -353,7 +384,15 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         for size in 0..4u32 {
             for i in 0..32 >> size {
-                lane(self, size, if size == 0 { 1u64 << (i % 8) } else { 1u64 << i });
+                lane(
+                    self,
+                    size,
+                    if size == 0 {
+                        1u64 << (i % 8)
+                    } else {
+                        1u64 << i
+                    },
+                );
             }
         }
         for i in 0..32u8 {
@@ -374,7 +413,15 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         for expand in [false, true] {
             for m in 0..256u32 {
                 let idx: Vec<u8> = if expand {
-                    (0..8).map(|i| if (m >> i) & 1 != 0 { (m & ((1 << i) - 1)).count_ones() as u8 } else { 0 }).collect()
+                    (0..8)
+                        .map(|i| {
+                            if (m >> i) & 1 != 0 {
+                                (m & ((1 << i) - 1)).count_ones() as u8
+                            } else {
+                                0
+                            }
+                        })
+                        .collect()
                 } else {
                     let set: Vec<u8> = (0..8).filter(|i| (m >> i) & 1 != 0).collect();
                     (0..8).map(|i| set.get(i).copied().unwrap_or(0)).collect()
@@ -386,7 +433,15 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         for expand in [false, true] {
             for m in 0..16u32 {
                 let lanes: Vec<u8> = if expand {
-                    (0..4).map(|i| if (m >> i) & 1 != 0 { (m & ((1 << i) - 1)).count_ones() as u8 } else { 0 }).collect()
+                    (0..4)
+                        .map(|i| {
+                            if (m >> i) & 1 != 0 {
+                                (m & ((1 << i) - 1)).count_ones() as u8
+                            } else {
+                                0
+                            }
+                        })
+                        .collect()
                 } else {
                     let set: Vec<u8> = (0..4).filter(|i| (m >> i) & 1 != 0).collect();
                     (0..4).map(|i| set.get(i).copied().unwrap_or(0)).collect()
@@ -414,12 +469,65 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             for _ in 0..2 {
                 for j in 0..16 {
                     let kept = 16 / fs * ts;
-                    self.emit::<u8>(if j < kept { ((j / ts) * fs + j % ts) as u8 } else { 0x80 });
+                    self.emit::<u8>(if j < kept {
+                        ((j / ts) * fs + j % ts) as u8
+                    } else {
+                        0x80
+                    });
                 }
             }
         }
         for _ in 0..4 {
             self.emit::<u64>(64);
+        }
+        for m in [0x1fu8, 0x3f, 0x7f] {
+            for _ in 0..32 {
+                self.emit::<u8>(m);
+            }
+        }
+        for v in [0x0100u16, 15, 31, 16, 0x00ff] {
+            for _ in 0..16 {
+                self.emit::<u16>(v);
+            }
+        }
+        for i in 0..32u32 {
+            self.emit::<u8>(((i % 16).count_ones() & 1) as u8);
+        }
+        for _ in 0..32 {
+            self.emit::<u8>(0x1b);
+        }
+        for _ in 0..4 {
+            self.emit::<u64>(0xff);
+        }
+        for k in 0..8 {
+            for _ in 0..32 {
+                self.emit::<u8>(1 << k);
+            }
+        }
+        for i in 0..8u8 {
+            for j in 0..32u8 {
+                self.emit::<u8>(((j % 16) & !7) + 7 - i);
+            }
+        }
+        for k in 1..8u32 {
+            for i in 0..8u32 {
+                self.emit::<u32>((i + 8 - k) % 8);
+            }
+        }
+        for k in 1..8u32 {
+            for i in 0..8u32 {
+                self.emit::<u32>(if i >= k { 1 << (i - k) } else { 0 });
+            }
+        }
+        for k in 1..4u32 {
+            for i in 0..4u32 {
+                self.emit::<u64>(if i >= k { 1 << (i - k) } else { 0 });
+            }
+        }
+        for v in [0x0000_ffffu32, 0xffff_0000] {
+            for _ in 0..8 {
+                self.emit::<u32>(v);
+            }
         }
         debug_assert_eq!(self.offset_in_text_section - start, TAB_END);
         if self.simd.avx512 {
@@ -459,6 +567,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.simd.previous_keeps_r11 = vector || insn.opc == ebpf::MOV64_IMM;
         if !vector && !is_pure_alu(insn.opc) {
             self.simd_flush(true);
+        } else if insn.opc == ebpf::LD_DW_IMM && !self.executable.get_sbpf_version().disable_lddw()
+        {
+            // lddw validates the instruction meter, which may throw: write back like a checkpoint
+            self.simd_flush(false);
         }
         self.simd.previous = Some(insn.clone());
     }
@@ -468,7 +580,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         if insn.opc != ebpf::CALL_IMM || insn.src != 0 {
             return None;
         }
-        self.simd.intrinsics.iter().find(|(hash, _, _)| *hash == insn.imm as u32).map(|(_, subop, wide)| (*subop, *wide))
+        self.simd
+            .intrinsics
+            .iter()
+            .find(|(hash, _, _)| *hash == insn.imm as u32)
+            .map(|(_, subop, wide)| (*subop, *wide))
     }
 
     fn simd_is_intrinsic(&self, insn: &ebpf::Insn) -> bool {
@@ -494,7 +610,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             }
             ebpf::CALL_IMM if self.simd_is_intrinsic(insn) => {
                 let (subop, _) = self.simd_intrinsic(insn).unwrap();
-                self.simd.known[0] = if simd::writes_dst(subop) { None } else { Some(0) };
+                self.simd.known[0] = if simd::writes_dst(subop) {
+                    None
+                } else {
+                    Some(0)
+                };
             }
             // Syscalls write r0, internal calls may change anything
             ebpf::CALL_IMM | ebpf::CALL_REG => self.simd.known = [None; 11],
@@ -518,7 +638,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     /// Codegen of a vector intrinsic call (SIMD-0645 style): inline AVX2 if the packed operands
     /// in r1 are a known valid constant, otherwise a regular syscall to `slow_path`
-    pub(crate) fn emit_simd_intrinsic(&mut self, subop: u8, wide: bool, slow_path: BuiltinFunction<C>) {
+    pub(crate) fn emit_simd_intrinsic(
+        &mut self,
+        subop: u8,
+        wide: bool,
+        slow_path: BuiltinFunction<C>,
+    ) {
         let op = if self.simd.enabled {
             self.simd.known[simd::intrinsics::OPERAND_REG as usize]
                 .and_then(|packed| simd::intrinsics::unpack(subop, wide, packed))
@@ -559,7 +684,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         let Some(host) = ro.vm_to_host_buffer(addr, (slots * ebpf::VECTOR_WIDTH) as u64) else {
             return false;
         };
-        let host = host.ptr() as *const u8 as i64;
+        let host = host.ptr().cast::<u8>() as i64;
         self.simd.stats.static_loads += 1;
         // Validates the vector base like every vector instruction
         self.simd_ensure_base();
@@ -570,7 +695,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         for i in 0..slots {
             // The destination is allocated first: an eviction stores relative to the vector base
             let rd = self.simd_destination(op.vd + i as u8);
-            self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, host + (i * ebpf::VECTOR_WIDTH) as i64));
+            self.emit_ins(X86Instruction::load_immediate(
+                REGISTER_SCRATCH,
+                host + (i * ebpf::VECTOR_WIDTH) as i64,
+            ));
             self.simd.r11 = R11::Unknown;
             self.emit_vex(V::load(rd, REGISTER_SCRATCH, 0));
         }
@@ -582,6 +710,16 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         if self.simd.enabled {
             self.simd_flush(false);
             // The checkpoint loads the pc into R11
+            self.simd.r11 = R11::Unknown;
+        }
+    }
+
+    /// Called before the per instruction trace call (a Rust call: clobbers the vector registers and
+    /// R11)
+    #[cfg(feature = "tracer")]
+    pub(super) fn simd_before_trace(&mut self) {
+        if self.simd.enabled {
+            self.simd_flush(true);
             self.simd.r11 = R11::Unknown;
         }
     }
@@ -604,13 +742,21 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::SimdVectorBase)),
         ));
         // if vector_base == 0 { throw UnsupportedInstruction }
-        self.emit_ins(X86Instruction::test(OperandSize::S64, REGISTER_SCRATCH, REGISTER_SCRATCH, None));
+        self.emit_ins(X86Instruction::test(
+            OperandSize::S64,
+            REGISTER_SCRATCH,
+            REGISTER_SCRATCH,
+            None,
+        ));
         // jnz rel32, emitted raw so that no diversification noop can sneak in before the patch
         self.emit::<u8>(0x0f);
         self.emit::<u8>(0x85);
         self.emit::<i32>(0);
         let patch = self.offset_in_text_section;
-        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
+        self.emit_ins(X86Instruction::load_immediate(
+            REGISTER_SCRATCH,
+            self.pc as i64,
+        ));
         self.emit_ins(X86Instruction::jump_immediate(
             self.relative_to_anchor(ANCHOR_CALL_UNSUPPORTED_INSTRUCTION, 5),
         ));
@@ -640,7 +786,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             for pair in 0..ebpf::VECTOR_SLOTS / 2 {
                 let state = self.simd.pairs[pair];
                 if state.dirty {
-                    self.emit_evex(E::store(state.reg.unwrap(), REGISTER_SCRATCH, Self::slot_disp(2 * pair as u8)));
+                    self.emit_evex(E::store(
+                        state.reg.unwrap(),
+                        REGISTER_SCRATCH,
+                        Self::slot_disp(2 * pair as u8),
+                    ));
                     self.simd.stats.flush_stores += 1;
                     self.simd.pairs[pair].dirty = false;
                 }
@@ -696,7 +846,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             let state = self.simd.slots[victim as usize];
             if state.dirty {
                 self.simd_ensure_base();
-                self.emit_vex(V::store(reg as u8, REGISTER_SCRATCH, Self::slot_disp(victim)));
+                self.emit_vex(V::store(
+                    reg as u8,
+                    REGISTER_SCRATCH,
+                    Self::slot_disp(victim),
+                ));
                 self.simd.stats.spills += 1;
             }
             self.simd.slots[victim as usize] = SlotState {
@@ -778,7 +932,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 }
             }
             16 | 8 => {
-                let anchor = if amount == 16 { ANCHOR_SIMD_ROT16 } else { ANCHOR_SIMD_ROT8 };
+                let anchor = if amount == 16 {
+                    ANCHOR_SIMD_ROT16
+                } else {
+                    ANCHOR_SIMD_ROT8
+                };
                 self.emit_vex(V::pshufb(dst, src, VexRm::Rip(self.anchors[anchor])));
             }
             _ => {
@@ -878,7 +1036,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         let f = |d: u8, a: u8, b: u8| (imm >> (d << 2 | a << 1 | b)) & 1;
         let tt2 = |g: &dyn Fn(u8, u8) -> u8| (0..4u8).fold(0, |t, i| t | g(i >> 1, i & 1) << i);
         if rd == ra || rd == rb {
-            let (tt, other) = if rd == ra { (tt2(&|x, y| f(x, x, y)), rb) } else { (tt2(&|x, y| f(x, y, x)), ra) };
+            let (tt, other) = if rd == ra {
+                (tt2(&|x, y| f(x, x, y)), rb)
+            } else {
+                (tt2(&|x, y| f(x, y, x)), ra)
+            };
             self.simd_emit_tt2(tt, rd, other);
             self.emit_vex(V::mov(rd, SCRATCH_YMM));
             return;
@@ -953,7 +1115,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             self.emit_simd_fallback(&op);
             return Ok(());
         }
-        if self.simd.avx512 && !self.simd_avx512_native(&op) && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64) {
+        if self.simd.avx512
+            && !self.simd_avx512_native(&op)
+            && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64)
+        {
             // The AVX2 lowering on an AVX-512 host (an extension is missing): YMM cache only
             let (slots, count) = Self::simd_operand_slots(&op);
             for &slot in &slots[..count] {
@@ -962,7 +1127,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 }
             }
         }
-        if self.simd.avx512 && self.simd_avx512_native(&op) && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64) {
+        if self.simd.avx512
+            && self.simd_avx512_native(&op)
+            && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64)
+        {
             // A slot is cached at one width only
             let (slots, count) = Self::simd_operand_slots(&op);
             for &slot in &slots[..count] {
@@ -994,16 +1162,14 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             // AVX2 templates for 32 / 64 bit lanes; otherwise compress runs as a branchless scalar loop
             // and expand through the reference implementation
             VCOMPRESS if op.wide || op.off < 2 => self.emit_simd_compress_scalar(&op),
-            VEXPAND if op.wide || op.off < 2 => self.emit_simd_fallback(&op),
+            VEXPAND if op.wide || op.off < 2 => self.emit_simd_expand_scalar(&op),
             VCMP | VBLENDM if op.wide => self.emit_simd_mask_split(&op),
             VZEXT | VSEXT if op.wide => self.emit_simd_widen_split(&op),
-            VPERMW | VCONFLICT | VDPBUSD => self.emit_simd_fallback(&op),
-            VSHLDV | VSHRDV if op.off == 1 => self.emit_simd_fallback(&op),
-            VTRUNC | VTESTM if op.wide => self.emit_simd_fallback(&op),
+            VCONFLICT if op.wide => self.emit_simd_fallback(&op),
+            VTRUNC if op.wide => self.emit_simd_trunc_split(&op),
+            VTESTM if op.wide => self.emit_simd_testm_split(&op),
             VCLMUL if !self.simd.vpclmul => self.emit_simd_fallback(&op),
-            VSLLV16 | VSRLV16 | VSRAV16 | VLZCNT | VPERMB | VPERMI2B | VMULTISHIFT | VGF2P8AFFINE | VGF2P8MUL => {
-                self.emit_simd_fallback(&op)
-            }
+            VPERMB | VPERMI2B | VPERMW => self.emit_simd_byte_table(&op),
             VPERMD if op.wide => self.emit_simd_cross(&op),
             VMOVMSK8 if op.wide => self.emit_simd_movmsk_wide(&op),
             _ if op.wide => {
@@ -1011,8 +1177,19 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 // overwrites a source of the high half.
                 for h in 0..2u8 {
                     // mont16 also takes q from a slot (in `off`)
-                    let off = if op.subop == VMONT16 { op.off + h as i16 } else { op.off };
-                    let half = VecInsn { wide: false, vd: op.vd + h, va: op.va + h, vb: op.vb + h, off, ..op };
+                    let off = if op.subop == VMONT16 {
+                        op.off + h as i16
+                    } else {
+                        op.off
+                    };
+                    let half = VecInsn {
+                        wide: false,
+                        vd: op.vd + h,
+                        va: op.va + h,
+                        vb: op.vb + h,
+                        off,
+                        ..op
+                    };
                     self.emit_simd_cached(&half);
                 }
             }
@@ -1035,30 +1212,76 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         let store = op.subop == simd::VSTORE;
         let slot = if store { op.va } else { op.vd };
         let spec = store as u64 | (slot as u64) << 8 | (op.transfer_slots() as u64) << 16;
-        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, op.off as i64));
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_MAP[op.src as usize], REGISTER_SCRATCH, None));
+        self.emit_ins(X86Instruction::load_immediate(
+            REGISTER_SCRATCH,
+            op.off as i64,
+        ));
+        self.emit_ins(X86Instruction::alu(
+            OperandSize::S64,
+            0x01,
+            REGISTER_MAP[op.src as usize],
+            REGISTER_SCRATCH,
+            None,
+        ));
         self.simd.stats.translations += 1;
         self.emit_rust_call(
             Value::Constant64(simd::jit_transfer as *const u8 as i64, false),
             &[
                 // First, the other arguments may overwrite it
-                Argument { index: 3, value: Value::Register(REGISTER_SCRATCH) },
-                Argument { index: 4, value: Value::Constant64(spec as i64, false) },
-                Argument { index: 2, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::SimdVectorBase), false) },
-                Argument { index: 1, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping), false) },
-                Argument { index: 0, value: Value::RegisterPlusConstant32(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult), false) },
+                Argument {
+                    index: 3,
+                    value: Value::Register(REGISTER_SCRATCH),
+                },
+                Argument {
+                    index: 4,
+                    value: Value::Constant64(spec as i64, false),
+                },
+                Argument {
+                    index: 2,
+                    value: Value::RegisterIndirect(
+                        REGISTER_PTR_TO_VM,
+                        self.slot_in_vm(RuntimeEnvironmentSlot::SimdVectorBase),
+                        false,
+                    ),
+                },
+                Argument {
+                    index: 1,
+                    value: Value::RegisterIndirect(
+                        REGISTER_PTR_TO_VM,
+                        self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping),
+                        false,
+                    ),
+                },
+                Argument {
+                    index: 0,
+                    value: Value::RegisterPlusConstant32(
+                        REGISTER_PTR_TO_VM,
+                        self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult),
+                        false,
+                    ),
+                },
             ],
             None,
         );
         self.emit_check_result_is_ok();
-        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
-        self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 6)));
+        self.emit_ins(X86Instruction::load_immediate(
+            REGISTER_SCRATCH,
+            self.pc as i64,
+        ));
+        self.emit_ins(X86Instruction::conditional_jump_immediate(
+            0x85,
+            self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 6),
+        ));
         self.simd.r11 = R11::Unknown;
     }
 
     /// Makes `slot` resident in `reg` (dirty), after a flush emptied the cache
     fn simd_assign(&mut self, slot: u8, reg: u8) {
-        self.simd.slots[slot as usize] = SlotState { reg: Some(reg), dirty: true, evicted: false };
+        self.simd.slots[slot as usize] = SlotState {
+            reg: Some(reg),
+            dirty: true,
+            evicted: false,
+        };
         self.simd.regs[reg as usize] = Some(slot);
         self.simd_touch(reg);
     }
@@ -1069,7 +1292,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         use crate::simd::*;
         self.simd_flush(true);
         self.simd_ensure_base();
-        let load = |jit: &mut Self, reg: u8, slot: u8| jit.emit_vex(V::load(reg, REGISTER_SCRATCH, Self::slot_disp(slot)));
+        let load = |jit: &mut Self, reg: u8, slot: u8| {
+            jit.emit_vex(V::load(reg, REGISTER_SCRATCH, Self::slot_disp(slot)))
+        };
         match (op.subop, op.wide) {
             (VTRANSPOSE8, _) => {
                 for row in 0..8u8 {
@@ -1092,11 +1317,29 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             (VTRANSPOSE64, true) if self.simd.avx512 => {
                 // r0..r7 in zmm16..23, t in zmm24..31, u in zmm16..23, columns in zmm24..31
                 for row in 0..8u8 {
-                    self.emit_evex(E::load(16 + row, REGISTER_SCRATCH, Self::slot_disp(op.vd + 2 * row)));
+                    self.emit_evex(E::load(
+                        16 + row,
+                        REGISTER_SCRATCH,
+                        Self::slot_disp(op.vd + 2 * row),
+                    ));
                 }
                 for i in 0..4u8 {
-                    self.emit_evex(E::alu_q(2, 1, VPUNPCKLQDQ, 24 + 2 * i, 16 + 2 * i, VexRm::Reg(17 + 2 * i)));
-                    self.emit_evex(E::alu_q(2, 1, VPUNPCKHQDQ, 25 + 2 * i, 16 + 2 * i, VexRm::Reg(17 + 2 * i)));
+                    self.emit_evex(E::alu_q(
+                        2,
+                        1,
+                        VPUNPCKLQDQ,
+                        24 + 2 * i,
+                        16 + 2 * i,
+                        VexRm::Reg(17 + 2 * i),
+                    ));
+                    self.emit_evex(E::alu_q(
+                        2,
+                        1,
+                        VPUNPCKHQDQ,
+                        25 + 2 * i,
+                        16 + 2 * i,
+                        VexRm::Reg(17 + 2 * i),
+                    ));
                 }
                 for (base, t) in [(16u8, 24u8), (20, 28)] {
                     self.emit_evex(E::shufi64x2(base, t, t + 2, 0x88));
@@ -1114,7 +1357,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     if reg == SCRATCH_ZMM {
                         self.emit_evex(E::store(reg, REGISTER_SCRATCH, Self::slot_disp(2 * pair)));
                     } else {
-                        self.simd.pairs[pair as usize] = PairState { reg: Some(reg), dirty: true };
+                        self.simd.pairs[pair as usize] = PairState {
+                            reg: Some(reg),
+                            dirty: true,
+                        };
                         self.simd.zregs[(reg - ZBASE) as usize] = Some(pair);
                         self.simd_ztouch(reg);
                     }
@@ -1130,7 +1376,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     }
                     self.simd_emit_transpose4q([0, 1, 2, 3], [4, 5, 6, 7]);
                     for r in 0..4u8 {
-                        self.emit_vex(V::store(r, REGISTER_SCRATCH, Self::slot_disp(row(dst.0 + r, dst.1))));
+                        self.emit_vex(V::store(
+                            r,
+                            REGISTER_SCRATCH,
+                            Self::slot_disp(row(dst.0 + r, dst.1)),
+                        ));
                     }
                 }
                 // B (rows 0..4, high halves) and C (rows 4..8, low halves) swap places
@@ -1204,7 +1454,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             }
             (VPERMI2D | VPERMT2D, false) => {
                 // out = idx bit 3 ? b[idx & 7] : a[idx & 7]
-                let (ta, ti) = if op.subop == VPERMI2D { (op.va, op.vd) } else { (op.vd, op.va) };
+                let (ta, ti) = if op.subop == VPERMI2D {
+                    (op.va, op.vd)
+                } else {
+                    (op.vd, op.va)
+                };
                 let (a, b, idx) = (ensure(self, ta), ensure(self, op.vb), ensure(self, ti));
                 let (out, m) = (temp(self), temp(self));
                 self.emit_vex(V::permd(out, idx, VexRm::Reg(a)));
@@ -1215,7 +1469,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             }
             _ => {
                 // 512 bit: bit 3 of the index picks the half, bit 4 the table
-                let (ta, ti) = if op.subop == VPERMI2D { (op.va, op.vd) } else { (op.vd, op.va) };
+                let (ta, ti) = if op.subop == VPERMI2D {
+                    (op.va, op.vd)
+                } else {
+                    (op.vd, op.va)
+                };
                 let (a0, a1) = (ensure(self, ta), ensure(self, ta + 1));
                 let (b0, b1) = (ensure(self, op.vb), ensure(self, op.vb + 1));
                 let idx = [ensure(self, ti), ensure(self, ti + 1)];
@@ -1247,7 +1505,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             return reg;
         }
         self.simd_ensure_base();
-        self.emit_vex(V::load(SCRATCH_YMM, REGISTER_SCRATCH, Self::slot_disp(slot)));
+        self.emit_vex(V::load(
+            SCRATCH_YMM,
+            REGISTER_SCRATCH,
+            Self::slot_disp(slot),
+        ));
         SCRATCH_YMM
     }
 
@@ -1259,8 +1521,21 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         let hi = self.simd_read_reg(op.va + 1);
         self.emit_vex(V::pmovmskb(REGISTER_SCRATCH, hi));
         self.simd.r11 = R11::Unknown;
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, REGISTER_SCRATCH, 32, None));
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, REGISTER_SCRATCH, dst, None));
+        self.emit_ins(X86Instruction::alu_immediate(
+            OperandSize::S64,
+            0xc1,
+            4,
+            REGISTER_SCRATCH,
+            32,
+            None,
+        ));
+        self.emit_ins(X86Instruction::alu(
+            OperandSize::S64,
+            0x09,
+            REGISTER_SCRATCH,
+            dst,
+            None,
+        ));
     }
 
     /// Strategy B: slots of the vector file are cached in YMM registers (strategy A flushes after
@@ -1270,7 +1545,21 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // Every vector instruction validates the vector base, like the interpreter
         self.simd_ensure_base();
         self.simd.pinned = [false; CACHE_REGS];
+        let native = self.simd.avx512 && self.simd_avx512_native(op);
         match op.subop {
+            VSLLV16 | VSRLV16 | VSRAV16 if !native => {
+                let (ra, rb) = (self.simd_pinned(op.va), self.simd_pinned(op.vb));
+                let out = self.simd_temp();
+                self.emit_simd_var16(op.subop, out, ra, rb);
+                self.simd_rebind(op.vd, out);
+            }
+            VSHLDV | VSHRDV if !native && op.off == 1 => self.emit_simd_funnel16_avx2(op),
+            VLZCNT if !native => self.emit_simd_lzcnt_avx2(op),
+            VMULTISHIFT if !native => self.emit_simd_multishift_avx2(op),
+            VGF2P8MUL if !native => self.emit_simd_gf2p8mul_avx2(op),
+            VGF2P8AFFINE if !native => self.emit_simd_gf2p8affine_avx2(op),
+            VCONFLICT if !native => self.emit_simd_conflict_avx2(op),
+            VDPBUSD if !native => self.emit_simd_dpbusd_avx2(op),
             VBCAST32 => {
                 self.emit_vex(V::movd_from_gpr(SCRATCH_YMM, REGISTER_MAP[op.src as usize]));
                 let rd = self.simd_destination(op.vd);
@@ -1287,7 +1576,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_vex(V::movq_from_gpr(SCRATCH_YMM, REGISTER_MAP[op.src as usize]));
                 self.emit_vex(V::pbroadcastq(SCRATCH_YMM, SCRATCH_YMM));
                 let rd = self.simd_destination(op.vd);
-                self.emit_vex(V::pblendd(rd, rd, VexRm::Reg(SCRATCH_YMM), 3 << (2 * op.off)));
+                self.emit_vex(V::pblendd(
+                    rd,
+                    rd,
+                    VexRm::Reg(SCRATCH_YMM),
+                    3 << (2 * op.off),
+                ));
             }
             VEXT64 => {
                 let dst = REGISTER_MAP[op.dst as usize];
@@ -1301,28 +1595,46 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     } else {
                         reg
                     };
-                    self.emit_vex(if lane & 1 == 0 { V::movq_to_gpr(dst, src) } else { V::pextrq(dst, src, 1) });
+                    self.emit_vex(if lane & 1 == 0 {
+                        V::movq_to_gpr(dst, src)
+                    } else {
+                        V::pextrq(dst, src, 1)
+                    });
                 } else {
                     let disp = Self::slot_disp(op.va) + 8 * op.off as i32;
-                    self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_SCRATCH, dst, X86IndirectAccess::Offset(disp)));
+                    self.emit_ins(X86Instruction::load(
+                        OperandSize::S64,
+                        REGISTER_SCRATCH,
+                        dst,
+                        X86IndirectAccess::Offset(disp),
+                    ));
                 }
             }
             VMOVMSK8 => {
                 let ra = self.simd_read_reg(op.va);
                 self.emit_vex(V::pmovmskb(REGISTER_MAP[op.dst as usize], ra));
             }
-            VADD32 | VXOR | VAND | VOR | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN | VADD16 | VSUB16
-            | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDW => {
+            VADD32 | VXOR | VAND | VOR | VBLENDD | VSUB32 | VMULLO32 | VMINU32 | VSLLV32
+            | VSRLV32 | VANDN | VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VMADD16
+            | VBLENDW => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_vex(Self::simd_binary(op.subop, rd, ra, b, op.off as u8));
             }
             VROLV32 if self.simd.avx512 => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::alu38(1, 0x15, rd, ra, b));
             }
@@ -1331,7 +1643,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.simd_pin(ra);
                 let rd = self.simd_ensure_reg(op.vd);
                 self.simd_pin(rd);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::pternlogd(1, rd, ra, b, op.off as u8));
             }
@@ -1341,7 +1657,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.simd_pin(ra);
                 let rd = self.simd_ensure_reg(op.vd);
                 self.simd_pin(rd);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::permi2d(1, rd, ra, b));
             }
@@ -1362,7 +1682,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VADD64 | VSUB64 | VMULU32 | VSLLV64 | VSRLV64 => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_vex(match op.subop {
                     VADD64 => V::alu(0xd4, rd, ra, b),
@@ -1375,11 +1699,23 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64 | VPOPCNT | VLZCNT | VZEXT | VSEXT => {
                 let ra = self.simd_pinned(op.va);
                 let n = op.off as u8;
-                let ext = |sub: u8| match sub { VSLL16 => 6, VSRL16 => 2, _ => 4 };
+                let ext = |sub: u8| match sub {
+                    VSLL16 => 6,
+                    VSRL16 => 2,
+                    _ => 4,
+                };
                 match op.subop {
                     VSLL16 | VSRL16 | VSRA16 => {
                         let rd = self.simd_destination(op.vd);
-                        self.emit_vex(V::ymm(1, 1, 0x71, ext(op.subop), rd, VexRm::Reg(ra), Some(n)));
+                        self.emit_vex(V::ymm(
+                            1,
+                            1,
+                            0x71,
+                            ext(op.subop),
+                            rd,
+                            VexRm::Reg(ra),
+                            Some(n),
+                        ));
                     }
                     VSRA32 => {
                         let rd = self.simd_destination(op.vd);
@@ -1403,7 +1739,17 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     }
                     VPOPCNT if self.simd_avx512_native(op) && self.simd.avx512 => {
                         let rd = self.simd_destination(op.vd);
-                        self.emit_evex(E::op(1, 2, n & 1 != 0, 1, if n < 2 { 0x54 } else { 0x55 }, rd, 0, VexRm::Reg(ra), None));
+                        self.emit_evex(E::op(
+                            1,
+                            2,
+                            n & 1 != 0,
+                            1,
+                            if n < 2 { 0x54 } else { 0x55 },
+                            rd,
+                            0,
+                            VexRm::Reg(ra),
+                            None,
+                        ));
                     }
                     VPOPCNT => self.emit_simd_popcnt_avx2(op.vd, ra, n),
                     VLZCNT => {
@@ -1413,7 +1759,15 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     _ => {
                         // VZEXT / VSEXT from the low part of the source
                         let rd = self.simd_destination(op.vd);
-                        self.emit_vex(V::ymm(1, 2, Self::widen_opcode(op), rd, 0, VexRm::Reg(ra), None));
+                        self.emit_vex(V::ymm(
+                            1,
+                            2,
+                            Self::widen_opcode(op),
+                            rd,
+                            0,
+                            VexRm::Reg(ra),
+                            None,
+                        ));
                     }
                 }
             }
@@ -1422,13 +1776,21 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let ra = self.simd_pinned(op.va);
                 let rb = self.simd_pinned(op.vb);
                 let rd = self.simd_destination(op.vd);
-                let (w, opcode) = if op.subop == VPERMB { (false, 0x8d) } else { (true, 0x83) };
+                let (w, opcode) = if op.subop == VPERMB {
+                    (false, 0x8d)
+                } else {
+                    (true, 0x83)
+                };
                 self.emit_evex(E::op(1, 2, w, 1, opcode, rd, rb, VexRm::Reg(ra), None));
             }
             VSRAV32 | VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VSLLV16 | VSRLV16 | VSRAV16
             | VGF2P8AFFINE | VGF2P8MUL | VCLMUL => {
                 let ra = self.simd_pinned(op.va);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 let imm = op.off as u8;
                 match op.subop {
@@ -1438,24 +1800,38 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                         self.emit_vex(V::ymm(1, map, opcode, rd, ra, b, None));
                     }
                     VSLLV16 | VSRLV16 | VSRAV16 => {
-                        let opcode = match op.subop { VSLLV16 => 0x12, VSRLV16 => 0x10, _ => 0x11 };
+                        let opcode = match op.subop {
+                            VSLLV16 => 0x12,
+                            VSRLV16 => 0x10,
+                            _ => 0x11,
+                        };
                         self.emit_evex(E::op(1, 2, true, 1, opcode, rd, ra, b, None));
                     }
-                    VGF2P8AFFINE => self.emit_evex(E::op(1, 3, true, 1, 0xce, rd, ra, b, Some(imm))),
+                    VGF2P8AFFINE => {
+                        self.emit_evex(E::op(1, 3, true, 1, 0xce, rd, ra, b, Some(imm)))
+                    }
                     VGF2P8MUL => self.emit_evex(E::op(1, 2, false, 1, 0xcf, rd, ra, b, None)),
                     _ => self.emit_vex(V::ymm(1, 3, 0x44, rd, ra, b, Some(imm))),
                 }
             }
             VSRAV64 if self.simd.avx512 => {
                 let ra = self.simd_pinned(op.va);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::alu_q(1, 2, 0x46, rd, ra, b));
             }
             VSRAV64 => {
                 // ((x ^ s) >> c) ^ s with s = sign mask (counts above 63 give s)
                 let ra = self.simd_pinned(op.va);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let t = self.simd_temp();
                 self.emit_vex(V::alu(VPXOR, t, t, VexRm::Reg(t)));
                 self.emit_vex(V::alu38(0x37, SCRATCH_YMM, t, VexRm::Reg(ra)));
@@ -1467,22 +1843,43 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VPERMI2B => {
                 let ra = self.simd_pinned(op.va);
                 self.simd_pinned(op.vd);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::op(1, 2, false, 1, 0x75, rd, ra, b, None));
             }
-            VMIN | VMAX | VADDS | VSUBS | VAVG | VADD8 | VSUB8 | VMULHU16 | VMULHRS16 | VMULS32 | VMADDUBS16 | VSADBW | VALIGNR
+            VMIN | VMAX | VADDS | VSUBS | VAVG | VADD8 | VSUB8 | VMULHU16 | VMULHRS16 | VMULS32
+            | VMADDUBS16 | VSADBW | VALIGNR
                 if !(matches!(op.subop, VMIN | VMAX) && op.off & 3 == 3) =>
             {
                 let ra = self.simd_pinned(op.va);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 let (map, opcode) = Self::core_opcode(op);
-                self.emit_vex(V::ymm(1, map, opcode, rd, ra, b, (op.subop == VALIGNR).then_some(op.off as u8)));
+                self.emit_vex(V::ymm(
+                    1,
+                    map,
+                    opcode,
+                    rd,
+                    ra,
+                    b,
+                    (op.subop == VALIGNR).then_some(op.off as u8),
+                ));
             }
             VMIN | VMAX if self.simd.avx512 => {
                 let ra = self.simd_pinned(op.va);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 let (_, opcode) = Self::core_opcode(op);
                 self.emit_evex(E::op(1, 2, true, 1, opcode, rd, ra, b, None));
@@ -1540,19 +1937,21 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     }
                     VTRUNC if self.simd.avx512 => {
                         let rd = self.simd_destination(op.vd);
-                        self.emit_evex(E::op(2, 2, false, 1, Self::trunc_opcode(op), ra, 0, VexRm::Reg(rd), None));
+                        self.emit_evex(E::op(
+                            2,
+                            2,
+                            false,
+                            1,
+                            Self::trunc_opcode(op),
+                            ra,
+                            0,
+                            VexRm::Reg(rd),
+                            None,
+                        ));
                     }
                     VTRUNC => {
-                        // Pack every 128 bit lane's low bytes, then join the two lanes (a VEX.128 op
-                        // zeroes the upper half)
-                        let (from, to) = ((imm & 3), (imm >> 2));
-                        let k = TRUNC_PAIRS.iter().position(|p| *p == (from, to)).unwrap();
-                        let t = self.simd_temp();
-                        self.emit_vex(V::pshufb(t, ra, self.simd_table(TAB_TRUNC + 32 * k)));
-                        self.emit_vex(V::extracti128(SCRATCH_YMM, t, 1));
-                        let rd = self.simd_destination(op.vd);
-                        let opcode = match from - to { 1 => 0x6c, 2 => 0x62, _ => 0x61 };
-                        self.emit_vex(V { l: false, ..V::alu(opcode, rd, t, VexRm::Reg(SCRATCH_YMM)) });
+                        let t = self.emit_simd_trunc_half(ra, imm);
+                        self.simd_rebind(op.vd, t);
                     }
                     _ => {
                         let rd = self.simd_destination(op.vd);
@@ -1562,16 +1961,34 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             }
             VTESTM if self.simd.avx512 => {
                 let ra = self.simd_pinned(op.va);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let size = (op.off & 3) as u8;
                 let pp = if op.off & 4 != 0 { 2 } else { 1 };
-                self.emit_evex(E::op(pp, 2, size & 1 != 0, 1, if size < 2 { 0x26 } else { 0x27 }, KMASK, ra, b, None));
+                self.emit_evex(E::op(
+                    pp,
+                    2,
+                    size & 1 != 0,
+                    1,
+                    if size < 2 { 0x26 } else { 0x27 },
+                    KMASK,
+                    ra,
+                    b,
+                    None,
+                ));
                 self.emit_vex(V::kmovq_to_gpr(REGISTER_MAP[op.dst as usize], KMASK));
             }
             VTESTM => {
                 // (a & b) == 0 per lane, as a mask (inverted for testm)
                 let ra = self.simd_pinned(op.va);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let (t, z) = (self.simd_temp(), self.simd_temp());
                 let size = (op.off & 3) as usize;
                 self.emit_vex(V::alu(VPAND, t, ra, b));
@@ -1586,31 +2003,64 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_simd_movemask(t, size, dst);
                 if op.off & 4 == 0 {
                     let lanes = 32u32 >> size;
-                    let lane_mask = if lanes == 32 { u32::MAX as i64 } else { (1i64 << lanes) - 1 };
-                    self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 6, dst, lane_mask, None));
+                    let lane_mask = if lanes == 32 {
+                        u32::MAX as i64
+                    } else {
+                        (1i64 << lanes) - 1
+                    };
+                    self.emit_ins(X86Instruction::alu_immediate(
+                        OperandSize::S32,
+                        0x81,
+                        6,
+                        dst,
+                        lane_mask,
+                        None,
+                    ));
                 }
             }
-            VDPWSSD | VDPBUSD if self.simd.avx512 => {
+            VDPWSSD | VDPBUSD if native => {
                 let ra = self.simd_pinned(op.va);
                 self.simd_pinned(op.vd);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
-                self.emit_evex(E::op(1, 2, false, 1, if op.subop == VDPBUSD { 0x50 } else { 0x52 }, rd, ra, b, None));
+                self.emit_evex(E::op(
+                    1,
+                    2,
+                    false,
+                    1,
+                    if op.subop == VDPBUSD { 0x50 } else { 0x52 },
+                    rd,
+                    ra,
+                    b,
+                    None,
+                ));
             }
             VDPWSSD => {
                 let ra = self.simd_pinned(op.va);
                 self.simd_pinned(op.vd);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 self.emit_vex(V::alu(0xf5, SCRATCH_YMM, ra, b));
                 let rd = self.simd_destination(op.vd);
                 self.emit_vex(V::alu(VPADDD, rd, rd, VexRm::Reg(SCRATCH_YMM)));
             }
-            VSHLD | VSHRD | VSHLDV | VSHRDV if self.simd.avx512 => {
+            VSHLD | VSHRD | VSHLDV | VSHRDV if native => {
                 let ra = self.simd_pinned(op.va);
                 if matches!(op.subop, VSHLDV | VSHRDV) {
                     self.simd_pinned(op.vd);
                 }
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 let (map, opcode, w, imm) = Self::funnel_opcode(op);
                 self.emit_evex(E::op(1, map, w, 1, opcode, rd, ra, b, imm));
@@ -1634,7 +2084,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let m = REGISTER_MAP[op.src as usize];
                 self.emit_simd_blendm_avx2(op.vd, op.va, op.vb, op.off as u8, m);
             }
-            VCOMPRESS | VEXPAND if !self.simd.avx512 || (op.off < 2 && !self.simd.vbmi2) => self.emit_simd_compress_avx2(op),
+            VCOMPRESS | VEXPAND if !self.simd.avx512 || (op.off < 2 && !self.simd.vbmi2) => {
+                self.emit_simd_compress_avx2(op)
+            }
             VSLL64 | VSRL64 | VSRA64 => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
@@ -1649,7 +2101,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VMULLO64 => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::alu_q(1, 2, 0x40, rd, ra, b));
             }
@@ -1658,22 +2114,49 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.simd_pin(ra);
                 let rd = self.simd_ensure_reg(op.vd);
                 self.simd_pin(rd);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
-                self.emit_evex(E::alu_q(1, 2, if op.subop == VMADD52LO { 0xb4 } else { 0xb5 }, rd, ra, b));
+                self.emit_evex(E::alu_q(
+                    1,
+                    2,
+                    if op.subop == VMADD52LO { 0xb4 } else { 0xb5 },
+                    rd,
+                    ra,
+                    b,
+                ));
             }
             VCMP => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
-                self.emit_evex(E::pcmp(1, (op.off >> 4) as u8, op.off & 8 != 0, KMASK, ra, b, (op.off & 7) as u8));
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
+                self.emit_evex(E::pcmp(
+                    1,
+                    (op.off >> 4) as u8,
+                    op.off & 8 != 0,
+                    KMASK,
+                    ra,
+                    b,
+                    (op.off & 7) as u8,
+                ));
                 self.emit_vex(V::kmovq_to_gpr(REGISTER_MAP[op.dst as usize], KMASK));
             }
             VBLENDM => {
                 self.emit_vex(V::kmov_from_gpr(KMASK, REGISTER_MAP[op.src as usize], true));
                 let rb = self.simd_ensure_reg(op.vb);
                 self.simd_pin(rb);
-                let a = if op.va == op.vb { VexRm::Reg(rb) } else { self.simd_source(op.va) };
+                let a = if op.va == op.vb {
+                    VexRm::Reg(rb)
+                } else {
+                    self.simd_source(op.va)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::pblendm(1, op.off as u8, rd, rb, a, KMASK));
             }
@@ -1692,7 +2175,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VSHUFB => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_vex(V::pshufb(rd, ra, b));
             }
@@ -1702,14 +2189,22 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.simd_pin(ri);
                 let rd = self.simd_ensure_reg(op.vd);
                 self.simd_pin(rd);
-                let b = if op.vb == op.va { VexRm::Reg(ri) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ri)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::permt2d(1, rd, ri, b));
             }
             VROLV64 if self.simd.avx512 => {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
-                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let b = if op.vb == op.va {
+                    VexRm::Reg(ra)
+                } else {
+                    self.simd_source(op.vb)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::alu_q(1, 2, 0x15, rd, ra, b));
             }
@@ -1761,7 +2256,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VPERMD => {
                 let rb = self.simd_ensure_reg(op.vb);
                 self.simd_pin(rb);
-                let a = if op.va == op.vb { VexRm::Reg(rb) } else { self.simd_source(op.va) };
+                let a = if op.va == op.vb {
+                    VexRm::Reg(rb)
+                } else {
+                    self.simd_source(op.va)
+                };
                 let rd = self.simd_destination(op.vd);
                 self.emit_vex(V::permd(rd, rb, a));
             }
@@ -1780,7 +2279,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let ra = self.simd_ensure_reg(op.va);
                 self.simd_pin(ra);
                 let rd = self.simd_destination(op.vd);
-                self.emit_vex(if op.subop == VSRL32 { V::psrld(rd, ra, op.off as u8) } else { V::pslld(rd, ra, op.off as u8) });
+                self.emit_vex(if op.subop == VSRL32 {
+                    V::psrld(rd, ra, op.off as u8)
+                } else {
+                    V::pslld(rd, ra, op.off as u8)
+                });
             }
             VMOV => {
                 if op.vd != op.va {
@@ -1809,8 +2312,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VCOMPRESS | VEXPAND | VSLL64 | VSRL64 | VSRA64 => ([op.vd, op.va, 0, 0, 0], 2),
             VMOV | VROR32 | VSHUFD | VSRL32 | VSLL32 => ([op.vd, op.va, 0, 0, 0], 2),
             VMONT16 => ([op.vd, op.va, op.vb, op.vb + 2, op.off as u8], 5),
-            VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64 | VPOPCNT | VLZCNT | VZEXT | VSEXT | VABS | VTRUNC | VPERMQ | VSHUFLW
-            | VSHUFHW | VCONFLICT => ([op.vd, op.va, 0, 0, 0], 2),
+            VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64 | VPOPCNT | VLZCNT | VZEXT | VSEXT
+            | VABS | VTRUNC | VPERMQ | VSHUFLW | VSHUFHW | VCONFLICT => {
+                ([op.vd, op.va, 0, 0, 0], 2)
+            }
             VTESTM => ([op.va, op.vb, 0, 0, 0], 2),
             _ => ([op.vd, op.va, op.vb, 0, 0], 3),
         }
@@ -1894,7 +2399,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         let reg = self.simd_zallocate();
         self.simd_ensure_base();
         self.emit_evex(E::load(reg, REGISTER_SCRATCH, Self::slot_disp(2 * pair)));
-        self.simd.pairs[pair as usize] = PairState { reg: Some(reg), dirty: false };
+        self.simd.pairs[pair as usize] = PairState {
+            reg: Some(reg),
+            dirty: false,
+        };
         self.simd.zregs[(reg - ZBASE) as usize] = Some(pair);
         reg
     }
@@ -1922,7 +2430,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 reg
             }
         };
-        self.simd.pairs[pair as usize] = PairState { reg: Some(reg), dirty: true };
+        self.simd.pairs[pair as usize] = PairState {
+            reg: Some(reg),
+            dirty: true,
+        };
         self.simd_ztouch(reg);
         reg
     }
@@ -1937,7 +2448,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VBCAST32 | VBCAST64 => {
                 let zd = self.simd_zdestination(pd);
                 let src = REGISTER_MAP[op.src as usize];
-                self.emit_evex(if op.subop == VBCAST32 { E::pbroadcastd_gpr(zd, src) } else { E::pbroadcastq_gpr(zd, src) });
+                self.emit_evex(if op.subop == VBCAST32 {
+                    E::pbroadcastd_gpr(zd, src)
+                } else {
+                    E::pbroadcastq_gpr(zd, src)
+                });
             }
             VMOVMSK8 => {
                 let za = match self.simd.pairs[pa as usize].reg {
@@ -1946,23 +2461,36 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                         reg
                     }
                     None => {
-                        self.emit_evex(E::load(SCRATCH_ZMM, REGISTER_SCRATCH, Self::slot_disp(op.va)));
+                        self.emit_evex(E::load(
+                            SCRATCH_ZMM,
+                            REGISTER_SCRATCH,
+                            Self::slot_disp(op.va),
+                        ));
                         SCRATCH_ZMM
                     }
                 };
                 self.emit_evex(E::pmovb2m(KMASK, za));
                 self.emit_vex(V::kmovq_to_gpr(REGISTER_MAP[op.dst as usize], KMASK));
             }
-            VADD32 | VXOR | VAND | VOR | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN | VROLV32 | VROLV64
-            | VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDD | VBLENDW | VSHUFB => {
+            VADD32 | VXOR | VAND | VOR | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32
+            | VANDN | VROLV32 | VROLV64 | VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16
+            | VMADD16 | VBLENDD | VBLENDW | VSHUFB => {
                 if matches!(op.subop, VBLENDD | VBLENDW) {
-                    let (anchor, size) = if op.subop == VBLENDD { (ANCHOR_SIMD_BLENDD_MASKS, 2) } else { (ANCHOR_SIMD_BLENDW_MASKS, 4) };
+                    let (anchor, size) = if op.subop == VBLENDD {
+                        (ANCHOR_SIMD_BLENDD_MASKS, 2)
+                    } else {
+                        (ANCHOR_SIMD_BLENDW_MASKS, 4)
+                    };
                     let entry = unsafe { self.anchors[anchor].add(size * op.off as usize) };
                     self.emit_vex(V::kmov_load(KMASK, op.subop == VBLENDW, VexRm::Rip(entry)));
                 }
                 let za = self.simd_zensure(pa);
                 self.simd_zpin(za);
-                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
+                let b = if pb == pa {
+                    VexRm::Reg(za)
+                } else {
+                    self.simd_zsource(pb)
+                };
                 let zd = self.simd_zdestination(pd);
                 let insn = match op.subop {
                     VADD32 => E::alu(2, 0xfe, zd, za, b),
@@ -1994,9 +2522,17 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.simd_zpin(za);
                 let zd = self.simd_zensure(pd);
                 self.simd_zpin(zd);
-                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
+                let b = if pb == pa {
+                    VexRm::Reg(za)
+                } else {
+                    self.simd_zsource(pb)
+                };
                 let zd = self.simd_zdestination(pd);
-                self.emit_evex(if op.subop == VTERNLOG { E::pternlogd(2, zd, za, b, op.off as u8) } else { E::permi2d(2, zd, za, b) });
+                self.emit_evex(if op.subop == VTERNLOG {
+                    E::pternlogd(2, zd, za, b, op.off as u8)
+                } else {
+                    E::permi2d(2, zd, za, b)
+                });
             }
             VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64 | VPOPCNT | VLZCNT | VZEXT | VSEXT => {
                 let za = self.simd_zensure(pa);
@@ -2010,13 +2546,23 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     VSRA16 => E::op(1, 1, false, 2, 0x71, 4, zd, r, Some(n)),
                     VSRA32 => E::op(1, 1, false, 2, 0x72, 4, zd, r, Some(n)),
                     VROR64 => E::op(1, 1, true, 2, 0x72, 0, zd, r, Some(n)),
-                    VPOPCNT => E::op(1, 2, n & 1 != 0, 2, if n < 2 { 0x54 } else { 0x55 }, zd, 0, r, None),
+                    VPOPCNT => E::op(
+                        1,
+                        2,
+                        n & 1 != 0,
+                        2,
+                        if n < 2 { 0x54 } else { 0x55 },
+                        zd,
+                        0,
+                        r,
+                        None,
+                    ),
                     VLZCNT => E::op(1, 2, n == 3, 2, 0x44, zd, 0, r, None),
                     _ => E::op(1, 2, false, 2, Self::widen_opcode(op), zd, 0, r, None),
                 });
             }
-            VSRAV32 | VSRAV64 | VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VSLLV16 | VSRLV16 | VSRAV16 | VPERMB | VMULTISHIFT
-            | VGF2P8AFFINE | VGF2P8MUL | VCLMUL => {
+            VSRAV32 | VSRAV64 | VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VSLLV16 | VSRLV16
+            | VSRAV16 | VPERMB | VMULTISHIFT | VGF2P8AFFINE | VGF2P8MUL | VCLMUL => {
                 let za = self.simd_zensure(pa);
                 self.simd_zpin(za);
                 let zb = self.simd_zensure(pb);
@@ -2046,12 +2592,17 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.simd_zpin(za);
                 let zd = self.simd_zensure(pd);
                 self.simd_zpin(zd);
-                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
+                let b = if pb == pa {
+                    VexRm::Reg(za)
+                } else {
+                    self.simd_zsource(pb)
+                };
                 let zd = self.simd_zdestination(pd);
                 self.emit_evex(E::op(1, 2, false, 2, 0x75, zd, za, b, None));
             }
-            VMIN | VMAX | VADDS | VSUBS | VAVG | VADD8 | VSUB8 | VMULHU16 | VMULHRS16 | VMULS32 | VMADDUBS16 | VSADBW | VALIGNR
-            | VPERMW | VDPBUSD | VDPWSSD | VSHLD | VSHRD | VSHLDV | VSHRDV => {
+            VMIN | VMAX | VADDS | VSUBS | VAVG | VADD8 | VSUB8 | VMULHU16 | VMULHRS16 | VMULS32
+            | VMADDUBS16 | VSADBW | VALIGNR | VPERMW | VDPBUSD | VDPWSSD | VSHLD | VSHRD
+            | VSHLDV | VSHRDV => {
                 let za = self.simd_zensure(pa);
                 self.simd_zpin(za);
                 if matches!(op.subop, VDPBUSD | VDPWSSD | VSHLDV | VSHRDV) {
@@ -2072,8 +2623,19 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     }
                     _ => {
                         let (map, opcode) = Self::core_opcode(op);
-                        let w = matches!(op.subop, VMIN | VMAX) && op.off & 3 == 3 || op.subop == VMULS32;
-                        E::op(1, map, w, 2, opcode, zd, za, b, (op.subop == VALIGNR).then_some(op.off as u8))
+                        let w = matches!(op.subop, VMIN | VMAX) && op.off & 3 == 3
+                            || op.subop == VMULS32;
+                        E::op(
+                            1,
+                            map,
+                            w,
+                            2,
+                            opcode,
+                            zd,
+                            za,
+                            b,
+                            (op.subop == VALIGNR).then_some(op.off as u8),
+                        )
                     }
                 };
                 self.emit_evex(insn);
@@ -2088,17 +2650,41 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     VPERMQ => E::op(1, 3, true, 2, 0x00, zd, 0, r, Some(imm)),
                     VSHUFLW => E::op(3, 1, false, 2, 0x70, zd, 0, r, Some(imm)),
                     VSHUFHW => E::op(2, 1, false, 2, 0x70, zd, 0, r, Some(imm)),
-                    VTRUNC => E::op(2, 2, false, 2, Self::trunc_opcode(op), za, 0, VexRm::Reg(zd), None),
+                    VTRUNC => E::op(
+                        2,
+                        2,
+                        false,
+                        2,
+                        Self::trunc_opcode(op),
+                        za,
+                        0,
+                        VexRm::Reg(zd),
+                        None,
+                    ),
                     _ => E::op(1, 2, imm == 3, 2, 0xc4, zd, 0, r, None),
                 });
             }
             VTESTM => {
                 let za = self.simd_zensure(pa);
                 self.simd_zpin(za);
-                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
+                let b = if pb == pa {
+                    VexRm::Reg(za)
+                } else {
+                    self.simd_zsource(pb)
+                };
                 let size = (op.off & 3) as u8;
                 let pp = if op.off & 4 != 0 { 2 } else { 1 };
-                self.emit_evex(E::op(pp, 2, size & 1 != 0, 2, if size < 2 { 0x26 } else { 0x27 }, KMASK, za, b, None));
+                self.emit_evex(E::op(
+                    pp,
+                    2,
+                    size & 1 != 0,
+                    2,
+                    if size < 2 { 0x26 } else { 0x27 },
+                    KMASK,
+                    za,
+                    b,
+                    None,
+                ));
                 self.emit_vex(V::kmovq_to_gpr(REGISTER_MAP[op.dst as usize], KMASK));
             }
             VMONT16 => {
@@ -2118,7 +2704,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VADD64 | VSUB64 | VMULU32 | VSLLV64 | VSRLV64 | VMULLO64 => {
                 let za = self.simd_zensure(pa);
                 self.simd_zpin(za);
-                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
+                let b = if pb == pa {
+                    VexRm::Reg(za)
+                } else {
+                    self.simd_zsource(pb)
+                };
                 let zd = self.simd_zdestination(pd);
                 let (map, opcode) = match op.subop {
                     VADD64 => (1, 0xd4),
@@ -2146,22 +2736,49 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.simd_zpin(za);
                 let zd = self.simd_zensure(pd);
                 self.simd_zpin(zd);
-                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
+                let b = if pb == pa {
+                    VexRm::Reg(za)
+                } else {
+                    self.simd_zsource(pb)
+                };
                 let zd = self.simd_zdestination(pd);
-                self.emit_evex(E::alu_q(2, 2, if op.subop == VMADD52LO { 0xb4 } else { 0xb5 }, zd, za, b));
+                self.emit_evex(E::alu_q(
+                    2,
+                    2,
+                    if op.subop == VMADD52LO { 0xb4 } else { 0xb5 },
+                    zd,
+                    za,
+                    b,
+                ));
             }
             VCMP => {
                 let za = self.simd_zensure(pa);
                 self.simd_zpin(za);
-                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
-                self.emit_evex(E::pcmp(2, (op.off >> 4) as u8, op.off & 8 != 0, KMASK, za, b, (op.off & 7) as u8));
+                let b = if pb == pa {
+                    VexRm::Reg(za)
+                } else {
+                    self.simd_zsource(pb)
+                };
+                self.emit_evex(E::pcmp(
+                    2,
+                    (op.off >> 4) as u8,
+                    op.off & 8 != 0,
+                    KMASK,
+                    za,
+                    b,
+                    (op.off & 7) as u8,
+                ));
                 self.emit_vex(V::kmovq_to_gpr(REGISTER_MAP[op.dst as usize], KMASK));
             }
             VBLENDM => {
                 self.emit_vex(V::kmov_from_gpr(KMASK, REGISTER_MAP[op.src as usize], true));
                 let zb = self.simd_zensure(pb);
                 self.simd_zpin(zb);
-                let a = if pa == pb { VexRm::Reg(zb) } else { self.simd_zsource(pa) };
+                let a = if pa == pb {
+                    VexRm::Reg(zb)
+                } else {
+                    self.simd_zsource(pa)
+                };
                 let zd = self.simd_zdestination(pd);
                 self.emit_evex(E::pblendm(2, op.off as u8, zd, zb, a, KMASK));
             }
@@ -2182,14 +2799,22 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.simd_zpin(zidx);
                 let zd = self.simd_zensure(pd);
                 self.simd_zpin(zd);
-                let b = if pb == pa { VexRm::Reg(zidx) } else { self.simd_zsource(pb) };
+                let b = if pb == pa {
+                    VexRm::Reg(zidx)
+                } else {
+                    self.simd_zsource(pb)
+                };
                 let zd = self.simd_zdestination(pd);
                 self.emit_evex(E::permt2d(2, zd, zidx, b));
             }
             VPERMD => {
                 let zidx = self.simd_zensure(pb);
                 self.simd_zpin(zidx);
-                let data = if pa == pb { VexRm::Reg(zidx) } else { self.simd_zsource(pa) };
+                let data = if pa == pb {
+                    VexRm::Reg(zidx)
+                } else {
+                    self.simd_zsource(pa)
+                };
                 let zd = self.simd_zdestination(pd);
                 self.emit_evex(E::permd(zd, zidx, data));
             }
@@ -2232,7 +2857,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     /// may alias.
     fn emit_simd_compress_scalar(&mut self, op: &VecInsn) {
         let shift = op.off as u8;
-        let size = match shift { 0 => OperandSize::S8, 1 => OperandSize::S16, 2 => OperandSize::S32, _ => OperandSize::S64 };
+        let size = match shift {
+            0 => OperandSize::S8,
+            1 => OperandSize::S16,
+            2 => OperandSize::S32,
+            _ => OperandSize::S64,
+        };
         let n = (ebpf::VECTOR_WIDTH * op.halves()) as i32 >> shift;
         // The operands must be in memory
         for slot in [op.vd, op.va] {
@@ -2243,7 +2873,15 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         self.simd_ensure_base();
         let (count, mask) = (REGISTER_MAP[op.dst as usize], REGISTER_MAP[op.src as usize]);
-        let mut temps = [REGISTER_MAP[1], REGISTER_MAP[2], REGISTER_MAP[3], REGISTER_MAP[4]].iter().copied().filter(|r| *r != count && *r != mask);
+        let mut temps = [
+            REGISTER_MAP[1],
+            REGISTER_MAP[2],
+            REGISTER_MAP[3],
+            REGISTER_MAP[4],
+        ]
+        .iter()
+        .copied()
+        .filter(|r| *r != count && *r != mask);
         let (t, z) = (temps.next().unwrap(), temps.next().unwrap());
         self.emit_ins(X86Instruction::push(t, None));
         self.emit_ins(X86Instruction::push(z, None));
@@ -2252,8 +2890,18 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::load_immediate(count, 0));
         let (da, dd) = (Self::slot_disp(op.va), Self::slot_disp(op.vd));
         for i in 0..n {
-            self.emit_ins(X86Instruction::load(size, REGISTER_SCRATCH, t, X86IndirectAccess::Offset(da + (i << shift))));
-            self.emit_ins(X86Instruction::store(size, t, REGISTER_SCRATCH, X86IndirectAccess::OffsetIndexShift(dd, count, shift)));
+            self.emit_ins(X86Instruction::load(
+                size,
+                REGISTER_SCRATCH,
+                t,
+                X86IndirectAccess::Offset(da + (i << shift)),
+            ));
+            self.emit_ins(X86Instruction::store(
+                size,
+                t,
+                REGISTER_SCRATCH,
+                X86IndirectAccess::OffsetIndexShift(dd, count, shift),
+            ));
             // bt z, i (CF = mask bit i), then adc count, 0
             let zr = z as u8;
             self.emit::<u8>(0x48 | if zr >= 8 { 1 } else { 0 });
@@ -2261,20 +2909,44 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             self.emit::<u8>(0xba);
             self.emit::<u8>(0xe0 | (zr & 7));
             self.emit::<u8>(i as u8);
-            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 2, count, 0, None));
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0x81,
+                2,
+                count,
+                0,
+                None,
+            ));
         }
         // for (t = count; t < n; t++) d[t] = 0
         self.emit_ins(X86Instruction::load_immediate(z, 0));
         self.emit_ins(X86Instruction::mov(OperandSize::S64, count, t));
         let top = self.offset_in_text_section;
-        self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, t, n as i64, None));
+        self.emit_ins(X86Instruction::cmp_immediate(
+            OperandSize::S64,
+            t,
+            n as i64,
+            None,
+        ));
         // jae rel32 (patched), emitted raw so that no diversification noop separates it from the patch
         self.emit::<u8>(0x0f);
         self.emit::<u8>(0x83);
         self.emit::<i32>(0);
         let patch = self.offset_in_text_section;
-        self.emit_ins(X86Instruction::store(size, z, REGISTER_SCRATCH, X86IndirectAccess::OffsetIndexShift(dd, t, shift)));
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, t, 1, None));
+        self.emit_ins(X86Instruction::store(
+            size,
+            z,
+            REGISTER_SCRATCH,
+            X86IndirectAccess::OffsetIndexShift(dd, t, shift),
+        ));
+        self.emit_ins(X86Instruction::alu_immediate(
+            OperandSize::S64,
+            0x81,
+            0,
+            t,
+            1,
+            None,
+        ));
         self.emit::<u8>(0xe9);
         let back = top as i64 - (self.offset_in_text_section as i64 + 4);
         self.emit::<i32>(back as i32);
@@ -2294,7 +2966,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VCOMPRESS | VEXPAND => op.off >= 2 || self.simd.vbmi2,
             VMULLO64 => self.simd.dq,
             VMADD52LO | VMADD52HI => self.simd.ifma,
-            VPOPCNT => if op.off < 2 { self.simd.bitalg } else { self.simd.vpopcntdq },
+            VPOPCNT => {
+                if op.off < 2 {
+                    self.simd.bitalg
+                } else {
+                    self.simd.vpopcntdq
+                }
+            }
             VLZCNT => self.simd.cd,
             VPERMB | VPERMI2B | VMULTISHIFT => self.simd.vbmi,
             VGF2P8AFFINE | VGF2P8MUL => self.simd.gfni,
@@ -2315,7 +2993,14 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             // A 32 bit mov zero extends
             self.emit_ins(X86Instruction::mov(OperandSize::S32, src, dst));
             if lanes < 32 {
-                self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, dst, (1i64 << lanes) - 1, None));
+                self.emit_ins(X86Instruction::alu_immediate(
+                    OperandSize::S32,
+                    0x81,
+                    4,
+                    dst,
+                    (1i64 << lanes) - 1,
+                    None,
+                ));
             }
         }
         // popcnt r64, r64 (no helper for it in the emitter)
@@ -2335,15 +3020,32 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.simd_flush(true);
         self.simd.stats.intrinsic_slow_paths += 1;
         let encoded = simd::encode_for_host(op);
-        let scalar = if simd::uses_src(op.subop) { Value::Register(REGISTER_MAP[op.src as usize]) } else { Value::Constant64(0, false) };
+        let scalar = if simd::uses_src(op.subop) {
+            Value::Register(REGISTER_MAP[op.src as usize])
+        } else {
+            Value::Constant64(0, false)
+        };
         let dst = simd::writes_dst(op.subop).then(|| REGISTER_MAP[op.dst as usize]);
         self.emit_rust_call(
             Value::Constant64(simd::jit_interpret as *const u8 as i64, false),
             &[
                 // First, the other arguments may overwrite it
-                Argument { index: 2, value: scalar },
-                Argument { index: 1, value: Value::Constant64(encoded as i64, false) },
-                Argument { index: 0, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::SimdVectorBase), false) },
+                Argument {
+                    index: 2,
+                    value: scalar,
+                },
+                Argument {
+                    index: 1,
+                    value: Value::Constant64(encoded as i64, false),
+                },
+                Argument {
+                    index: 0,
+                    value: Value::RegisterIndirect(
+                        REGISTER_PTR_TO_VM,
+                        self.slot_in_vm(RuntimeEnvironmentSlot::SimdVectorBase),
+                        false,
+                    ),
+                },
             ],
             dst,
         );
@@ -2414,8 +3116,19 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     fn emit_simd_madd52_avx2(&mut self, op: &VecInsn) {
         let (ra, rb) = (self.simd_pinned(op.va), self.simd_pinned(op.vb));
         let rd = self.simd_pinned(op.vd);
-        let (a0, a1, b0, b1, p, m) = (self.simd_temp(), self.simd_temp(), self.simd_temp(), self.simd_temp(), self.simd_temp(), self.simd_temp());
-        let (s, m26, m52) = (SCRATCH_YMM, self.simd_table(TAB_M26), self.simd_table(TAB_M52));
+        let (a0, a1, b0, b1, p, m) = (
+            self.simd_temp(),
+            self.simd_temp(),
+            self.simd_temp(),
+            self.simd_temp(),
+            self.simd_temp(),
+            self.simd_temp(),
+        );
+        let (s, m26, m52) = (
+            SCRATCH_YMM,
+            self.simd_table(TAB_M26),
+            self.simd_table(TAB_M52),
+        );
         let r = VexRm::Reg;
         self.emit_vex(V::alu(VPAND, a0, ra, m26));
         self.emit_vex(V::psrlq(a1, ra, 26));
@@ -2448,9 +3161,16 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     fn emit_simd_cmp_avx2(&mut self, va: u8, vb: u8, off: i16, target: X86Register) {
         let (size, pred, unsigned) = ((off >> 4) as usize, off & 7, off & 8 != 0);
         let lanes = 32u32 >> size;
-        let lane_mask = if lanes == 32 { u32::MAX as i64 } else { (1i64 << lanes) - 1 };
+        let lane_mask = if lanes == 32 {
+            u32::MAX as i64
+        } else {
+            (1i64 << lanes) - 1
+        };
         if pred == 3 || pred == 7 {
-            self.emit_ins(X86Instruction::load_immediate(target, if pred == 7 { lane_mask } else { 0 }));
+            self.emit_ins(X86Instruction::load_immediate(
+                target,
+                if pred == 7 { lane_mask } else { 0 },
+            ));
             return;
         }
         let (mut x, mut y) = (self.simd_pinned(va), self.simd_pinned(vb));
@@ -2462,10 +3182,22 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         let r = self.simd_temp();
         let (eq, gt) = match size {
-            0 => (V::alu(0x74, r, x, VexRm::Reg(y)), V::alu(0x64, r, x, VexRm::Reg(y))),
-            1 => (V::alu(0x75, r, x, VexRm::Reg(y)), V::alu(0x65, r, x, VexRm::Reg(y))),
-            2 => (V::alu(0x76, r, x, VexRm::Reg(y)), V::alu(0x66, r, x, VexRm::Reg(y))),
-            _ => (V::alu38(0x29, r, x, VexRm::Reg(y)), V::alu38(0x37, r, x, VexRm::Reg(y))),
+            0 => (
+                V::alu(0x74, r, x, VexRm::Reg(y)),
+                V::alu(0x64, r, x, VexRm::Reg(y)),
+            ),
+            1 => (
+                V::alu(0x75, r, x, VexRm::Reg(y)),
+                V::alu(0x65, r, x, VexRm::Reg(y)),
+            ),
+            2 => (
+                V::alu(0x76, r, x, VexRm::Reg(y)),
+                V::alu(0x66, r, x, VexRm::Reg(y)),
+            ),
+            _ => (
+                V::alu38(0x29, r, x, VexRm::Reg(y)),
+                V::alu38(0x37, r, x, VexRm::Reg(y)),
+            ),
         };
         // eq / ne: x == y, lt / ge: y > x, le / gt: x > y
         let swapped = |mut i: V| {
@@ -2486,12 +3218,26 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_vex(V::alu(0x63, r, r, VexRm::Reg(r)));
                 self.emit_vex(V::permq(r, r, 0xd8));
                 self.emit_vex(V::pmovmskb(target, r));
-                self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, target, 0xffff, None));
+                self.emit_ins(X86Instruction::alu_immediate(
+                    OperandSize::S32,
+                    0x81,
+                    4,
+                    target,
+                    0xffff,
+                    None,
+                ));
             }
             _ => self.emit_vex(V::movmskps(target, r, size == 3)),
         }
         if matches!(pred, 2 | 4 | 5) {
-            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 6, target, lane_mask, None));
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S32,
+                0x81,
+                6,
+                target,
+                lane_mask,
+                None,
+            ));
         }
     }
 
@@ -2548,14 +3294,34 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             self.simd.pinned = [false; CACHE_REGS];
             self.emit_simd_cmp_avx2(op.va + 1, op.vb + 1, op.off, REGISTER_SCRATCH);
             self.simd.r11 = R11::Unknown;
-            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, REGISTER_SCRATCH, lanes, None));
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, REGISTER_SCRATCH, dst, None));
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0xc1,
+                4,
+                REGISTER_SCRATCH,
+                lanes,
+                None,
+            ));
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x09,
+                REGISTER_SCRATCH,
+                dst,
+                None,
+            ));
         } else {
             let (m, size) = (REGISTER_MAP[op.src as usize], op.off as u8);
             self.emit_simd_blendm_avx2(op.vd, op.va, op.vb, size, m);
             self.simd.pinned = [false; CACHE_REGS];
             self.emit_ins(X86Instruction::mov(OperandSize::S64, m, REGISTER_SCRATCH));
-            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, REGISTER_SCRATCH, (32 >> size) as i64, None));
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0xc1,
+                5,
+                REGISTER_SCRATCH,
+                (32 >> size) as i64,
+                None,
+            ));
             self.emit_simd_blendm_avx2(op.vd + 1, op.va + 1, op.vb + 1, size, REGISTER_SCRATCH);
         }
         self.simd.pinned = [false; CACHE_REGS];
@@ -2572,14 +3338,38 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             _ => (4, TAB_E64),
         };
         // ymm15 = the 8 u32 indices at table + 8 * (mask & lanes)
-        let t = [REGISTER_MAP[1], REGISTER_MAP[2], REGISTER_MAP[3]].iter().copied().find(|r| *r != src && *r != REGISTER_MAP[op.dst as usize]).unwrap();
+        let t = [REGISTER_MAP[1], REGISTER_MAP[2], REGISTER_MAP[3]]
+            .iter()
+            .copied()
+            .find(|r| *r != src && *r != REGISTER_MAP[op.dst as usize])
+            .unwrap();
         self.emit_ins(X86Instruction::push(t, None));
         self.emit_ins(X86Instruction::mov(OperandSize::S32, src, t));
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, t, (1i64 << lanes) - 1, None));
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, t, 3, None));
+        self.emit_ins(X86Instruction::alu_immediate(
+            OperandSize::S32,
+            0x81,
+            4,
+            t,
+            (1i64 << lanes) - 1,
+            None,
+        ));
+        self.emit_ins(X86Instruction::alu_immediate(
+            OperandSize::S64,
+            0xc1,
+            4,
+            t,
+            3,
+            None,
+        ));
         let base = unsafe { self.anchors[ANCHOR_SIMD_TABLES].add(table) } as i64;
         self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, base));
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, t, REGISTER_SCRATCH, None));
+        self.emit_ins(X86Instruction::alu(
+            OperandSize::S64,
+            0x01,
+            t,
+            REGISTER_SCRATCH,
+            None,
+        ));
         self.emit_ins(X86Instruction::pop(t));
         self.emit_vex(V::pmovzxbd(SCRATCH_YMM, REGISTER_SCRATCH, 0));
         self.simd.r11 = R11::Unknown;
@@ -2635,7 +3425,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_vex(V::alu(VPAND, t, ra, self.simd_table(TAB_0F)));
         self.emit_vex(V::ymm(1, 1, 0x71, 2, s, VexRm::Reg(ra), Some(4)));
         self.emit_vex(V::alu(VPAND, s, s, self.simd_table(TAB_0F)));
-        self.emit_vex(V::load_rip(u, unsafe { self.anchors[ANCHOR_SIMD_TABLES].add(TAB_NIB) }));
+        self.emit_vex(V::load_rip(u, unsafe {
+            self.anchors[ANCHOR_SIMD_TABLES].add(TAB_NIB)
+        }));
         self.emit_vex(V::pshufb(t, u, VexRm::Reg(t)));
         self.emit_vex(V::pshufb(s, u, VexRm::Reg(s)));
         let rd = self.simd_destination(vd);
@@ -2663,7 +3455,15 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // The high half's source first: the destination may alias the source
         match ratio {
             2 => self.emit_vex(V::extracti128(SCRATCH_YMM, ra, 1)),
-            _ => self.emit_vex(V::ymm(1, 1, 0x73, 3, SCRATCH_YMM, VexRm::Reg(ra), Some(32 / ratio))),
+            _ => self.emit_vex(V::ymm(
+                1,
+                1,
+                0x73,
+                3,
+                SCRATCH_YMM,
+                VexRm::Reg(ra),
+                Some(32 / ratio),
+            )),
         }
         let opcode = Self::widen_opcode(op);
         let hi = self.simd_destination(op.vd + 1);
@@ -2712,9 +3512,20 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     /// (map, opcode, W, immediate) of the VBMI2 funnel shifts
     fn funnel_opcode(op: &VecInsn) -> (u8, u8, bool, Option<u8>) {
         use crate::simd::*;
-        let size = if matches!(op.subop, VSHLD | VSHRD) { op.off >> 6 } else { op.off } as u8;
-        let base = match op.subop { VSHLD | VSHLDV => 0x70, _ => 0x72 } + (size > 1) as u8;
-        let map = if matches!(op.subop, VSHLD | VSHRD) { 3 } else { 2 };
+        let size = if matches!(op.subop, VSHLD | VSHRD) {
+            op.off >> 6
+        } else {
+            op.off
+        } as u8;
+        let base = match op.subop {
+            VSHLD | VSHLDV => 0x70,
+            _ => 0x72,
+        } + (size > 1) as u8;
+        let map = if matches!(op.subop, VSHLD | VSHRD) {
+            3
+        } else {
+            2
+        };
         let imm = matches!(op.subop, VSHLD | VSHRD).then_some((op.off & 63) as u8);
         (map, base, size != 2, imm)
     }
@@ -2727,7 +3538,14 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_vex(V::alu(0x63, r, r, VexRm::Reg(r)));
                 self.emit_vex(V::permq(r, r, 0xd8));
                 self.emit_vex(V::pmovmskb(target, r));
-                self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, target, 0xffff, None));
+                self.emit_ins(X86Instruction::alu_immediate(
+                    OperandSize::S32,
+                    0x81,
+                    4,
+                    target,
+                    0xffff,
+                    None,
+                ));
             }
             _ => self.emit_vex(V::movmskps(target, r, size == 3)),
         }
@@ -2735,7 +3553,15 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     /// Immediate shift of lanes of `1 << size` bytes (0x71 / 0x72 / 0x73, /6 left, /2 right)
     fn shift_imm(size: u8, left: bool, dst: u8, src: u8, n: u8) -> V {
-        V::ymm(1, 1, 0x70 + size, if left { 6 } else { 2 }, dst, VexRm::Reg(src), Some(n))
+        V::ymm(
+            1,
+            1,
+            0x70 + size,
+            if left { 6 } else { 2 },
+            dst,
+            VexRm::Reg(src),
+            Some(n),
+        )
     }
 
     /// shld / shrd by an immediate without VBMI2: two immediate shifts and an or
@@ -2764,20 +3590,40 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         let rd0 = self.simd_pinned(op.vd);
         let (c, t) = (self.simd_temp(), self.simd_temp());
         let (mask, width) = if q {
-            (VexRm::Rip(self.anchors[ANCHOR_SIMD_C63Q]), self.simd_table(TAB_C64Q))
+            (
+                VexRm::Rip(self.anchors[ANCHOR_SIMD_C63Q]),
+                self.simd_table(TAB_C64Q),
+            )
         } else {
-            (VexRm::Rip(self.anchors[ANCHOR_SIMD_C31]), VexRm::Rip(self.anchors[ANCHOR_SIMD_C32]))
+            (
+                VexRm::Rip(self.anchors[ANCHOR_SIMD_C31]),
+                VexRm::Rip(self.anchors[ANCHOR_SIMD_C32]),
+            )
         };
         let shift = |left: bool, dst: u8, src: u8, count: u8| {
             let opcode = if left { 0x47 } else { 0x45 };
-            if q { V::alu38w(opcode, dst, src, VexRm::Reg(count)) } else { V::alu38(opcode, dst, src, VexRm::Reg(count)) }
+            if q {
+                V::alu38w(opcode, dst, src, VexRm::Reg(count))
+            } else {
+                V::alu38(opcode, dst, src, VexRm::Reg(count))
+            }
         };
         let left = op.subop == simd::VSHLDV;
         self.emit_vex(V::alu(VPAND, c, rb, mask));
         // ymm15 = w - c (a shift by w gives 0, so c = 0 keeps d)
-        self.emit_vex(V::alu(VPXOR, SCRATCH_YMM, SCRATCH_YMM, VexRm::Reg(SCRATCH_YMM)));
+        self.emit_vex(V::alu(
+            VPXOR,
+            SCRATCH_YMM,
+            SCRATCH_YMM,
+            VexRm::Reg(SCRATCH_YMM),
+        ));
         self.emit_vex(V::alu(VPOR, SCRATCH_YMM, SCRATCH_YMM, width));
-        self.emit_vex(V::alu(if q { 0xfb } else { VPSUBD }, SCRATCH_YMM, SCRATCH_YMM, VexRm::Reg(c)));
+        self.emit_vex(V::alu(
+            if q { 0xfb } else { VPSUBD },
+            SCRATCH_YMM,
+            SCRATCH_YMM,
+            VexRm::Reg(c),
+        ));
         self.emit_vex(shift(!left, t, ra, SCRATCH_YMM));
         let rd = self.simd_destination(op.vd);
         debug_assert_eq!(rd, rd0);
@@ -2790,26 +3636,644 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.simd_flush(true);
         let store = op.subop == simd::VSTOREM;
         let slot = if store { op.va } else { op.vd };
-        let spec = store as u64 | (slot as u64) << 8 | (op.vb as u64) << 16 | (op.halves() as u64) << 24;
-        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, op.off as i64));
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_MAP[op.src as usize], REGISTER_SCRATCH, None));
+        let spec =
+            store as u64 | (slot as u64) << 8 | (op.vb as u64) << 16 | (op.halves() as u64) << 24;
+        self.emit_ins(X86Instruction::load_immediate(
+            REGISTER_SCRATCH,
+            op.off as i64,
+        ));
+        self.emit_ins(X86Instruction::alu(
+            OperandSize::S64,
+            0x01,
+            REGISTER_MAP[op.src as usize],
+            REGISTER_SCRATCH,
+            None,
+        ));
         self.simd.stats.translations += 1;
         self.emit_rust_call(
             Value::Constant64(simd::jit_transfer_masked as *const u8 as i64, false),
             &[
                 // The registers first (the mask may live in an argument register)
-                Argument { index: 5, value: Value::Register(REGISTER_MAP[op.dst as usize]) },
-                Argument { index: 3, value: Value::Register(REGISTER_SCRATCH) },
-                Argument { index: 4, value: Value::Constant64(spec as i64, false) },
-                Argument { index: 2, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::SimdVectorBase), false) },
-                Argument { index: 1, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping), false) },
-                Argument { index: 0, value: Value::RegisterPlusConstant32(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult), false) },
+                Argument {
+                    index: 5,
+                    value: Value::Register(REGISTER_MAP[op.dst as usize]),
+                },
+                Argument {
+                    index: 3,
+                    value: Value::Register(REGISTER_SCRATCH),
+                },
+                Argument {
+                    index: 4,
+                    value: Value::Constant64(spec as i64, false),
+                },
+                Argument {
+                    index: 2,
+                    value: Value::RegisterIndirect(
+                        REGISTER_PTR_TO_VM,
+                        self.slot_in_vm(RuntimeEnvironmentSlot::SimdVectorBase),
+                        false,
+                    ),
+                },
+                Argument {
+                    index: 1,
+                    value: Value::RegisterIndirect(
+                        REGISTER_PTR_TO_VM,
+                        self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping),
+                        false,
+                    ),
+                },
+                Argument {
+                    index: 0,
+                    value: Value::RegisterPlusConstant32(
+                        REGISTER_PTR_TO_VM,
+                        self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult),
+                        false,
+                    ),
+                },
             ],
             None,
         );
         self.emit_check_result_is_ok();
-        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
-        self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 6)));
+        self.emit_ins(X86Instruction::load_immediate(
+            REGISTER_SCRATCH,
+            self.pc as i64,
+        ));
+        self.emit_ins(X86Instruction::conditional_jump_immediate(
+            0x85,
+            self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 6),
+        ));
         self.simd.r11 = R11::Unknown;
+    }
+
+    /// Truncation of one 256 bit register without AVX-512 into a new temporary (low part, the rest
+    /// zero): every 128 bit lane's kept bytes packed with vpshufb, then the two lanes joined by a
+    /// VEX.128 unpack (which zeroes the upper half)
+    fn emit_simd_trunc_half(&mut self, ra: u8, imm: u8) -> u8 {
+        let (from, to) = (imm & 3, imm >> 2);
+        let k = TRUNC_PAIRS.iter().position(|p| *p == (from, to)).unwrap();
+        let t = self.simd_temp();
+        self.emit_vex(V::pshufb(t, ra, self.simd_table(TAB_TRUNC + 32 * k)));
+        self.emit_vex(V::extracti128(SCRATCH_YMM, t, 1));
+        let opcode = match from - to {
+            1 => 0x6c,
+            2 => 0x62,
+            _ => 0x61,
+        };
+        self.emit_vex(V {
+            l: false,
+            ..V::alu(opcode, t, t, VexRm::Reg(SCRATCH_YMM))
+        });
+        t
+    }
+
+    /// 512 bit trunc without AVX-512: both halves truncated, joined into the low slot, the high slot
+    /// zero
+    fn emit_simd_trunc_split(&mut self, op: &VecInsn) {
+        self.simd_ensure_base();
+        self.simd.pinned = [false; CACHE_REGS];
+        let imm = op.off as u8;
+        let (lo_src, hi_src) = (self.simd_pinned(op.va), self.simd_pinned(op.va + 1));
+        let lo = self.emit_simd_trunc_half(lo_src, imm);
+        let hi = self.emit_simd_trunc_half(hi_src, imm);
+        match (imm & 3) - (imm >> 2) {
+            1 => self.emit_vex(V::inserti128(lo, lo, hi, 1)),
+            2 => self.emit_vex(V {
+                l: false,
+                ..V::alu(0x6c, lo, lo, VexRm::Reg(hi))
+            }),
+            _ => self.emit_vex(V {
+                l: false,
+                ..V::alu(0x62, lo, lo, VexRm::Reg(hi))
+            }),
+        }
+        self.emit_vex(V::alu(VPXOR, hi, hi, VexRm::Reg(hi)));
+        self.simd_rebind(op.vd, lo);
+        self.simd_rebind(op.vd + 1, hi);
+        self.simd.pinned = [false; CACHE_REGS];
+    }
+
+    /// testm without AVX-512 into the scalar register `target`
+    fn emit_simd_testm_avx2(&mut self, va: u8, vb: u8, off: i16, target: X86Register) {
+        let ra = self.simd_pinned(va);
+        let b = if vb == va {
+            VexRm::Reg(ra)
+        } else {
+            self.simd_source(vb)
+        };
+        let (t, z) = (self.simd_temp(), self.simd_temp());
+        let size = (off & 3) as usize;
+        self.emit_vex(V::alu(VPAND, t, ra, b));
+        self.emit_vex(V::alu(VPXOR, z, z, VexRm::Reg(z)));
+        self.emit_vex(match size {
+            0 => V::alu(0x74, t, t, VexRm::Reg(z)),
+            1 => V::alu(0x75, t, t, VexRm::Reg(z)),
+            2 => V::alu(0x76, t, t, VexRm::Reg(z)),
+            _ => V::alu38(0x29, t, t, VexRm::Reg(z)),
+        });
+        self.emit_simd_movemask(t, size, target);
+        if off & 4 == 0 {
+            let lanes = 32u32 >> size;
+            let lane_mask = if lanes == 32 {
+                u32::MAX as i64
+            } else {
+                (1i64 << lanes) - 1
+            };
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S32,
+                0x81,
+                6,
+                target,
+                lane_mask,
+                None,
+            ));
+        }
+    }
+
+    /// 512 bit testm without AVX-512: two halves, the high half's mask in r11
+    fn emit_simd_testm_split(&mut self, op: &VecInsn) {
+        self.simd_ensure_base();
+        self.simd.pinned = [false; CACHE_REGS];
+        let dst = REGISTER_MAP[op.dst as usize];
+        let lanes = (32u32 >> (op.off & 3)) as i64;
+        self.emit_simd_testm_avx2(op.va, op.vb, op.off, dst);
+        self.simd.pinned = [false; CACHE_REGS];
+        self.emit_simd_testm_avx2(op.va + 1, op.vb + 1, op.off, REGISTER_SCRATCH);
+        self.simd.r11 = R11::Unknown;
+        self.emit_ins(X86Instruction::alu_immediate(
+            OperandSize::S64,
+            0xc1,
+            4,
+            REGISTER_SCRATCH,
+            lanes,
+            None,
+        ));
+        self.emit_ins(X86Instruction::alu(
+            OperandSize::S64,
+            0x09,
+            REGISTER_SCRATCH,
+            dst,
+            None,
+        ));
+        self.simd.pinned = [false; CACHE_REGS];
+    }
+
+    fn simd_unpin(&mut self, reg: u8) {
+        self.simd.pinned[reg as usize] = false;
+    }
+
+    /// Byte table lookup without VBMI: every 128 bit lane of the table broadcast and indexed with
+    /// vpshufb (index bits 0..4), then selected by the higher index bits with a vpblendvb tree.
+    /// `idx` holds byte indices below 16 * lanes.len(); returns a temporary
+    fn emit_simd_lookup(&mut self, lanes: &[(u8, u8)], idx: u8) -> u8 {
+        if lanes.len() == 1 {
+            let (reg, lane) = lanes[0];
+            let t = self.simd_temp();
+            self.emit_vex(V::permq(t, reg, if lane == 0 { 0x44 } else { 0xee }));
+            self.emit_vex(V::pshufb(t, t, VexRm::Reg(idx)));
+            return t;
+        }
+        let half = lanes.len() / 2;
+        let l = self.emit_simd_lookup(&lanes[..half], idx);
+        let r = self.emit_simd_lookup(&lanes[half..], idx);
+        // Index bit 4 + log2(half) to the sign bit of every byte (a u16 shift by at most 3 keeps bit 7
+        // of both bytes inside their byte)
+        let bit = 4 + half.trailing_zeros() as u8;
+        self.emit_vex(V::ymm(
+            1,
+            1,
+            0x71,
+            6,
+            SCRATCH_YMM,
+            VexRm::Reg(idx),
+            Some(7 - bit),
+        ));
+        self.emit_vex(V::pblendvb(l, l, r, SCRATCH_YMM));
+        self.simd_unpin(r);
+        l
+    }
+
+    /// permb / permi2b / permw without VBMI / AVX-512 (both widths) as byte table lookups
+    fn emit_simd_byte_table(&mut self, op: &VecInsn) {
+        use crate::simd::*;
+        self.simd_ensure_base();
+        self.simd.pinned = [false; CACHE_REGS];
+        let h = op.halves() as u8;
+        let mut table_slots: Vec<u8> = (0..h).map(|k| op.va + k).collect();
+        if op.subop == VPERMI2B {
+            table_slots.extend((0..h).map(|k| op.vb + k));
+        }
+        let mut lanes = Vec::new();
+        for slot in table_slots {
+            let reg = self.simd_pinned(slot);
+            lanes.push((reg, 0));
+            lanes.push((reg, 1));
+        }
+        let index_slot = if op.subop == VPERMI2B { op.vd } else { op.vb };
+        let mut out = Vec::new();
+        for k in 0..h {
+            let idx = self.simd_pinned(index_slot + k);
+            let bi = self.simd_temp();
+            if op.subop == VPERMW {
+                // u16 index w -> bytes (2 w, 2 w + 1)
+                self.emit_vex(V::alu(
+                    VPAND,
+                    bi,
+                    idx,
+                    self.simd_table(if h == 1 { TAB_W15 } else { TAB_W31 }),
+                ));
+                self.emit_vex(V::ymm(1, 1, 0x71, 6, bi, VexRm::Reg(bi), Some(1)));
+                self.emit_vex(V::ymm(1, 1, 0x71, 6, SCRATCH_YMM, VexRm::Reg(bi), Some(8)));
+                self.emit_vex(V::alu(VPOR, bi, bi, VexRm::Reg(SCRATCH_YMM)));
+                self.emit_vex(V::alu(VPADDW, bi, bi, self.simd_table(TAB_W0100)));
+            } else {
+                let m = match lanes.len() {
+                    2 => 0,
+                    4 => 1,
+                    _ => 2,
+                };
+                self.emit_vex(V::alu(VPAND, bi, idx, self.simd_table(TAB_BMASK + 32 * m)));
+            }
+            let r = self.emit_simd_lookup(&lanes, bi);
+            self.simd_unpin(bi);
+            out.push(r);
+        }
+        for (k, r) in out.into_iter().enumerate() {
+            self.simd_rebind(op.vd + k as u8, r);
+        }
+        self.simd.pinned = [false; CACHE_REGS];
+    }
+
+    /// u16 variable shifts without AVX-512BW, from u32 variable shifts on the even and odd u16
+    /// lanes; `out` must not be an input
+    fn emit_simd_var16(&mut self, subop: u8, out: u8, x: u8, c: u8) {
+        use crate::simd::*;
+        let (t, u, s) = (self.simd_temp(), self.simd_temp(), SCRATCH_YMM);
+        let (lo16, hi16) = (self.simd_table(TAB_LO16), self.simd_table(TAB_HI16));
+        let r = VexRm::Reg;
+        self.emit_vex(V::alu(VPAND, s, c, lo16));
+        self.emit_vex(V::psrld(u, c, 16));
+        match subop {
+            VSRLV16 => {
+                self.emit_vex(V::alu(VPAND, t, x, lo16));
+                self.emit_vex(V::alu38(0x45, t, t, r(s)));
+                self.emit_vex(V::psrld(s, x, 16));
+                self.emit_vex(V::alu38(0x45, s, s, r(u)));
+                self.emit_vex(V::pslld(s, s, 16));
+            }
+            VSLLV16 => {
+                self.emit_vex(V::alu(VPAND, t, x, lo16));
+                self.emit_vex(V::alu38(0x47, t, t, r(s)));
+                self.emit_vex(V::alu(VPAND, t, t, lo16));
+                self.emit_vex(V::alu(VPAND, s, x, hi16));
+                self.emit_vex(V::alu38(0x47, s, s, r(u)));
+                self.emit_vex(V::alu(VPAND, s, s, hi16));
+            }
+            _ => {
+                self.emit_vex(V::pslld(t, x, 16));
+                self.emit_vex(V::psrad(t, t, 16));
+                self.emit_vex(V::alu38(0x46, t, t, r(s)));
+                self.emit_vex(V::alu(VPAND, t, t, lo16));
+                self.emit_vex(V::psrad(s, x, 16));
+                self.emit_vex(V::alu38(0x46, s, s, r(u)));
+                self.emit_vex(V::pslld(s, s, 16));
+            }
+        }
+        self.emit_vex(V::alu(VPOR, out, t, r(s)));
+        self.simd_unpin(t);
+        self.simd_unpin(u);
+    }
+
+    /// shldv / shrdv of u16 lanes without VBMI2: c = b & 15, then the u16 variable shifts
+    fn emit_simd_funnel16_avx2(&mut self, op: &VecInsn) {
+        use crate::simd::*;
+        let (ra, rb) = (self.simd_pinned(op.va), self.simd_pinned(op.vb));
+        let rd0 = self.simd_pinned(op.vd);
+        let (c, w) = (self.simd_temp(), self.simd_temp());
+        self.emit_vex(V::alu(VPAND, c, rb, self.simd_table(TAB_W15)));
+        self.emit_vex(V::load_rip(w, unsafe {
+            self.anchors[ANCHOR_SIMD_TABLES].add(TAB_C16W)
+        }));
+        self.emit_vex(V::alu(VPSUBW, w, w, VexRm::Reg(c)));
+        let (p, q) = (self.simd_temp(), self.simd_temp());
+        let (first, second) = if op.subop == VSHLDV {
+            (VSLLV16, VSRLV16)
+        } else {
+            (VSRLV16, VSLLV16)
+        };
+        self.emit_simd_var16(first, p, rd0, c);
+        self.emit_simd_var16(second, q, ra, w);
+        let rd = self.simd_destination(op.vd);
+        self.emit_vex(V::alu(VPOR, rd, p, VexRm::Reg(q)));
+    }
+
+    /// lzcnt without AVX-512CD: smear the bits right, then width - popcnt
+    fn emit_simd_lzcnt_avx2(&mut self, op: &VecInsn) {
+        let q = op.off == 3;
+        let ra = self.simd_pinned(op.va);
+        let t = self.simd_temp();
+        self.emit_vex(V::mov(t, ra));
+        for sh in [1u8, 2, 4, 8, 16, 32] {
+            if sh == 32 && !q {
+                break;
+            }
+            self.emit_vex(if q {
+                V::psrlq(SCRATCH_YMM, t, sh)
+            } else {
+                V::psrld(SCRATCH_YMM, t, sh)
+            });
+            self.emit_vex(V::alu(VPOR, t, t, VexRm::Reg(SCRATCH_YMM)));
+        }
+        self.emit_simd_popcnt_avx2(op.vd, t, op.off as u8);
+        let rd = self.simd.slots[op.vd as usize].reg.unwrap();
+        let width = if q {
+            unsafe { self.anchors[ANCHOR_SIMD_TABLES].add(TAB_C64Q) }
+        } else {
+            self.anchors[ANCHOR_SIMD_C32]
+        };
+        self.emit_vex(V::load_rip(SCRATCH_YMM, width));
+        self.emit_vex(V::alu(
+            if q { 0xfb } else { VPSUBD },
+            rd,
+            SCRATCH_YMM,
+            VexRm::Reg(rd),
+        ));
+    }
+
+    /// multishift without VBMI: per byte position j, the u64 lanes rotated right by the control byte
+    /// j (& 63), the low byte placed at j
+    fn emit_simd_multishift_avx2(&mut self, op: &VecInsn) {
+        let (ra, rb) = (self.simd_pinned(op.va), self.simd_pinned(op.vb));
+        let (acc, t, u, k) = (
+            self.simd_temp(),
+            self.simd_temp(),
+            self.simd_temp(),
+            self.simd_temp(),
+        );
+        let (c63, c64, ffq) = (
+            VexRm::Rip(self.anchors[ANCHOR_SIMD_C63Q]),
+            self.simd_table(TAB_C64Q),
+            self.simd_table(TAB_FFQ),
+        );
+        let r = VexRm::Reg;
+        self.emit_vex(V::alu(VPXOR, acc, acc, r(acc)));
+        for j in 0..8u8 {
+            let s = SCRATCH_YMM;
+            if j == 0 {
+                self.emit_vex(V::alu(VPAND, s, rb, c63));
+            } else {
+                self.emit_vex(V::psrlq(s, rb, 8 * j));
+                self.emit_vex(V::alu(VPAND, s, s, c63));
+            }
+            self.emit_vex(V::alu38w(0x45, t, ra, r(s)));
+            self.emit_vex(V::alu(VPXOR, k, k, r(k)));
+            self.emit_vex(V::alu(VPOR, k, k, c64));
+            self.emit_vex(V::alu(0xfb, k, k, r(s)));
+            self.emit_vex(V::alu38w(0x47, u, ra, r(k)));
+            self.emit_vex(V::alu(VPOR, t, t, r(u)));
+            self.emit_vex(V::alu(VPAND, t, t, ffq));
+            if j > 0 {
+                self.emit_vex(V::psllq(t, t, 8 * j));
+            }
+            self.emit_vex(V::alu(VPOR, acc, acc, r(t)));
+        }
+        self.simd_rebind(op.vd, acc);
+    }
+
+    /// gf2p8mul without GFNI: 8 steps of (b bit k ? a : 0) xor-accumulated, a doubled modulo 0x11b
+    fn emit_simd_gf2p8mul_avx2(&mut self, op: &VecInsn) {
+        let (ra, rb) = (self.simd_pinned(op.va), self.simd_pinned(op.vb));
+        let (acc, xa, m, z) = (
+            self.simd_temp(),
+            self.simd_temp(),
+            self.simd_temp(),
+            self.simd_temp(),
+        );
+        let r = VexRm::Reg;
+        let s = SCRATCH_YMM;
+        self.emit_vex(V::alu(VPXOR, acc, acc, r(acc)));
+        self.emit_vex(V::alu(VPXOR, z, z, r(z)));
+        self.emit_vex(V::mov(xa, ra));
+        for k in 0..8usize {
+            let bit = self.simd_table(TAB_BYTEBIT + 32 * k);
+            self.emit_vex(V::alu(VPAND, m, rb, bit));
+            self.emit_vex(V::alu(0x74, m, m, bit));
+            self.emit_vex(V::alu(VPAND, m, m, r(xa)));
+            self.emit_vex(V::alu(VPXOR, acc, acc, r(m)));
+            if k < 7 {
+                self.emit_vex(V::alu(0x64, s, z, r(xa)));
+                self.emit_vex(V::alu(VPAND, s, s, self.simd_table(TAB_1B)));
+                self.emit_vex(V::alu(0xfc, xa, xa, r(xa)));
+                self.emit_vex(V::alu(VPXOR, xa, xa, r(s)));
+            }
+        }
+        self.simd_rebind(op.vd, acc);
+    }
+
+    /// gf2p8affine without GFNI: per result bit i (from 7 down), the matrix byte 7 - i of every u64
+    /// broadcast, and-ed with the data, its parity from a nibble table, shifted into the result
+    fn emit_simd_gf2p8affine_avx2(&mut self, op: &VecInsn) {
+        let (ra, rb) = (self.simd_pinned(op.va), self.simd_pinned(op.vb));
+        let (acc, t, lo, ptab) = (
+            self.simd_temp(),
+            self.simd_temp(),
+            self.simd_temp(),
+            self.simd_temp(),
+        );
+        let r = VexRm::Reg;
+        let s = SCRATCH_YMM;
+        let nib = self.simd_table(TAB_0F);
+        self.emit_vex(V::alu(VPXOR, acc, acc, r(acc)));
+        self.emit_vex(V::load_rip(ptab, unsafe {
+            self.anchors[ANCHOR_SIMD_TABLES].add(TAB_PARITY)
+        }));
+        for i in (0..8usize).rev() {
+            self.emit_vex(V::pshufb(t, rb, self.simd_table(TAB_AFFIDX + 32 * i)));
+            self.emit_vex(V::alu(VPAND, t, t, r(ra)));
+            self.emit_vex(V::alu(VPAND, lo, t, nib));
+            self.emit_vex(V::ymm(1, 1, 0x71, 2, s, r(t), Some(4)));
+            self.emit_vex(V::alu(VPAND, s, s, nib));
+            self.emit_vex(V::pshufb(lo, ptab, r(lo)));
+            self.emit_vex(V::pshufb(s, ptab, r(s)));
+            self.emit_vex(V::alu(VPXOR, lo, lo, r(s)));
+            self.emit_vex(V::alu(0xfc, acc, acc, r(acc)));
+            self.emit_vex(V::alu(VPOR, acc, acc, r(lo)));
+        }
+        let imm = op.off as u8;
+        if imm != 0 {
+            self.emit_ins(X86Instruction::load_immediate(
+                REGISTER_SCRATCH,
+                imm as i64 * 0x0101_0101,
+            ));
+            self.simd.r11 = R11::Unknown;
+            self.emit_vex(V::movd_from_gpr(s, REGISTER_SCRATCH));
+            self.emit_vex(V::pbroadcastd(s, s));
+            self.emit_vex(V::alu(VPXOR, acc, acc, r(s)));
+        }
+        self.simd_rebind(op.vd, acc);
+    }
+
+    /// conflict of a 256 bit register without AVX-512CD: compared with its lane rotations by k, the
+    /// bit 1 << (i - k) set where equal (i >= k)
+    fn emit_simd_conflict_avx2(&mut self, op: &VecInsn) {
+        let ra = self.simd_pinned(op.va);
+        let (acc, t) = (self.simd_temp(), self.simd_temp());
+        let r = VexRm::Reg;
+        self.emit_vex(V::alu(VPXOR, acc, acc, r(acc)));
+        if op.off == 2 {
+            for k in 1..8usize {
+                self.emit_vex(V::load_rip(SCRATCH_YMM, unsafe {
+                    self.anchors[ANCHOR_SIMD_TABLES].add(TAB_CONF_IDX32 + 32 * (k - 1))
+                }));
+                self.emit_vex(V::permd(t, SCRATCH_YMM, r(ra)));
+                self.emit_vex(V::alu(0x76, t, t, r(ra)));
+                self.emit_vex(V::alu(
+                    VPAND,
+                    t,
+                    t,
+                    self.simd_table(TAB_CONF_BIT32 + 32 * (k - 1)),
+                ));
+                self.emit_vex(V::alu(VPOR, acc, acc, r(t)));
+            }
+        } else {
+            for k in 1..4u8 {
+                let imm = (0..4u8).fold(0, |m, i| m | ((i + 4 - k) % 4) << (2 * i));
+                self.emit_vex(V::permq(t, ra, imm));
+                self.emit_vex(V::alu38(0x29, t, t, r(ra)));
+                self.emit_vex(V::alu(
+                    VPAND,
+                    t,
+                    t,
+                    self.simd_table(TAB_CONF_BIT64 + 32 * (k as usize - 1)),
+                ));
+                self.emit_vex(V::alu(VPOR, acc, acc, r(t)));
+            }
+        }
+        self.simd_rebind(op.vd, acc);
+    }
+
+    /// dpbusd without VNNI, exactly: the bytes widened to u16 (a zero extended, b sign extended) in
+    /// even / odd positions, vpmaddwd each, accumulated
+    fn emit_simd_dpbusd_avx2(&mut self, op: &VecInsn) {
+        let (ra, rb) = (self.simd_pinned(op.va), self.simd_pinned(op.vb));
+        self.simd_pinned(op.vd);
+        let (ae, be, ao) = (self.simd_temp(), self.simd_temp(), self.simd_temp());
+        let r = VexRm::Reg;
+        let s = SCRATCH_YMM;
+        self.emit_vex(V::alu(VPAND, ae, ra, self.simd_table(TAB_W00FF)));
+        self.emit_vex(V::ymm(1, 1, 0x71, 6, be, r(rb), Some(8)));
+        self.emit_vex(V::ymm(1, 1, 0x71, 4, be, r(be), Some(8)));
+        self.emit_vex(V::alu(0xf5, ae, ae, r(be)));
+        self.emit_vex(V::ymm(1, 1, 0x71, 2, ao, r(ra), Some(8)));
+        self.emit_vex(V::ymm(1, 1, 0x71, 4, s, r(rb), Some(8)));
+        self.emit_vex(V::alu(0xf5, ao, ao, r(s)));
+        let rd = self.simd_destination(op.vd);
+        self.emit_vex(V::alu(VPADDD, rd, rd, r(ae)));
+        self.emit_vex(V::alu(VPADDD, rd, rd, r(ao)));
+    }
+
+    /// expand without a native or table lowering (8 / 16 bit lanes, 512 bit forms): a branchless
+    /// scalar loop from the top lane down, k = rank of the set bit: d[i] = bit i ? a[k--] : 0. The
+    /// reads are at k <= i and the writes go to indices above every later read, so the operands may
+    /// alias.
+    fn emit_simd_expand_scalar(&mut self, op: &VecInsn) {
+        let shift = op.off as u8;
+        let size = match shift {
+            0 => OperandSize::S8,
+            1 => OperandSize::S16,
+            2 => OperandSize::S32,
+            _ => OperandSize::S64,
+        };
+        let n = (ebpf::VECTOR_WIDTH * op.halves()) as i32 >> shift;
+        for slot in [op.vd, op.va] {
+            for s in slot..slot + op.halves() as u8 {
+                self.simd_drop_slot(s);
+                self.simd_drop_pair(s / 2);
+            }
+        }
+        self.simd_ensure_base();
+        let mask = REGISTER_MAP[op.src as usize];
+        let regs: Vec<X86Register> = REGISTER_MAP[1..7]
+            .iter()
+            .copied()
+            .filter(|r| *r != mask)
+            .take(5)
+            .collect();
+        let (k, idx, t, z, m) = (regs[0], regs[1], regs[2], regs[3], regs[4]);
+        for reg in &regs {
+            self.emit_ins(X86Instruction::push(*reg, None));
+        }
+        // m = mask & lanes, k = popcnt(m) - 1
+        if n == 64 {
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, mask, m));
+        } else {
+            self.emit_ins(X86Instruction::mov(OperandSize::S32, mask, m));
+            if n < 32 {
+                self.emit_ins(X86Instruction::alu_immediate(
+                    OperandSize::S32,
+                    0x81,
+                    4,
+                    m,
+                    (1i64 << n) - 1,
+                    None,
+                ));
+            }
+        }
+        let (kr, mr) = (k as u8, m as u8);
+        self.emit::<u8>(0xf3);
+        self.emit::<u8>(0x48 | if kr >= 8 { 4 } else { 0 } | if mr >= 8 { 1 } else { 0 });
+        self.emit::<u8>(0x0f);
+        self.emit::<u8>(0xb8);
+        self.emit::<u8>(0xc0 | (kr & 7) << 3 | (mr & 7));
+        self.emit_ins(X86Instruction::alu_immediate(
+            OperandSize::S64,
+            0x81,
+            5,
+            k,
+            1,
+            None,
+        ));
+        self.emit_ins(X86Instruction::load_immediate(z, 0));
+        let (da, dd) = (Self::slot_disp(op.va), Self::slot_disp(op.vd));
+        for i in (0..n).rev() {
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, k, idx));
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0x81,
+                4,
+                idx,
+                (n - 1) as i64,
+                None,
+            ));
+            self.emit_ins(X86Instruction::load(
+                size,
+                REGISTER_SCRATCH,
+                t,
+                X86IndirectAccess::OffsetIndexShift(da, idx, shift),
+            ));
+            // bt m, i (CF = mask bit i), t = CF ? t : 0, store, k -= CF
+            self.emit::<u8>(0x48 | if mr >= 8 { 1 } else { 0 });
+            self.emit::<u8>(0x0f);
+            self.emit::<u8>(0xba);
+            self.emit::<u8>(0xe0 | (mr & 7));
+            self.emit::<u8>(i as u8);
+            self.emit_ins(X86Instruction::cmov(OperandSize::S64, 0x43, z, t));
+            self.emit_ins(X86Instruction::store(
+                size,
+                t,
+                REGISTER_SCRATCH,
+                X86IndirectAccess::Offset(dd + (i << shift)),
+            ));
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0x81,
+                3,
+                k,
+                0,
+                None,
+            ));
+        }
+        for reg in regs.iter().rev() {
+            self.emit_ins(X86Instruction::pop(*reg));
+        }
     }
 }

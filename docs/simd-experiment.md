@@ -15,7 +15,9 @@ What this experiment would propose, separated from the research scaffolding:
 
 * **Vehicle: static syscall intrinsics only** (SIMD-0645 style, see below). The custom opcode
   `VOP = 0xe7` is research scaffolding for comparing lowerings and needs an ISA change; the
-  intrinsics express everything without one.
+  intrinsics express everything without one. The opcode form and `SimdJitStrategy::Direct` stay
+  in the experiment only as baselines (the benchmarks and `intrinsic_calls_lower_to_inline_avx2` compare
+  against them) and would not be part of a proposal.
 * **The core set: AVX instructions as intrinsics.** The integer subset of AVX2 and AVX-512 (F, BW,
   VL, DQ, CD, IFMA, VBMI, VBMI2, VNNI, BITALG, VPOPCNTDQ) plus GFNI and VPCLMULQDQ, each operation
   with a 256 bit and (except moves / lane extraction) a 512 bit form on slot pairs. Excluded on
@@ -30,8 +32,9 @@ What this experiment would propose, separated from the research scaffolding:
   `mont16` (Falcon's NTT: -870 operations).
 * **Pricing.** Every operation costs 2 CUs (`mov64` + `call`) at either width. A 512 bit operation
   is two native operations on AVX2-only validators; the proposal should state that explicitly, as
-  well as the operations which are slow there (host calls or long templates: `madd52`, VBMI,
-  `conflict`, `lzcnt`, GFNI, `dpbusd`).
+  well as the operations which are slow there (long templates or scalar loops: `madd52`, VBMI,
+  GFNI, `multishift`, `conflict`, 8 / 16 bit `compress` / `expand`; 512 bit `conflict` is a host
+  call).
 
 ## Implementation strategy (and why not `CALL_IMM` builtins)
 
@@ -168,13 +171,19 @@ IFMA and VBMI2 are detected separately):
    `cmp` (`vpcmpgt` / `vpcmpeq`, sign flips for unsigned, `vpmovmskb` / `vmovmskps` / `vmovmskpd`,
    `vpacksswb` + `vpermq` for 16 bit lanes), `blendm` (mask expanded to a vector, `vpblendvb`), u32 /
    u64 `compress` / `expand` (`vpermd` with indices from a table indexed by the mask, no BMI2 since
-   `pext` is microcoded on Zen 1 / 2). 512 bit forms run as two halves.
-3. A branchless scalar loop over the vector file for `compress` without a native or table based
-   lowering (8 / 16 bit lanes, 512 bit forms).
-4. A host call to the reference implementation (`intrinsic_slow_paths` in the statistics) for the
-   operations whose AVX-512 extension is missing and which have no cheap AVX2 equivalent (`expand` of
-   8 / 16 bit lanes, `permw`, `conflict`, `lzcnt`, VBMI, GFNI, `dpbusd`, 16 bit variable shifts and
-   funnel shifts, 512 bit `trunc` / `testm`).
+   `pext` is microcoded on Zen 1 / 2). Further templates for the remaining extensions:
+   `lzcnt` (bit smearing + the `popcnt` template), `permb` / `permi2b` / `permw` (byte table lookups:
+   every 128 bit table lane broadcast and indexed with `vpshufb`, selected by the higher index bits
+   with a `vpblendvb` tree), u16 variable shifts and funnel shifts (u32 variable shifts on the even
+   and odd words), exact `dpbusd` (bytes widened to words, two `vpmaddwd`), `conflict` of u32 / u64
+   lanes (compares with the lane rotations), `gf2p8mul` (8 shift / xor steps), `gf2p8affine` (per
+   result bit a matrix byte broadcast with `vpshufb`, parity from a nibble table), `multishift`
+   (8 variable u64 rotations), 512 bit `trunc` (two truncated halves joined) and `testm` (two masks
+   joined). 512 bit forms otherwise run as two halves.
+3. A branchless scalar loop over the vector file for `compress` and `expand` without a native or
+   table based lowering (8 / 16 bit lanes, 512 bit forms).
+4. A host call to the reference implementation (`intrinsic_slow_paths` in the statistics): only
+   512 bit `conflict` without AVX-512CD (`avx2_templates_cover_the_avx512_operations` checks this).
 
 Every tier must give the reference results bit for bit (integer operations only, semantics fixed
 per operation, never per host), and CUs never depend on the tier. `Config::simd_force_reference`

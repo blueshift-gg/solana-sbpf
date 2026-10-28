@@ -345,12 +345,16 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             code_length_estimate += q * MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT;
         }
         #[cfg(feature = "simd-experiment")]
-        let (simd, vector_instructions) = simd_jit::SimdJitState::new(executable, program, config)?;
+        let (simd, vector_code_units) = simd_jit::SimdJitState::new(executable, program, config)?;
         #[cfg(feature = "simd-experiment")]
         if simd.enabled {
-            // Vector instructions (transposes, translations) and cache flushes need more room
-            // Plus the constants and tables after the subroutines (simd_jit::TAB_END and the masks)
-            code_length_estimate += 1024 * vector_instructions + 160 * pc + simd_jit::CONSTANTS_SIZE;
+            // Vector instructions (transposes, translations, scalar loops) and cache flushes need more
+            // room, plus the constants and tables after the subroutines (simd_jit::TAB_END and the masks)
+            let simd_estimate = 1024 * vector_code_units + 160 * pc + simd_jit::CONSTANTS_SIZE;
+            code_length_estimate += simd_estimate;
+            if config.noop_instruction_rate != 0 {
+                code_length_estimate += simd_estimate / config.noop_instruction_rate as usize;
+            }
         }
         // Relative jump destinations limit the maximum output size
         debug_assert!(code_length_estimate < (i32::MAX as usize));
@@ -416,6 +420,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
             #[cfg(feature = "tracer")]
             {
+                #[cfg(feature = "simd-experiment")]
+                self.simd_before_trace();
                 self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
                 self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(ANCHOR_TRACE, 5)));
                 self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, 0));
@@ -1046,7 +1052,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
 
         let stack_arguments = arguments.len().saturating_sub(ARGUMENT_REGISTERS.len()) as i64;
-        if stack_arguments % 2 != 0 {
+        // Not saving the result register also changes the parity of the pushes
+        let pad = (stack_arguments + (CALLER_SAVED_REGISTERS.len() - saved_registers.len()) as i64) % 2 != 0;
+        if pad {
             // If we're going to pass an odd number of stack args we need to pad
             // to preserve alignment
             self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, RSP, 8, None));
@@ -1137,7 +1145,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
         // Restore registers from stack
         self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP,
-            if stack_arguments % 2 != 0 { stack_arguments + 1 } else { stack_arguments } * 8, None));
+            if pad { stack_arguments + 1 } else { stack_arguments } * 8, None));
 
         for reg in saved_registers.iter().rev() {
             self.emit_ins(X86Instruction::pop(*reg));

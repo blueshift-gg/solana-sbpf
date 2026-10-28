@@ -325,7 +325,12 @@ pub fn hashes() -> Vec<(u32, u8, bool)> {
 /// gf2p8affine / clmul
 /// ```
 pub fn pack(op: &VecInsn) -> u64 {
-    let (vd, va, vb, imm) = (op.vd as u64, op.va as u64, op.vb as u64, op.off as u16 as u64);
+    let (vd, va, vb, imm) = (
+        op.vd as u64,
+        op.va as u64,
+        op.vb as u64,
+        op.off as u16 as u64,
+    );
     match op.subop {
         VLOAD => vd | imm << 8 | vb << 24,
         VSTORE => va | imm << 8 | vb << 24,
@@ -333,18 +338,21 @@ pub fn pack(op: &VecInsn) -> u64 {
         VINS64 => vd | imm << 8,
         VEXT64 => va | imm << 8,
         VMOVMSK8 => va,
-        VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 | VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64
-        | VPOPCNT | VLZCNT | VZEXT | VSEXT | VABS | VTRUNC | VPERMQ | VSHUFLW | VSHUFHW | VCONFLICT => vd | va << 8 | (imm & 0xff) << 16,
+        VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 | VSLL16 | VSRL16 | VSRA16
+        | VSRA32 | VROR64 | VPOPCNT | VLZCNT | VZEXT | VSEXT | VABS | VTRUNC | VPERMQ | VSHUFLW
+        | VSHUFHW | VCONFLICT => vd | va << 8 | (imm & 0xff) << 16,
         VCMP | VTESTM => va | vb << 8 | (imm & 0xff) << 16,
         VLOADM => vd | imm << 8 | vb << 24,
         VSTOREM => va | imm << 8 | vb << 24,
-        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL | VMIN | VMAX | VADDS | VSUBS | VAVG | VALIGNR | VSHLD
-        | VSHRD | VSHLDV | VSHRDV => {
+        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL | VMIN | VMAX | VADDS
+        | VSUBS | VAVG | VALIGNR | VSHLD | VSHRD | VSHLDV | VSHRDV => {
             (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21
         }
         VBLENDM => vd | va << 8 | vb << 16 | (imm & 3) << 24,
         VCOMPRESS | VEXPAND => vd | va << 8 | (imm & 3) << 16,
-        VBLENDD | VBLENDW | VTERNLOG => (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21,
+        VBLENDD | VBLENDW | VTERNLOG => {
+            (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21
+        }
         VMONT16 => (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0x7f) << 21,
         VMOV => vd | va << 8,
         _ => vd | va << 8 | vb << 16,
@@ -365,13 +373,14 @@ pub fn unpack(subop: u8, wide: bool, packed: u64) -> Option<VecInsn> {
         VINS64 => (vd, off) = (byte(0), byte(8) as i16),
         VEXT64 => (va, off) = (byte(0), byte(8) as i16),
         VMOVMSK8 => va = byte(0),
-        VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 | VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64
-        | VPOPCNT | VLZCNT | VZEXT | VSEXT | VABS | VTRUNC | VPERMQ | VSHUFLW | VSHUFHW | VCONFLICT => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
+        VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 | VSLL16 | VSRL16 | VSRA16
+        | VSRA32 | VROR64 | VPOPCNT | VLZCNT | VZEXT | VSEXT | VABS | VTRUNC | VPERMQ | VSHUFLW
+        | VSHUFHW | VCONFLICT => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
         VCMP | VTESTM => (va, vb, off) = (byte(0), byte(8), byte(16) as i16),
         VLOADM => (vd, off, vb) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16, byte(24)),
         VSTOREM => (va, off, vb) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16, byte(24)),
-        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL | VMIN | VMAX | VADDS | VSUBS | VAVG | VALIGNR | VSHLD
-        | VSHRD | VSHLDV | VSHRDV => {
+        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL | VMIN | VMAX | VADDS
+        | VSUBS | VAVG | VALIGNR | VSHLD | VSHRD | VSHLDV | VSHRDV => {
             let field = |shift: u32| ((packed >> shift) & 0x7f) as u8;
             (vd, va, vb, off) = (field(0), field(7), field(14), byte(21) as i16);
         }
@@ -390,8 +399,21 @@ pub fn unpack(subop: u8, wide: bool, packed: u64) -> Option<VecInsn> {
     }
     let src = if uses_src(subop) { SCALAR_REG } else { 0 };
     // Masked load / store take the mask in r3
-    let dst = if reads_mask_register(subop) { MASK_REG } else { 0 };
-    let op = VecInsn { subop, vd, va, vb, wide, dst, src, off };
+    let dst = if reads_mask_register(subop) {
+        MASK_REG
+    } else {
+        0
+    };
+    let op = VecInsn {
+        subop,
+        vd,
+        va,
+        vb,
+        wide,
+        dst,
+        src,
+        off,
+    };
     // The opcode form's validation (operand ranges), applied without its 6 bit slot encoding
     validate_slot_op(&op)?;
     (pack(&op) == packed).then_some(op)
@@ -413,7 +435,9 @@ pub fn execute(
 /// The built-in function of one sub-operation
 pub struct Intrinsic<const SUBOP: u8, const WIDE: bool>;
 
-impl<C: ContextObject, const SUBOP: u8, const WIDE: bool> BuiltinFunctionDefinition<C> for Intrinsic<SUBOP, WIDE> {
+impl<C: ContextObject, const SUBOP: u8, const WIDE: bool> BuiltinFunctionDefinition<C>
+    for Intrinsic<SUBOP, WIDE>
+{
     type Error = EbpfError;
 
     fn rust(_: &mut C, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, EbpfError> {
@@ -431,10 +455,11 @@ impl<C: ContextObject, const SUBOP: u8, const WIDE: bool> BuiltinFunctionDefinit
                     vm.context().consume(used_cus);
                 }
                 let vector_base = vm.simd_vector_base;
-                vm.program_result = match execute(SUBOP, WIDE, [a, b, c, d, e], vector_base, vm.memory()) {
-                    Ok(value) => ProgramResult::Ok(value),
-                    Err(err) => ProgramResult::Err(err),
-                };
+                vm.program_result =
+                    match execute(SUBOP, WIDE, [a, b, c, d, e], vector_base, vm.memory()) {
+                        Ok(value) => ProgramResult::Ok(value),
+                        Err(err) => ProgramResult::Err(err),
+                    };
                 if enable_insn_meter {
                     vm.previous_instruction_meter = vm.context().get_remaining();
                 }

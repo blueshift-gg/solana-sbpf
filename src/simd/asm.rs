@@ -153,12 +153,34 @@ impl Asm {
     /// Emits a vector operation. `dst` is the scalar destination (vext64, vmovmsk8), which is
     /// r0 in [VecMode::Call] (a mov follows if another register is requested).
     #[allow(clippy::too_many_arguments)]
-    pub fn vop_full(&mut self, subop: u8, wide: bool, vd: u8, va: u8, vb: u8, dst: u8, src: u8, off: i16) {
+    pub fn vop_full(
+        &mut self,
+        subop: u8,
+        wide: bool,
+        vd: u8,
+        va: u8,
+        vb: u8,
+        dst: u8,
+        src: u8,
+        off: i16,
+    ) {
         if self.mode == VecMode::Call {
             use super::intrinsics::{hash, pack, unpack, OPERAND_REG, SCALAR_REG};
-            let op = VecInsn { subop, vd, va, vb, wide, dst: 0, src: if uses_src(subop) { SCALAR_REG } else { 0 }, off };
+            let op = VecInsn {
+                subop,
+                vd,
+                va,
+                vb,
+                wide,
+                dst: 0,
+                src: if uses_src(subop) { SCALAR_REG } else { 0 },
+                off,
+            };
             let packed = pack(&op);
-            assert!(unpack(subop, wide, packed).is_some(), "operands not encodable as an intrinsic call");
+            assert!(
+                unpack(subop, wide, packed).is_some(),
+                "operands not encodable as an intrinsic call"
+            );
             // The scalar operand is passed in r2 (clobbers r2 unless it is already there)
             if uses_src(subop) && src != SCALAR_REG {
                 self.mov64(SCALAR_REG, src);
@@ -170,7 +192,17 @@ impl Asm {
             }
             return;
         }
-        let insn = VecInsn { subop, vd, va, vb, wide, dst, src, off }.encode();
+        let insn = VecInsn {
+            subop,
+            vd,
+            va,
+            vb,
+            wide,
+            dst,
+            src,
+            off,
+        }
+        .encode();
         assert!(VecInsn::decode(&insn).is_some(), "invalid vector operation");
         self.insns.push(insn);
     }
@@ -305,7 +337,8 @@ impl Asm {
             if is_call {
                 self.insns[pc].imm = rel;
             } else {
-                self.insns[pc].off = <i16 as std::convert::TryFrom<i64>>::try_from(rel).expect("jump too far");
+                self.insns[pc].off =
+                    <i16 as std::convert::TryFrom<i64>>::try_from(rel).expect("jump too far");
             }
         }
         self.insns.iter().flat_map(|insn| insn.to_array()).collect()

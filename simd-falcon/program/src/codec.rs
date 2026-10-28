@@ -30,7 +30,11 @@ static SHORT: [u32; 4096] = {
             let m = (k << 7) | ((i >> 4) & 0x7f) as u32;
             let negative = i & 0x800 != 0;
             if !(negative && m == 0) {
-                let v = if negative { (m as i16).wrapping_neg() } else { m as i16 };
+                let v = if negative {
+                    (m as i16).wrapping_neg()
+                } else {
+                    m as i16
+                };
                 t[i] = v as u16 as u32 | (9 + k) << 26;
             }
         }
@@ -76,7 +80,9 @@ fn decode_long(padded: &[u8; COMP_LEN + 15], pos: u64) -> Option<(u16, u64)> {
 /// 57 valid bits from bit `pos` (big-endian), at the top of a u64
 #[inline(always)]
 fn window(padded: &[u8; COMP_LEN + 15], pos: u64) -> u64 {
-    u64::from_be(unsafe { (padded.as_ptr().add((pos >> 3) as usize) as *const u64).read_unaligned() }) << (pos & 7)
+    u64::from_be(unsafe {
+        (padded.as_ptr().add((pos >> 3) as usize) as *const u64).read_unaligned()
+    }) << (pos & 7)
 }
 
 /// Decodes the compressed s2 into `out[0..N]` as signed values (|s2| < 2048).
@@ -103,7 +109,9 @@ pub fn decompress_signature(buf: &[u8; COMP_LEN], out: *mut u16) -> bool {
         // Up to four short codes per window, stored at constant offsets from `out`; a code which
         // isn't short (rare) ends the window and is decoded inline (a call would clobber the
         // registers holding the loop state)
-        let mut w = u64::from_be(unsafe { (bits.add((pos >> 3) as usize) as *const u64).read_unaligned() }) << (pos & 7);
+        let mut w =
+            u64::from_be(unsafe { (bits.add((pos >> 3) as usize) as *const u64).read_unaligned() })
+                << (pos & 7);
         let mut k = 0;
         while k < 4 {
             let e = unsafe { *short.add((w >> 52) as usize) };
@@ -118,14 +126,18 @@ pub fn decompress_signature(buf: &[u8; COMP_LEN], out: *mut u16) -> bool {
         }
         out = unsafe { out.add(k) };
         if k < 4 {
-            let Some((v, n)) = decode_long(&padded, pos) else { return false };
+            let Some((v, n)) = decode_long(&padded, pos) else {
+                return false;
+            };
             unsafe { out.write_volatile(v) };
             out = unsafe { out.add(1) };
             pos += n;
         }
     }
     while out != end {
-        let Some((v, n)) = decode_long(&padded, pos) else { return false };
+        let Some((v, n)) = decode_long(&padded, pos) else {
+            return false;
+        };
         unsafe { out.write_volatile(v) };
         out = unsafe { out.add(1) };
         pos += n;
