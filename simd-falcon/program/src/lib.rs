@@ -97,8 +97,9 @@ fn verify(sig: &[u8; SIG_LEN], message: &[u8]) -> bool {
     }
     iv::load(generated::P_SLOT, 32, buffer.0.as_ptr().cast());
     generated::vector_core();
-    let mut acc: Rows<2> = [[0; 8]; 2];
-    iv::store(acc.as_mut_ptr().cast(), generated::ACC1, 2);
+    // ACC1 and ACC2 are slot pairs
+    let mut acc: Rows<4> = [[0; 8]; 4];
+    iv::store(acc.as_mut_ptr().cast(), generated::ACC1, 4);
     acc.iter().flatten().map(|x| *x as u64).sum::<u64>() <= L2_BOUND
 }
 

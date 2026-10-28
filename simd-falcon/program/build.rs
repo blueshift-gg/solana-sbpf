@@ -22,21 +22,22 @@ const Q: u32 = 12289;
 const N: usize = 512;
 const QI: i64 = Q as i64;
 
-// Slots of the vector region (16 coefficients each)
+// Slots of the vector file (16 coefficients each). Everything but P and C is a slot pair, for the
+// 512 bit operations (256 bit operations use the low slot).
 const P: u8 = 0; // working polynomial (s2, NTT, product, m), 32 slots
 const C: u8 = 64; // hash_to_point candidates (u16 < 5Q), 32 slots
-const QV: u8 = 104; // q in every word
-const Q2V: u8 = 105;
-const Q4V: u8 = 106;
-const ONE: u8 = 107; // R mod q (Montgomery one) and its q^-1 multiple
-const ONE_P: u8 = 108;
-const TW: u8 = 109; // twiddle and its q^-1 multiple
-const TW_P: u8 = 110;
-const T0: u8 = 111;
+const QV: u8 = 96; // q in every word
+const Q2V: u8 = 98;
+const Q4V: u8 = 100;
+const ONE: u8 = 102; // R mod q (Montgomery one) and its q^-1 multiple
+const ONE_P: u8 = 104;
+const TW: u8 = 106; // twiddle and its q^-1 multiple
+const TW_P: u8 = 108;
+const T0: u8 = 110;
 const T1: u8 = 112;
-const T2: u8 = 113;
-const ACC1: u8 = 114; // ||s1||^2 partial sums (u32 lanes)
-const ACC2: u8 = 115; // ||s2||^2
+const T2: u8 = 114;
+const ACC1: u8 = 116; // ||s1||^2 partial sums (u32 lanes)
+const ACC2: u8 = 118; // ||s2||^2
 const I16_MAX: i64 = i16::MAX as i64;
 
 fn pow_mod(mut b: u64, mut e: u64, m: u64) -> u64 {
@@ -196,14 +197,33 @@ struct Gen {
     tables: std::collections::BTreeMap<&'static str, Vec<[u32; 8]>>,
 }
 
+/// Width of the generated operations: 256 bit (one slot) or 512 bit (a pair of slots)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Width {
+    Y,
+    Z,
+}
+use Width::{Y, Z};
+
 impl Gen {
-    fn op(&mut self, op: Op) {
-        self.ops.push(op);
+    fn op(&mut self, op: Op, width: Width) {
+        self.ops.push(if width == Z { w(op) } else { op });
     }
 
-    fn set_bound(&mut self, slot: u8, bound: i64) {
-        self.bound[slot as usize] = bound;
-        self.checks.push((self.ops.len(), slot, bound));
+    /// Slots of an operand
+    fn slots(s: u8, width: Width) -> std::ops::Range<u8> {
+        s..s + if width == Z { 2 } else { 1 }
+    }
+
+    fn bound(&self, s: u8, width: Width) -> i64 {
+        Self::slots(s, width).map(|x| self.bound[x as usize]).max().unwrap()
+    }
+
+    fn set_bound(&mut self, s: u8, bound: i64, width: Width) {
+        for x in Self::slots(s, width) {
+            self.bound[x as usize] = bound;
+            self.checks.push((self.ops.len(), x, bound));
+        }
     }
 
     /// Loads table rows (appended to `table`) into consecutive slots from `slot`
@@ -211,143 +231,151 @@ impl Gen {
         let rows = self.tables.entry(table).or_default();
         let index = rows.len();
         rows.extend_from_slice(new_rows);
-        self.op(Op::Load(slot, table, index, new_rows.len() as u8));
+        self.ops.push(Op::Load(slot, table, index, new_rows.len() as u8));
     }
 
-    /// Twiddle slots for per word Montgomery constants `w` (bound returned)
-    fn twiddle_rows(&mut self, table: &'static str, w: [i64; 16]) -> i64 {
-        let row = |f: &dyn Fn(i64) -> i64| -> [u32; 8] { std::array::from_fn(|i| pair(f(w[2 * i]), f(w[2 * i + 1]))) };
-        let (plain, prime) = (row(&|x| x), row(&mont_prime));
-        assert_eq!(TW_P, TW + 1);
-        self.rows(TW, table, &[plain, prime]);
-        w.iter().map(|x| x.abs()).max().unwrap()
+    /// Twiddle rows (TW, TW_P = TW + 2) for per word Montgomery constants: one row of 16 words per
+    /// slot of the operation (bound returned)
+    fn twiddle_rows(&mut self, table: &'static str, w: &[[i64; 16]]) -> i64 {
+        let row = |w: &[i64; 16], f: &dyn Fn(i64) -> i64| -> [u32; 8] { std::array::from_fn(|i| pair(f(w[2 * i]), f(w[2 * i + 1]))) };
+        let mut rows: Vec<[u32; 8]> = w.iter().map(|w| row(w, &|x| x)).collect();
+        if w.len() == 1 {
+            rows.push([0; 8]); // TW + 1 is unused by 256 bit operations
+        }
+        rows.extend(w.iter().map(|w| row(w, &mont_prime)));
+        assert_eq!(TW_P, TW + 2);
+        self.rows(TW, table, &rows);
+        w.iter().flatten().map(|x| x.abs()).max().unwrap()
     }
 
     /// Broadcast twiddle (bound returned)
-    fn twiddle_bcast(&mut self, w: i64) -> i64 {
-        self.op(Op::Bcast(TW, pair(w, w)));
-        self.op(Op::Bcast(TW_P, pair(mont_prime(w), mont_prime(w))));
+    fn twiddle_bcast(&mut self, w: i64, width: Width) -> i64 {
+        self.op(Op::Bcast(TW, pair(w, w)), width);
+        self.op(Op::Bcast(TW_P, pair(mont_prime(w), mont_prime(w))), width);
         w.abs()
     }
 
     /// dst = mont(a, W) (dst may be a)
-    fn mont(&mut self, dst: u8, a: u8, w: u8, w_p: u8, w_abs: i64) {
-        self.op(Op::Mullo16(T0, a, w_p));
-        self.op(Op::Mulhi16(T1, a, w));
-        self.op(Op::Mulhi16(T0, T0, QV));
-        self.op(Op::Sub16(dst, T1, T0));
-        self.set_bound(dst, mont_bound(self.bound[a as usize], w_abs));
+    fn mont(&mut self, dst: u8, a: u8, w: u8, w_p: u8, w_abs: i64, width: Width) {
+        self.op(Op::Mullo16(T0, a, w_p), width);
+        self.op(Op::Mulhi16(T1, a, w), width);
+        self.op(Op::Mulhi16(T0, T0, QV), width);
+        self.op(Op::Sub16(dst, T1, T0), width);
+        let b = mont_bound(self.bound(a, width), w_abs);
+        self.set_bound(dst, b, width);
     }
 
     /// Transposes a tile of 8 slots: every slot may now hold values of any slot of the tile
     fn transpose(&mut self, tile: u8) {
-        self.op(Op::Transpose(tile));
+        self.ops.push(Op::Transpose(tile));
         let max = (tile..tile + 8).map(|s| self.bound[s as usize]).max().unwrap();
         for s in tile..tile + 8 {
-            self.set_bound(s, max);
+            self.set_bound(s, max, Y);
         }
     }
 
-    fn reduce(&mut self, x: u8) {
+    fn reduce(&mut self, x: u8, width: Width) {
         let one = mont_centered(1).abs();
-        self.mont(x, x, ONE, ONE_P, one);
+        self.mont(x, x, ONE, ONE_P, one, width);
     }
 
-    fn reduce_if(&mut self, x: u8, limit: i64) {
-        if self.bound[x as usize] > limit {
-            self.reduce(x);
+    fn reduce_if(&mut self, x: u8, limit: i64, width: Width) {
+        if self.bound(x, width) > limit {
+            self.reduce(x, width);
         }
     }
 
     /// Cooley-Tukey: (a, b) = (a + b w, a - b w), twiddle in TW / TW_P
-    fn ct(&mut self, a: u8, b: u8, w_abs: i64) {
-        let bw = mont_bound(self.bound[b as usize], w_abs);
-        self.reduce_if(a, I16_MAX - bw);
-        assert!(self.bound[a as usize] + bw <= I16_MAX);
-        self.mont(T2, b, TW, TW_P, w_abs);
-        self.op(Op::Sub16(b, a, T2));
-        self.op(Op::Add16(a, a, T2));
-        let out = self.bound[a as usize] + bw;
-        self.set_bound(a, out);
-        self.set_bound(b, out);
+    fn ct(&mut self, a: u8, b: u8, w_abs: i64, width: Width) {
+        let bw = mont_bound(self.bound(b, width), w_abs);
+        self.reduce_if(a, I16_MAX - bw, width);
+        assert!(self.bound(a, width) + bw <= I16_MAX);
+        self.mont(T2, b, TW, TW_P, w_abs, width);
+        self.op(Op::Sub16(b, a, T2), width);
+        self.op(Op::Add16(a, a, T2), width);
+        let out = self.bound(a, width) + bw;
+        self.set_bound(a, out, width);
+        self.set_bound(b, out, width);
     }
 
     /// Gentleman-Sande: (a, b) = (a + b, (a - b) w), twiddle in TW / TW_P
-    fn gs(&mut self, a: u8, b: u8, w_abs: i64) {
-        if self.bound[a as usize] + self.bound[b as usize] > I16_MAX {
-            let (big, small) = if self.bound[a as usize] >= self.bound[b as usize] { (a, b) } else { (b, a) };
-            self.reduce(big);
-            if self.bound[a as usize] + self.bound[b as usize] > I16_MAX {
-                self.reduce(small);
+    fn gs(&mut self, a: u8, b: u8, w_abs: i64, width: Width) {
+        if self.bound(a, width) + self.bound(b, width) > I16_MAX {
+            let (big, small) = if self.bound(a, width) >= self.bound(b, width) { (a, b) } else { (b, a) };
+            self.reduce(big, width);
+            if self.bound(a, width) + self.bound(b, width) > I16_MAX {
+                self.reduce(small, width);
             }
         }
-        let sum = self.bound[a as usize] + self.bound[b as usize];
+        let sum = self.bound(a, width) + self.bound(b, width);
         assert!(sum <= I16_MAX);
-        self.op(Op::Sub16(T2, a, b));
-        self.op(Op::Add16(a, a, b));
-        self.set_bound(T2, sum);
-        self.mont(b, T2, TW, TW_P, w_abs);
-        self.set_bound(a, sum);
+        self.op(Op::Sub16(T2, a, b), width);
+        self.op(Op::Add16(a, a, b), width);
+        self.set_bound(T2, sum, width);
+        self.mont(b, T2, TW, TW_P, w_abs, width);
+        self.set_bound(a, sum, width);
     }
 
-    /// Level 1 on every slot (pairs inside a u32): forward (a, b) = (a + b w, a - b w),
-    /// inverse (a, b) = (a + b, (a - b) w)
-    fn level1(&mut self, slot: u8, w: [i64; 8], forward: bool) {
+    /// Level 1 on the slot (pair) `x` (pairs inside a u32): forward (a, b) = (a + b w, a - b w),
+    /// inverse (a, b) = (a + b, (a - b) w); `w[s]` are the twiddles of slot x + s
+    fn level1(&mut self, x: u8, w: &[[i64; 8]], forward: bool, width: Width) {
         let one = mont_centered(1);
         // Low words get the Montgomery one (a reduction), high words the twiddle
-        let words: [i64; 16] = std::array::from_fn(|i| if i % 2 == 0 { one } else { w[i / 2] });
-        let w_abs = self.twiddle_rows(if forward { "TWF1" } else { "TWI1" }, words);
-        let x = P + slot;
+        let words: Vec<[i64; 16]> = w.iter().map(|w| std::array::from_fn(|i| if i % 2 == 0 { one } else { w[i / 2] })).collect();
+        let w_abs = self.twiddle_rows(if forward { "TWF1" } else { "TWI1" }, &words);
         if forward {
             // M = (a', b w), Ms = (b w, a'), out = (M + Ms, Ms - M) blended
-            self.mont(x, x, TW, TW_P, w_abs);
-            let m = self.bound[x as usize];
-            self.op(Op::Ror(T2, x, 16));
-            self.op(Op::Sub16(T1, T2, x));
-            self.op(Op::Add16(x, x, T2));
-            self.op(Op::Blendw(x, x, T1, 0xaa));
+            self.mont(x, x, TW, TW_P, w_abs, width);
+            let m = self.bound(x, width);
+            self.op(Op::Ror(T2, x, 16), width);
+            self.op(Op::Sub16(T1, T2, x), width);
+            self.op(Op::Add16(x, x, T2), width);
+            self.op(Op::Blendw(x, x, T1, 0xaa), width);
             assert!(2 * m <= I16_MAX);
-            self.set_bound(x, 2 * m);
+            self.set_bound(x, 2 * m, width);
         } else {
             // Xs = (b, a), S = X + Xs = (a + b, a + b), D = Xs - X = (b - a, a - b),
             // out = mont((S, D) blended, (one, w))
-            self.reduce_if(x, I16_MAX / 2);
-            let b = self.bound[x as usize];
-            self.op(Op::Ror(T2, x, 16));
-            self.op(Op::Sub16(T1, T2, x));
-            self.op(Op::Add16(x, x, T2));
-            self.op(Op::Blendw(x, x, T1, 0xaa));
-            self.set_bound(x, 2 * b);
-            self.mont(x, x, TW, TW_P, w_abs);
+            self.reduce_if(x, I16_MAX / 2, width);
+            let b = self.bound(x, width);
+            self.op(Op::Ror(T2, x, 16), width);
+            self.op(Op::Sub16(T1, T2, x), width);
+            self.op(Op::Add16(x, x, T2), width);
+            self.op(Op::Blendw(x, x, T1, 0xaa), width);
+            self.set_bound(x, 2 * b, width);
+            self.mont(x, x, TW, TW_P, w_abs, width);
         }
     }
 }
 
 /// The vector core: ||s2||^2, NTT(s2), product with the prepared pubkey (table H_PREP), inverse
 /// NTT, s1 = c - s2 h, ||s1||^2. Returns the op stream and the generated tables (H_PREP rows are
-/// placeholders, filled by [prepare]).
+/// placeholders, filled by [prepare]). Most of it runs on slot pairs (512 bit operations); the
+/// butterflies between the two slots of a pair (levels 16 and, in the transposed layout, 2) and
+/// the transposes use 256 bit operations.
 fn generate(psi_pos: &[u32; N], psi_neg: &[u32; N]) -> (Vec<Op>, Tables, Vec<(usize, u8, i64)>) {
     let mut g = Gen { ops: Vec::new(), bound: [0; 256], checks: Vec::new(), tables: Default::default() };
     let one = mont_centered(1);
     for (slot, value) in [(QV, QI), (Q2V, 2 * QI), (Q4V, 4 * QI), (ONE, one), (ONE_P, mont_prime(one))] {
-        g.op(Op::Bcast(slot, pair(value, value)));
+        g.op(Op::Bcast(slot, pair(value, value)), Z);
     }
     // ||s2||^2 from the decoded (signed, |s2| < 2048) coefficients
-    for s in 0..32 {
-        g.op(Op::Madd16(T0, P + s, P + s));
-        g.op(Op::Add(ACC2, ACC2, T0));
-        g.set_bound(P + s, 2047);
+    for s in (0..32).step_by(2) {
+        g.op(Op::Madd16(T0, P + s, P + s), Z);
+        g.op(Op::Add(ACC2, ACC2, T0), Z);
+        g.set_bound(P + s, 2047, Z);
     }
     let twiddle = |psi: &[u32; N], t: usize, i: usize| mont_centered(psi[N / (2 * t) + i] as i64);
     // Forward NTT, levels 256..16 between whole slots
     let mut t = 256;
     while t >= 16 {
         let ts = (t / 16) as u8;
+        let width = if ts >= 2 { Z } else { Y };
         for i in 0..N / (2 * t) {
-            let w_abs = g.twiddle_bcast(twiddle(psi_pos, t, i));
+            let w_abs = g.twiddle_bcast(twiddle(psi_pos, t, i), width);
             let base = (2 * i * t / 16) as u8;
-            for k in 0..ts {
-                g.ct(P + base + k, P + base + ts + k, w_abs);
+            for k in (0..ts).step_by(if width == Z { 2 } else { 1 }) {
+                g.ct(P + base + k, P + base + ts + k, w_abs, width);
             }
         }
         t /= 2;
@@ -356,53 +384,53 @@ fn generate(psi_pos: &[u32; N], psi_neg: &[u32; N]) -> (Vec<Op>, Tables, Vec<(us
         g.transpose(P + 8 * tile);
     }
     // Levels 8, 4, 2: slot c and c + t / 2 of a tile, block index from (tile, lane, group)
-    for t in [8usize, 4, 2] {
+    let tw_words = |psi: &[u32; N], t: usize, tile: usize, c: usize| -> [i64; 16] {
+        std::array::from_fn(|word| {
+            let (r, h) = (word / 2, word % 2);
+            let j = 128 * tile + 16 * r + 2 * c + h;
+            twiddle(psi, t, j / (2 * t))
+        })
+    };
+    let transposed_level = |g: &mut Gen, psi: &[u32; N], t: usize, table: &'static str, forward: bool| {
         let d = t / 2; // slot distance
+        let width = if d >= 2 { Z } else { Y };
         for tile in 0..4 {
             for grp in 0..4 / d {
-                let w: [i64; 16] = std::array::from_fn(|word| {
-                    let (r, h) = (word / 2, word % 2);
-                    let j = 128 * tile + 16 * r + 2 * (grp * 2 * d) + h;
-                    twiddle(psi_pos, t, j / (2 * t))
-                });
-                let w_abs = g.twiddle_rows("TWF", w);
-                for c in grp * 2 * d..grp * 2 * d + d {
-                    g.ct(P + 8 * tile as u8 + c as u8, P + 8 * tile as u8 + (c + d) as u8, w_abs);
+                let c0 = grp * 2 * d;
+                // The twiddles only depend on the group (the slot c enters as 2 c / (2 t) = 0)
+                let words: Vec<[i64; 16]> = vec![tw_words(psi, t, tile, c0); if width == Z { 2 } else { 1 }];
+                let w_abs = g.twiddle_rows(table, &words);
+                for c in (c0..c0 + d).step_by(if width == Z { 2 } else { 1 }) {
+                    let (a, b) = (P + 8 * tile as u8 + c as u8, P + 8 * tile as u8 + (c + d) as u8);
+                    if forward { g.ct(a, b, w_abs, width) } else { g.gs(a, b, w_abs, width) }
                 }
             }
         }
+    };
+    for t in [8usize, 4, 2] {
+        transposed_level(&mut g, psi_pos, t, "TWF", true);
     }
-    for slot in 0..32u8 {
-        let (tile, c) = (slot as usize / 8, slot as usize % 8);
-        let w: [i64; 8] = std::array::from_fn(|r| twiddle(psi_pos, 1, (128 * tile + 16 * r + 2 * c) / 2));
-        g.level1(slot, w, true);
+    let level1_words = |psi: &[u32; N], slot: usize| -> [i64; 8] {
+        let (tile, c) = (slot / 8, slot % 8);
+        std::array::from_fn(|r| twiddle(psi, 1, (128 * tile + 16 * r + 2 * c) / 2))
+    };
+    for slot in (0..32u8).step_by(2) {
+        let w = [level1_words(psi_pos, slot as usize), level1_words(psi_pos, slot as usize + 1)];
+        g.level1(P + slot, &w, true, Z);
     }
-    // Pointwise product with the prepared pubkey (NTT(h) / N, Montgomery form)
-    for s in 0..32u8 {
-        g.rows(TW, "H_PREP", &[[0; 8]; 2]);
-        g.mont(P + s, P + s, TW, TW_P, QI / 2 + 1);
+    // Pointwise product with the prepared pubkey (NTT(h) / N, Montgomery form), rows of a pair:
+    // H (2 slots), H q^-1 (2 slots)
+    for s in (0..32u8).step_by(2) {
+        g.rows(TW, "H_PREP", &[[0; 8]; 4]);
+        g.mont(P + s, P + s, TW, TW_P, QI / 2 + 1, Z);
     }
     // Inverse NTT: level 1, then 2, 4, 8 in the transposed layout, then 16..256
-    for slot in 0..32u8 {
-        let (tile, c) = (slot as usize / 8, slot as usize % 8);
-        let w: [i64; 8] = std::array::from_fn(|r| twiddle(psi_neg, 1, (128 * tile + 16 * r + 2 * c) / 2));
-        g.level1(slot, w, false);
+    for slot in (0..32u8).step_by(2) {
+        let w = [level1_words(psi_neg, slot as usize), level1_words(psi_neg, slot as usize + 1)];
+        g.level1(P + slot, &w, false, Z);
     }
     for t in [2usize, 4, 8] {
-        let d = t / 2;
-        for tile in 0..4 {
-            for grp in 0..4 / d {
-                let w: [i64; 16] = std::array::from_fn(|word| {
-                    let (r, h) = (word / 2, word % 2);
-                    let j = 128 * tile + 16 * r + 2 * (grp * 2 * d) + h;
-                    twiddle(psi_neg, t, j / (2 * t))
-                });
-                let w_abs = g.twiddle_rows("TWI", w);
-                for c in grp * 2 * d..grp * 2 * d + d {
-                    g.gs(P + 8 * tile as u8 + c as u8, P + 8 * tile as u8 + (c + d) as u8, w_abs);
-                }
-            }
-        }
+        transposed_level(&mut g, psi_neg, t, "TWI", false);
     }
     for tile in 0..4 {
         g.transpose(P + 8 * tile);
@@ -410,35 +438,40 @@ fn generate(psi_pos: &[u32; N], psi_neg: &[u32; N]) -> (Vec<Op>, Tables, Vec<(us
     let mut t = 16;
     while t <= 256 {
         let ts = (t / 16) as u8;
+        let width = if ts >= 2 { Z } else { Y };
         for i in 0..N / (2 * t) {
-            let w_abs = g.twiddle_bcast(twiddle(psi_neg, t, i));
+            let w_abs = g.twiddle_bcast(twiddle(psi_neg, t, i), width);
             let base = (2 * i * t / 16) as u8;
-            for k in 0..ts {
-                g.gs(P + base + k, P + base + ts + k, w_abs);
+            for k in (0..ts).step_by(if width == Z { 2 } else { 1 }) {
+                g.gs(P + base + k, P + base + ts + k, w_abs, width);
             }
         }
         t *= 2;
     }
     // s1 = c - m: c (u16 < 5q) to [0, 2q), u = c + q - m in [0, 4q) (m reduced below q), u to
     // [0, q), |s1| = min(u, q - u), squares summed in pairs into u32 lanes
-    for s in 0..32u8 {
+    for s in (0..32u8).step_by(2) {
         let (cs, m) = (C + s, P + s);
-        g.reduce_if(m, QI);
-        assert!(g.bound[m as usize] <= QI);
-        g.op(Op::Sub16(T2, cs, Q4V));
-        g.op(Op::Minu16(T2, cs, T2)); // [0, 4q) (5q > 4q values wrapped below q)
-        g.op(Op::Sub16(T1, T2, Q2V));
-        g.op(Op::Minu16(T2, T2, T1)); // [0, 2q)
-        g.op(Op::Add16(T2, T2, QV));
-        g.op(Op::Sub16(T2, T2, m)); // [0, 4q)
-        g.op(Op::Sub16(T1, T2, Q2V));
-        g.op(Op::Minu16(T2, T2, T1)); // [0, 2q)
-        g.op(Op::Sub16(T1, T2, QV));
-        g.op(Op::Minu16(T2, T2, T1)); // [0, q)
-        g.op(Op::Sub16(T1, QV, T2));
-        g.op(Op::Minu16(T2, T2, T1)); // [0, q / 2]
-        g.op(Op::Madd16(T1, T2, T2));
-        g.op(Op::Add(ACC1, ACC1, T1));
+        g.reduce_if(m, QI, Z);
+        assert!(g.bound(m, Z) <= QI);
+        for op in [
+            Op::Sub16(T2, cs, Q4V),
+            Op::Minu16(T2, cs, T2), // [0, 4q) (5q > 4q values wrapped below q)
+            Op::Sub16(T1, T2, Q2V),
+            Op::Minu16(T2, T2, T1), // [0, 2q)
+            Op::Add16(T2, T2, QV),
+            Op::Sub16(T2, T2, m), // [0, 4q)
+            Op::Sub16(T1, T2, Q2V),
+            Op::Minu16(T2, T2, T1), // [0, 2q)
+            Op::Sub16(T1, T2, QV),
+            Op::Minu16(T2, T2, T1), // [0, q)
+            Op::Sub16(T1, QV, T2),
+            Op::Minu16(T2, T2, T1), // [0, q / 2]
+            Op::Madd16(T1, T2, T2),
+            Op::Add(ACC1, ACC1, T1),
+        ] {
+            g.op(op, Z);
+        }
     }
     (g.ops, g.tables, g.checks)
 }
@@ -573,7 +606,7 @@ fn decode_pubkey(pk: &[u8]) -> [u32; N] {
 }
 
 
-/// NTT(h) / N in Montgomery form, laid out like the forward NTT output: rows (H, H q^-1) per slot
+/// NTT(h) / N in Montgomery form, laid out like the forward NTT output
 fn prepare(h: &[u32; N], psi_pos: &[u32; N]) -> Vec<[u32; 8]> {
     let mut hn = *h;
     ntt_ref(&mut hn, psi_pos);
@@ -583,10 +616,14 @@ fn prepare(h: &[u32; N], psi_pos: &[u32; N]) -> Vec<[u32; 8]> {
         let (slot, word) = transposed_pos(j);
         words[slot][word] = mont_centered(hn[j] as i64 * n_inv);
     }
+    // Per slot pair: H of both slots, then H q^-1 of both slots
     let mut rows = Vec::new();
-    for w in words {
-        rows.push(std::array::from_fn(|i| pair(w[2 * i], w[2 * i + 1])));
-        rows.push(std::array::from_fn(|i| pair(mont_prime(w[2 * i]), mont_prime(w[2 * i + 1]))));
+    for w in words.chunks(2) {
+        for f in [&|x: i64| x, &mont_prime as &dyn Fn(i64) -> i64] {
+            for w in w {
+                rows.push(std::array::from_fn(|i| pair(f(w[2 * i]), f(w[2 * i + 1]))));
+            }
+        }
     }
     rows
 }
@@ -621,16 +658,23 @@ fn self_test(ops: &[Op], tables: &Tables, checks: &[(usize, u8, i64)], psi_pos: 
         }
         let lookup = |name: &str, row: usize| if name == "H_PREP" { h_prep[row] } else { tables[name][row] };
         // Signed 16 bit overflow check of the NTT part (the final stage wraps on purpose)
-        let ntt_end = ops.iter().position(|op| matches!(*op, Op::Sub16(_, a, _) if a == C)).unwrap();
+        let first_c = |op: &Op| matches!(*op, Op::Sub16(_, a, _) if a == C);
+        let ntt_end = ops.iter().position(|op| first_c(op) || matches!(*op, Op::W(inner) if first_c(inner))).unwrap();
         for (k, op) in ops[..ntt_end].iter().enumerate() {
-            if let Op::Add16(_, a, b) | Op::Sub16(_, a, b) = *op {
-                let sub = matches!(op, Op::Sub16(..));
-                for lane in 0..8 {
-                    for h in 0..2 {
-                        let x = (region[a as usize][lane] >> (16 * h)) as u16 as i16 as i32;
-                        let y = (region[b as usize][lane] >> (16 * h)) as u16 as i16 as i32;
-                        let r = if sub { x - y } else { x + y };
-                        assert!(r == r as i16 as i32, "overflow at op {k} {op:?} round {round}: {x} {y}");
+            let halves = match *op {
+                Op::W(inner) => vec![shifted(*inner, 0), shifted(*inner, 1)],
+                other => vec![other],
+            };
+            for half in halves {
+                if let Op::Add16(_, a, b) | Op::Sub16(_, a, b) = half {
+                    let sub = matches!(half, Op::Sub16(..));
+                    for lane in 0..8 {
+                        for h in 0..2 {
+                            let x = (region[a as usize][lane] >> (16 * h)) as u16 as i16 as i32;
+                            let y = (region[b as usize][lane] >> (16 * h)) as u16 as i16 as i32;
+                            let r = if sub { x - y } else { x + y };
+                            assert!(r == r as i16 as i32, "overflow at op {k} {op:?} round {round}: {x} {y}");
+                        }
                     }
                 }
             }
@@ -659,8 +703,8 @@ fn self_test(ops: &[Op], tables: &Tables, checks: &[(usize, u8, i64)], psi_pos: 
         };
         let norm1: i64 = (0..N).map(|i| centered(c[i] as i64 - prod[i]).pow(2)).sum();
         let norm2: i64 = (0..N).map(|i| s2[i].pow(2)).sum();
-        let got1: i64 = region[ACC1 as usize].iter().map(|x| *x as i64).sum();
-        let got2: i64 = region[ACC2 as usize].iter().map(|x| *x as i64).sum();
+        let got1: i64 = region[ACC1 as usize..ACC1 as usize + 2].iter().flatten().map(|x| *x as i64).sum();
+        let got2: i64 = region[ACC2 as usize..ACC2 as usize + 2].iter().flatten().map(|x| *x as i64).sum();
         let word = |slot: u8, i: usize| (region[slot as usize + i / 16][(i % 16) / 2] >> (16 * (i % 2))) as u16 as i16 as i64;
         let bad: Vec<usize> = (0..N).filter(|&i| (word(P, i) - prod[i]).rem_euclid(QI) != 0).collect();
         if !bad.is_empty() {
@@ -1041,7 +1085,7 @@ fn main() {
     let pk_path = std::env::var("FALCON_PK").unwrap_or_else(|_| "../fixtures/falcon.pk".to_string());
     println!("cargo:rerun-if-changed={pk_path}");
     println!("cargo:rerun-if-changed=build.rs");
-    assert_eq!(ACC2, ACC1 + 1);
+    assert_eq!(ACC2, ACC1 + 2);
     let (psi_pos, psi_neg) = twiddles();
     let (ops, mut tables, checks) = generate(&psi_pos, &psi_neg);
     self_test(&ops, &tables, &checks, &psi_pos);
