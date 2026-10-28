@@ -17,11 +17,14 @@ static CLZ8: [u8; 256] = {
     t
 };
 
+/// Entry of a code which isn't short: length 0, a value no coefficient has (|s2| < 2048)
+const LONG: u32 = 0x8000;
+
 /// Coefficients whose 12 leading bits hold the whole code (high bits k < 4): `value | length << 26`
 /// (value as i16; the length in the top 6 bits needs no masking as a shift amount) indexed by
-/// those 12 bits, 0 if the code is longer (or -0, which is invalid)
+/// those 12 bits, [LONG] if the code is longer (or -0, which is invalid)
 static SHORT: [u32; 4096] = {
-    let mut t = [0u32; 4096];
+    let mut t = [LONG; 4096];
     let mut i = 0;
     while i < 4096 {
         let unary = i & 0xf;
@@ -85,6 +88,24 @@ fn window(padded: &[u8; COMP_LEN + 15], pos: u64) -> u64 {
     }) << (pos & 7)
 }
 
+/// Four codes from the 57 bit window at `pos` into `out[0..4]`, without a test per code: a code
+/// which isn't short (rare) has length 0 in the table, so it repeats into the later lookups and
+/// `pos` stops at it. Returns the last entry, [LONG] if the window hit such a code.
+#[inline(always)]
+unsafe fn window4(bits: u64, short: u64, pos: &mut u64, out: *mut u16) -> u32 {
+    let mut w = u64::from_be(unsafe { (((*pos >> 3) + bits) as *const u64).read_unaligned() })
+        << (*pos & 7);
+    let mut e = 0;
+    for k in 0..4 {
+        e = unsafe { *((((w >> 50) & 0x3ffc) + short) as *const u32) };
+        unsafe { out.add(k).write_volatile(e as u16) };
+        let n = (e >> 26) as u64;
+        *pos += n;
+        w <<= n;
+    }
+    e
+}
+
 /// Decodes the compressed s2 into `out[0..N]` as signed values (|s2| < 2048).
 ///
 /// Firedancer's approach (fd_falcon_signature_parse): a 64 bit big-endian window and a table
@@ -96,43 +117,42 @@ pub fn decompress_signature(buf: &[u8; COMP_LEN], out: *mut u16) -> bool {
     let mut padded = [0u8; COMP_LEN + 15];
     padded[..COMP_LEN].copy_from_slice(buf);
     let mut pos = 0u64;
-    // An opaque pointer into the padded stack buffer and the table address: kept in registers
-    // instead of a frame address or a 64 bit immediate per access. `out` is opaque already (the
-    // function isn't inlined)
+    // The padded stack buffer and the table address, opaque: kept in registers instead of a frame
+    // address or a 64 bit immediate per access. As integers, `index + base` adds the base into the
+    // index register (a pointer offset copies the base first, one more instruction per lookup).
+    // `out` is opaque already (the function isn't inlined)
     let mut out = out;
     let end = unsafe { out.add(N) };
-    let bits = core::hint::black_box(padded.as_ptr());
-    let short = core::hint::black_box(SHORT.as_ptr());
-    // Fast windows while four coefficients remain, then single codes
-    let last_window = unsafe { end.sub(4) };
-    while out <= last_window {
-        // Up to four short codes per window, stored at constant offsets from `out`; a code which
-        // isn't short (rare) ends the window and is decoded inline (a call would clobber the
-        // registers holding the loop state)
-        let mut w =
-            u64::from_be(unsafe { (bits.add((pos >> 3) as usize) as *const u64).read_unaligned() })
-                << (pos & 7);
-        let mut k = 0;
-        while k < 4 {
-            let e = unsafe { *short.add((w >> 52) as usize) };
-            if e == 0 {
-                break;
+    let bits = core::hint::black_box(padded.as_ptr() as u64);
+    let short = core::hint::black_box(SHORT.as_ptr() as u64);
+    // Fast windows while four coefficients remain (two per iteration while eight remain), then
+    // single codes
+    let last_pair = core::hint::black_box(unsafe { end.sub(8) } as u64);
+    let last_window = unsafe { end.sub(4) } as u64;
+    while out as u64 <= last_window {
+        let mut e = unsafe { window4(bits, short, &mut pos, out) };
+        if e != LONG {
+            out = unsafe { out.add(4) };
+            if out as u64 > last_pair {
+                continue;
             }
-            unsafe { out.add(k).write_volatile(e as u16) };
-            let n = (e >> 26) as u64;
-            pos += n;
-            w <<= n;
-            k += 1;
+            e = unsafe { window4(bits, short, &mut pos, out) };
+            if e != LONG {
+                out = unsafe { out.add(4) };
+                continue;
+            }
         }
-        out = unsafe { out.add(k) };
-        if k < 4 {
-            let Some((v, n)) = decode_long(&padded, pos) else {
-                return false;
-            };
-            unsafe { out.write_volatile(v) };
+        // Skip the short codes before the long one, then decode it inline (a call would clobber
+        // the registers holding the loop state)
+        while unsafe { out.read_volatile() } != LONG as u16 {
             out = unsafe { out.add(1) };
-            pos += n;
         }
+        let Some((v, n)) = decode_long(&padded, pos) else {
+            return false;
+        };
+        unsafe { out.write_volatile(v) };
+        out = unsafe { out.add(1) };
+        pos += n;
     }
     while out != end {
         let Some((v, n)) = decode_long(&padded, pos) else {

@@ -10,7 +10,9 @@ Blueshift's example program, with Firedancer's verifier structure (`fd_falcon.c`
 
 * **Signature decompression:** Firedancer's windowed decoder. A 64 bit big-endian window and one
   lookup in a 4096 entry table per coefficient (sign, low bits and the unary high bits of every code
-  up to 12 bits long), four coefficients per window; longer codes (rare) are decoded inline. sBPF
+  up to 12 bits long), four coefficients per window, two windows per loop iteration. A longer code
+  (rare) has length 0 in the table, so it repeats into the window's later lookups: one test of the
+  last entry per window instead of one per code, then the long code is decoded inline. sBPF
   has no count-leading-zeros, the table replaces it. Output: signed 16 bit coefficients in a buffer,
   loaded into the vector file with one 32 slot `load256`.
 * **SHAKE-256 hash-to-point:** a vectorized Keccak-f[1600] on one state with 512 bit operations on
@@ -32,7 +34,8 @@ Blueshift's example program, with Firedancer's verifier structure (`fd_falcon.c`
   where a tracked bound requires it, levels 8 / 4 / 2 after an 8 x 8 transpose of coefficient pairs,
   level 1 inside the pairs. Everything runs on 512 bit slot pairs except the two levels between the
   slots of a pair and the transposes. The norm sums squares with `madd16`. Firedancer computes
-  NTT(h) per call, here it is part of the prepared pubkey.
+  NTT(h) per call, here it is part of the prepared pubkey. The twiddles of 8 butterfly groups come
+  in with one 32 slot `load256` (instead of a load or two broadcasts per group).
 
 The vector file is private VM state: the program moves data between guest buffers and slots only
 with `load256` / `store256` (up to 32 slots each).
@@ -50,11 +53,11 @@ tampered messages and signatures rejected, CUs identical between interpreter and
 
 | | Blueshift (scalar sBPF) | Vector intrinsics |
 |---|---|---|
-| CUs, median (min, max) | 182,764 (172,264, 254,225) | **23,460** (21,926, 33,296), 7.8x fewer |
-| Program size | 99 KiB | 76 KiB |
+| CUs, median (min, max) | 182,764 (172,264, 254,225) | **22,029** (20,460, 31,872), 8.3x fewer |
+| Program size | 99 KiB | 79 KiB |
 
-Where the CUs go (135 byte message, 24,883 CUs): Keccak-f 13.45k (10 permutations of 1,345), the
-signature decoder 7.2k, the NTT / product / norms 2.8k, sampling, absorbing and glue 1.3k.
+Where the CUs go (135 byte message, 23,442 CUs): Keccak-f 13.45k (10 permutations of 1,345), the
+signature decoder 6.4k, the NTT / product / norms 2.2k, sampling, absorbing and glue 1.3k.
 
 | Change | CUs (135 byte message) |
 |---|---|
@@ -72,6 +75,8 @@ signature decoder 7.2k, the NTT / product / norms 2.8k, sampling, absorbing and 
 | `mont16` (one op per Montgomery product), message blocks absorbed from vector loads | 25,735 |
 | Sampling with the core `cmp512` + `compress512` instead of a fused op | 25,843 |
 | Keccak with 28 ops per round (free row 4 and column 0 copies) | 24,883 |
+| Decoder: one long code test per window, two windows per iteration, integer table addresses | 24,090 |
+| NTT twiddles loaded 8 groups at a time | 23,442 |
 
 ## Reproduce
 

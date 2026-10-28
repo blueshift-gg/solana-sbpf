@@ -38,6 +38,7 @@ const T1: u8 = 112;
 const T2: u8 = 114;
 const ACC1: u8 = 116; // ||s1||^2 partial sums (u32 lanes)
 const ACC2: u8 = 118; // ||s2||^2
+const TWB: u8 = 32; // 8 twiddle groups (TW..TW + 4 each) at a time, see hoist_twiddles
 const I16_MAX: i64 = i16::MAX as i64;
 
 fn pow_mod(mut b: u64, mut e: u64, m: u64) -> u64 {
@@ -516,6 +517,143 @@ fn generate(psi_pos: &[u32; N], psi_neg: &[u32; N]) -> (Vec<Op>, Tables, Vec<(us
         }
     }
     (g.ops, g.tables, g.checks)
+}
+
+/// The op with every slot operand mapped by `f` (immediates unchanged)
+fn map_slots(op: Op, f: &dyn Fn(u8) -> u8) -> Op {
+    use Op::*;
+    match op {
+        Add(d, a, b) => Add(f(d), f(a), f(b)),
+        Mov(d, a) => Mov(f(d), f(a)),
+        Bcast(d, v) => Bcast(f(d), v),
+        Transpose(d) => Transpose(f(d)),
+        Xor(d, a, b) => Xor(f(d), f(a), f(b)),
+        Ror(d, a, n) => Ror(f(d), f(a), n),
+        Tern(d, a, b, imm) => Tern(f(d), f(a), f(b), imm),
+        Add16(d, a, b) => Add16(f(d), f(a), f(b)),
+        Sub16(d, a, b) => Sub16(f(d), f(a), f(b)),
+        Minu16(d, a, b) => Minu16(f(d), f(a), f(b)),
+        Madd16(d, a, b) => Madd16(f(d), f(a), f(b)),
+        Blendw(d, a, b, m) => Blendw(f(d), f(a), f(b), m),
+        Load(d, t, row, n) => Load(f(d), t, row, n),
+        Rolv64(d, a, b) => Rolv64(f(d), f(a), f(b)),
+        Mont(d, a, w, q) => Mont(f(d), f(a), f(w), f(q)),
+        W(inner) => w(map_slots(*inner, f)),
+        PermdW(d, a, b) => PermdW(f(d), f(a), f(b)),
+        TransposeQW(d) => TransposeQW(f(d)),
+        PermT2W(d, a, b) => PermT2W(f(d), f(a), f(b)),
+    }
+}
+
+/// Destination slots of an op
+fn written(op: Op) -> std::ops::Range<u8> {
+    use Op::*;
+    match op {
+        W(inner) => {
+            let r = written(*inner);
+            r.start..r.end + 1
+        }
+        Load(d, _, _, n) => d..d + n,
+        Transpose(d) => d..d + 8,
+        TransposeQW(d) => d..d + 16,
+        PermdW(d, ..) | PermT2W(d, ..) => d..d + 2,
+        Add(d, ..)
+        | Mov(d, _)
+        | Bcast(d, _)
+        | Xor(d, ..)
+        | Ror(d, ..)
+        | Tern(d, ..)
+        | Add16(d, ..)
+        | Sub16(d, ..)
+        | Minu16(d, ..)
+        | Madd16(d, ..)
+        | Blendw(d, ..)
+        | Rolv64(d, ..)
+        | Mont(d, ..) => d..d + 1,
+    }
+}
+
+/// The twiddles are materialized in TW..TW + 4 right before their butterflies (a load or two
+/// broadcasts per group). Instead, the groups go into a table, 8 of them are loaded with one
+/// 32 slot load into TWB..TWB + 32, and the butterflies read them there. The checks (op positions)
+/// are moved along.
+fn hoist_twiddles(
+    ops: &[Op],
+    tables: &mut Tables,
+    checks: &[(usize, u8, i64)],
+) -> (Vec<Op>, Vec<(usize, u8, i64)>) {
+    let tw = TW..TW + 4;
+    // The prepared public key goes through the twiddle slots too, it stays (its table comes later)
+    let key = |op: &Op| matches!(op, Op::Load(_, "H_PREP", ..));
+    let defines = |op: &Op| {
+        let r = written(*op);
+        let inside = tw.contains(&r.start) && r.end <= tw.end;
+        assert!(
+            inside || r.end <= tw.start || r.start >= tw.end,
+            "{op:?} overlaps the twiddles"
+        );
+        assert!(
+            r.end <= TWB || r.start >= TWB + 32,
+            "{op:?} writes the slots of the twiddle batches"
+        );
+        inside
+    };
+    let mut out = Vec::new();
+    let mut position = vec![0; ops.len() + 1];
+    let mut rows: Vec<[u32; 8]> = Vec::new();
+    let mut group = None;
+    let mut batches = Vec::new();
+    let mut mapped = false;
+    let mut k = 0;
+    while k < ops.len() {
+        position[k] = out.len();
+        if key(&ops[k]) {
+            mapped = false;
+        }
+        if key(&ops[k]) || !defines(&ops[k]) {
+            let g = group.filter(|_| mapped);
+            out.push(map_slots(ops[k], &|s| match g {
+                Some(g) if tw.contains(&s) => TWB + 4 * (g % 8) as u8 + (s - TW),
+                _ => s,
+            }));
+            k += 1;
+            continue;
+        }
+        // A group: the consecutive ops which write the twiddle slots, evaluated
+        let end = (k..ops.len())
+            .find(|&j| key(&ops[j]) || !defines(&ops[j]))
+            .unwrap_or(ops.len());
+        mapped = true;
+        // (slots a 256 bit group leaves alone are zero, the self test checks nothing reads them)
+        let mut region = [[0u32; 8]; 256];
+        simulate(&ops[k..end], &mut region, &|name, row| tables[name][row]);
+        let g = group.map_or(0, |g| g + 1);
+        group = Some(g);
+        rows.extend_from_slice(&region[tw.start as usize..tw.end as usize]);
+        if g % 8 == 0 {
+            // The batch: rows counted below
+            batches.push(out.len());
+            out.push(Op::Load(TWB, "TWB", 4 * g, 0));
+        }
+        position[k + 1..end].fill(out.len());
+        k = end;
+    }
+    position[ops.len()] = out.len();
+    for (b, &at) in batches.iter().enumerate() {
+        let n = (rows.len() - 32 * b).min(32) as u8;
+        out[at] = Op::Load(TWB, "TWB", 32 * b, n);
+    }
+    tables.insert("TWB", rows);
+    // The tables only the groups loaded
+    tables.retain(|name, _| {
+        out.iter()
+            .any(|op| matches!(op, Op::Load(_, t, ..) if t == name))
+    });
+    let checks = checks
+        .iter()
+        .map(|&(k, slot, bound)| (position[k], slot, bound))
+        .collect();
+    (out, checks)
 }
 
 /// Executes the op stream on a model of the vector region
@@ -1373,6 +1511,7 @@ fn main() {
     assert_eq!(ACC2, ACC1 + 2);
     let (psi_pos, psi_neg) = twiddles();
     let (ops, mut tables, checks) = generate(&psi_pos, &psi_neg);
+    let (ops, checks) = hoist_twiddles(&ops, &mut tables, &checks);
     self_test(&ops, &tables, &checks, &psi_pos);
     let h = decode_pubkey(&std::fs::read(&pk_path).expect("pubkey fixture"));
     tables.insert("H_PREP", prepare(&h, &psi_pos));

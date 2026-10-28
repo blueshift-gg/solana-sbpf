@@ -2045,14 +2045,15 @@ fn falcon_programs() {
                 if engine == Engine::Jit && name == "falcon_simd.so" {
                     let stats = r.executable.get_compiled_program().unwrap().simd_stats;
                     assert_eq!(stats.intrinsic_slow_paths, 0);
-                    // Table rows (twiddles, prepared pubkey, Keccak constants) from .rodata
+                    // Table rows (twiddles 8 groups per load, prepared pubkey, Keccak constants)
+                    // from .rodata
                     assert!(
-                        stats.static_loads > 100 && stats.translations < 16,
+                        stats.static_loads > 30 && stats.translations < 16,
                         "{:?}",
                         stats
                     );
                     if strategy == SimdJitStrategy::RegisterCached && !cfg!(feature = "tracer") {
-                        // AVX2 about 4200, AVX-512 about 2650 (the ZMM pair cache needs far fewer
+                        // AVX2 about 3500, AVX-512 about 2400 (the ZMM pair cache needs far fewer
                         // hits: a third of the vector loads, 15 instead of ~1300 reloads)
                         assert!(stats.cache_hits > 2_000, "{:?}", stats);
                     }

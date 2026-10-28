@@ -21,7 +21,6 @@ const fn ops7(d: u8, a: u8, b: u8, imm: u8) -> u64 {
 
 define_syscall!(fn sol_avx_load256(ops: u64, addr: u64) -> u64);
 define_syscall!(fn sol_avx_store256(ops: u64, addr: u64) -> u64);
-define_syscall!(fn sol_avx2_bcast32x8(ops: u64, value: u64) -> u64);
 define_syscall!(fn sol_avx2_transpose8x8(ops: u64) -> u64);
 define_syscall!(fn sol_avx2_add32x8(ops: u64) -> u64);
 define_syscall!(fn sol_avx2_add16x16(ops: u64) -> u64);
@@ -60,10 +59,6 @@ pub fn load(d: u8, n: u8, src: *const u32) {
 #[inline(always)]
 pub fn store(dst: *mut u32, a: u8, n: u8) {
     unsafe { sol_avx_store256(a as u64 | ((n - 1) as u64) << 24, dst as u64) };
-}
-#[inline(always)]
-pub fn bcast(d: u8, value: u32) {
-    unsafe { sol_avx2_bcast32x8(d as u64, value as u64) };
 }
 #[inline(always)]
 pub fn transpose(d: u8) {
