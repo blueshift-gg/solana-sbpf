@@ -78,9 +78,14 @@ is the 256 bit operation on both halves unless noted. The intrinsic name (next s
 | 0x22 | `sol_avx512_permi2d256` | `sol_avx512_permi2d512` | `v[d][i] = (v[a] ++ v[b])[v[d][i] & (2 L - 1)]` | 4 / 9 instructions per half / `vpermi2d` |
 | 0x23 | `sol_avx512_rolv64x4` | `sol_avx512_rolv64x8` | u64 `rotate_left(b % 64)` | 7 instructions / `vprolvq` |
 | 0x24 | `sol_avx2_transpose4x4q` | `sol_avx512_transpose8x8q` | u64 matrix: rows `vd..vd + 4` / pairs `vd, vd + 2, .., vd + 14` | 8 / 32 instructions / 24 zmm instructions |
+| 0x25 | `sol_avx2_shufb256` | `sol_avx512_shufb512` | byte shuffle per 128 bit lane (index bit 7 zeroes) | `vpshufb` |
+| 0x26 | `sol_avx512_permt2d256` | `sol_avx512_permt2d512` | `v[d][i] = (v[d] ++ v[b])[v[a][i] & (2 L - 1)]` (first table overwritten, index kept) | 4 / 9 instructions per half / `vpermt2d` |
+| 0x27 | `sol_avx512_compresslt16x16` | `sol_avx512_compresslt16x32` | u16 lanes of `a` below those of `b`, in order, packed into `d` (rest 0); count in `dst` / r0 | branchless scalar loop over the vector file / `vpcmpuw` + `vpcompressw` (VBMI2) + `kmovd` + `popcnt` |
 
 The BLAKE3 work needed the first 13; the rest came with the Falcon verifier (16 bit NTT arithmetic,
-Keccak on 64 bit lanes) and the private vector file (lane moves).
+Keccak on 64 bit lanes, vectorized rejection sampling) and the private vector file (lane moves).
+`compresslt16` needs AVX512_VBMI2 for its native form (Ice Lake, Zen 4 and later); on other hosts the
+JIT emits a branchless loop of 5 scalar instructions per lane.
 
 ## Intrinsic call form (SIMD-0645 style, no new opcode)
 
@@ -93,7 +98,7 @@ mov64 r1, <packed operands>       ; compile time constant
 call  sol_avx2_add32x8            ; CALL_IMM, src = 0, imm = murmur32("sol_avx2_add32x8")
 ```
 
-* **Encoding:** one static call identifier per operation and width (67 of them, the names in the
+* **Encoding:** one static call identifier per operation and width (73 of them, the names in the
   table above). `dst`, `src` and `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF.
   The names say which ISA level each operation maps to: `sol_avx_` (moves), `sol_avx2_` (AVX2
   integer operations) and `sol_avx512_` (AVX-512 operations, and every 512 bit form). Every

@@ -10,7 +10,7 @@
 //! - `r1` holds the packed operands (see [pack]), always a compile time constant in practice.
 //! - `r2` holds the scalar operand: the address of `load256`/`store256`, the value of `bcast` /
 //!   `ins64`.
-//! - The operation writes its scalar result (`ext64`, `movmsk8`) or 0 to `r0` and leaves every
+//! - The operation writes its scalar result (`ext64`, `movmsk8`, `compresslt16`) or 0 to `r0` and leaves every
 //!   other register unchanged.
 //! - It costs the 1 CU of its `CALL_IMM` instruction and nothing else.
 //!
@@ -69,6 +69,9 @@ pub const NAMES_256: [&str; SUBOP_COUNT as usize] = [
     "sol_avx512_permi2d256",
     "sol_avx512_rolv64x4",
     "sol_avx2_transpose4x4q",
+    "sol_avx2_shufb256",
+    "sol_avx512_permt2d256",
+    "sol_avx512_compresslt16x16",
 ];
 
 /// Function names of the 512 bit forms (slot pairs, AVX-512F/BW), indexed by sub-operation
@@ -110,6 +113,9 @@ pub const NAMES_512: [Option<&str>; SUBOP_COUNT as usize] = [
     Some("sol_avx512_permi2d512"),
     Some("sol_avx512_rolv64x8"),
     Some("sol_avx512_transpose8x8q"),
+    Some("sol_avx512_shufb512"),
+    Some("sol_avx512_permt2d512"),
+    Some("sol_avx512_compresslt16x32"),
 ];
 
 /// Register holding the packed operands
@@ -267,8 +273,8 @@ pub fn register<C: ContextObject>(loader: &mut BuiltinProgram<C>) -> Result<(), 
         };
     }
     register!(false: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36);
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39);
     register!(true: 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-        32, 33, 34, 35, 36);
+        32, 33, 34, 35, 36, 37, 38, 39);
     Ok(())
 }

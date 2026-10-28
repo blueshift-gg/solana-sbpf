@@ -120,8 +120,17 @@ pub const VROLV64: u8 = 0x23;
 /// Transposes the matrix of u64 lanes whose rows are the slots `vd..vd + 4` (4 x 4), or for the 512
 /// bit form the slot pairs `vd, vd + 2, .., vd + 14` (8 x 8)
 pub const VTRANSPOSE64: u8 = 0x24;
+/// `v[vd].u8[i] = v[vb].u8[i] & 0x80 != 0 ? 0 : v[va].u8[(i & !15) + (v[vb].u8[i] & 15)]` (byte
+/// shuffle within each 128 bit lane, vpshufb)
+pub const VSHUFB: u8 = 0x25;
+/// `v[vd][i] = (v[vd] ++ v[vb])[v[va][i] & (2 L - 1)]` for `L` u32 lanes per operand: two table
+/// permutation, the first table is overwritten (vpermt2d)
+pub const VPERMT2D: u8 = 0x26;
+/// The u16 lanes `i` of `v[va]` with `v[va][i] < v[vb][i]` (unsigned), in order, packed into the
+/// low lanes of `v[vd]` (the others zero); `r[dst]` = their number (vpcmpuw + vpcompressw)
+pub const VCOMPRESSLT16: u8 = 0x27;
 /// Number of defined sub-operations
-pub const SUBOP_COUNT: u8 = 0x25;
+pub const SUBOP_COUNT: u8 = 0x28;
 
 /// 512 bit flag in the immediate
 pub const WIDE: u32 = 1 << 24;
@@ -164,7 +173,7 @@ pub fn uses_src(subop: u8) -> bool {
 
 /// Sub-operations which write the scalar destination register
 pub fn writes_dst(subop: u8) -> bool {
-    matches!(subop, VEXT64 | VMOVMSK8)
+    matches!(subop, VEXT64 | VMOVMSK8 | VCOMPRESSLT16)
 }
 
 /// Operand validation shared by the opcode form and the intrinsic call form
@@ -381,6 +390,12 @@ pub fn compute(op: &VecInsn, a: &Lanes, b: &Lanes) -> Lanes {
             let p = |i: usize| a[i] as i16 as i32 * b[i] as i16 as i32;
             (0..8).for_each(|i| out[i] = p(2 * i).wrapping_add(p(2 * i + 1)) as u32);
         }
+        VSHUFB => {
+            let bytes = |x: &Lanes| -> [u8; 32] { std::array::from_fn(|i| (x[i / 4] >> (8 * (i % 4))) as u8) };
+            let (x, idx) = (bytes(a), bytes(b));
+            let r: [u8; 32] = std::array::from_fn(|i| if idx[i] & 0x80 != 0 { 0 } else { x[(i & !15) + (idx[i] & 15) as usize] });
+            out = std::array::from_fn(|i| u32::from_le_bytes([r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]]));
+        }
         VMOV => {}
         _ => unreachable!(),
     }
@@ -474,6 +489,16 @@ pub fn interpret(
         VEXT64 => {
             return Ok(u64::from_le(unsafe { std::ptr::read_unaligned(slot(op.va).add(8 * op.off as usize).cast::<u64>()) }));
         }
+        VCOMPRESSLT16 => {
+            let n = 16 * op.halves();
+            let word = |s: u8, i: usize| unsafe { std::ptr::read_unaligned(slot(s).add(2 * i).cast::<u16>()) };
+            let (a, b): (Vec<u16>, Vec<u16>) = (0..n).map(|i| (word(op.va, i), word(op.vb, i))).unzip();
+            let kept: Vec<u16> = (0..n).filter(|&i| a[i] < b[i]).map(|i| a[i]).collect();
+            for i in 0..n {
+                unsafe { std::ptr::write_unaligned(slot(op.vd).add(2 * i).cast::<u16>(), kept.get(i).copied().unwrap_or(0)) };
+            }
+            return Ok(kept.len() as u64);
+        }
         VMOVMSK8 => {
             let mut mask = 0u64;
             for i in 0..op.halves() * ebpf::VECTOR_WIDTH {
@@ -484,7 +509,7 @@ pub fn interpret(
         _ => {}
     }
     let halves = op.halves();
-    if !op.wide && !matches!(op.subop, VBCAST32 | VBCAST64 | VPERMI2D) {
+    if !op.wide && !matches!(op.subop, VBCAST32 | VBCAST64 | VPERMI2D | VPERMT2D) {
         // The common case: one 256 bit lane-wise operation
         let (a, b) = (read(op.va), read(op.vb));
         let out = if op.subop == VTERNLOG { compute_half(op, &a, &b, &read(op.vd)) } else { compute(op, &a, &b) };
@@ -492,7 +517,7 @@ pub fn interpret(
         return Ok(0);
     }
     // Every source is read before the destination is written
-    let reads_d = matches!(op.subop, VTERNLOG | VPERMI2D);
+    let reads_d = matches!(op.subop, VTERNLOG | VPERMI2D | VPERMT2D);
     let a: [Lanes; 2] = std::array::from_fn(|h| if h < halves { read(op.va + h as u8) } else { [0; 8] });
     let b: [Lanes; 2] = std::array::from_fn(|h| if h < halves { read(op.vb + h as u8) } else { [0; 8] });
     let d: [Lanes; 2] = std::array::from_fn(|h| if h < halves && reads_d { read(op.vd + h as u8) } else { [0; 8] });
@@ -507,6 +532,12 @@ pub fn interpret(
             std::array::from_fn(|i| {
                 let index = get(&d, 8 * h + i) as usize & (2 * lanes - 1);
                 if index < lanes { get(&a, index) } else { get(&b, index - lanes) }
+            })
+        }),
+        VPERMT2D => std::array::from_fn(|h| {
+            std::array::from_fn(|i| {
+                let index = get(&a, 8 * h + i) as usize & (2 * lanes - 1);
+                if index < lanes { get(&d, index) } else { get(&b, index - lanes) }
             })
         }),
         _ => std::array::from_fn(|h| compute_half(op, &a[h], &b[h], &d[h])),
@@ -546,6 +577,7 @@ pub fn disassemble(insn: &ebpf::Insn) -> String {
         VINS64 => format!("{name} v{vd}, r{}, {}", op.src, op.off),
         VEXT64 => format!("{name} r{}, v{va}, {}", op.dst, op.off),
         VMOVMSK8 => format!("{name} r{}, v{va}", op.dst),
+        VCOMPRESSLT16 => format!("{name} r{}, v{vd}, v{va}, v{vb}", op.dst),
         VMOV => format!("{name} v{vd}, v{va}"),
         VROR32 | VSRL32 | VSLL32 => format!("{name} v{vd}, v{va}, {}", op.off),
         VSHUFD => format!("{name} v{vd}, v{va}, {:#x}", op.off),

@@ -807,6 +807,10 @@ const K_ONE: u8 = 38;
 const K_RHO: u8 = 40; // 5 pairs
 const K_PI: u8 = 50; // 5 pairs
 const K_RC: u8 = 60; // 24 pairs
+const K_BSWAP: u8 = 108; // byte swap of every u16 (shufb indices)
+const K_TH_FULL: u8 = 110; // sampling thresholds: 5q in the 20 u16 of lanes 0..5, else 0
+const K_TH_LAST: u8 = 112; // 5q in the 8 u16 of lanes 0..2 (rate row 3), else 0
+const K_SMP: u8 = 114; // samples of one row
 /// d ^ a ^ b
 const XOR3: u8 = 0x96;
 /// d ^ (!a & b)
@@ -892,6 +896,13 @@ fn keccak_table() -> Vec<[u32; 8]> {
         pairs.push(std::array::from_fn(|i| if i == 0 { rc } else { 0 }));
     }
     assert_eq!(K_TABLE as usize + 2 * pairs.len(), K_RC as usize + 48);
+    // shufb indices are relative to the 128 bit lane: the odd u64 of a lane uses bytes 8..16
+    pairs.push(std::array::from_fn(|j| u64::from_le_bytes([1, 0, 3, 2, 5, 4, 7, 6]) + 0x0808_0808_0808_0808 * (j as u64 % 2)));
+    let q5 = 5 * Q as u64;
+    for lanes in [5, 2] {
+        pairs.push(std::array::from_fn(|i| if i < lanes { q5 * 0x0001_0001_0001_0001 } else { 0 }));
+    }
+    assert_eq!(K_TABLE as usize + 2 * pairs.len(), K_SMP as usize);
     pairs.into_iter().flat_map(pair_rows).collect()
 }
 
@@ -941,26 +952,16 @@ fn keccak_f_ops() -> Vec<Op> {
     ops
 }
 
-/// Byte offsets of the 68 samples of a squeezed block in the stored rate rows (pairs 0..4), in
-/// stream order: sample 4 L + j is bytes 2 j..2 j + 2 of lane L = 5 y + x, at byte 64 y + 8 x
-fn sample_offsets() -> Vec<usize> {
-    (0..shake::RATE_LANES * 4)
-        .map(|i| {
-            let (lane, j) = (i / 4, i % 4);
-            64 * (lane / 5) + 8 * (lane % 5) + 2 * j
-        })
-        .collect()
-}
-
 fn emit_take(s: &mut String) {
-    // A cold call keeps the rare rejection out of line, so the common path is a not taken branch
-    // instead of a select
-    writeln!(s, "#[cold]\n#[inline(never)]\nfn rejected(p: *mut u16) -> *mut u16 {{\n    unsafe {{ p.sub(1) }}\n}}").unwrap();
-    writeln!(s, "/// Appends the accepted samples of a squeezed block (`b`: the stored rate rows) at `p` (see").unwrap();
-    writeln!(s, "/// shake::Sponge::take)").unwrap();
-    writeln!(s, "#[inline(always)]\npub unsafe fn take_candidates(b: *const u8, mut p: *mut u16) -> *mut u16 {{").unwrap();
-    for off in sample_offsets() {
-        writeln!(s, "    let v = u16::from_be((b.add({off}) as *const u16).read_volatile()); p.write_volatile(v); p = p.add(1); if v >= {} {{ p = rejected(p); }}", 5 * Q).unwrap();
+    writeln!(s, "/// Appends the accepted samples of the squeezed block (rate rows 0..4 of the state) at `p`:").unwrap();
+    writeln!(s, "/// per row, byte swap the big-endian u16, keep those below 5q in order (compress), store the").unwrap();
+    writeln!(s, "/// pair at `p` and advance by their number. May write up to 32 values past the last accepted.").unwrap();
+    writeln!(s, "#[inline(always)]\npub unsafe fn take_candidates(mut p: *mut u16) -> *mut u16 {{\n    use crate::iv::*;").unwrap();
+    for y in 0..4u8 {
+        let th = if y < 3 { K_TH_FULL } else { K_TH_LAST };
+        writeln!(s, "    shufb512({K_SMP}, {}, {K_BSWAP});", K_STATE + 2 * y).unwrap();
+        writeln!(s, "    let c = compresslt16x32({K_SMP}, {K_SMP}, {th});").unwrap();
+        writeln!(s, "    store(p.cast(), {K_SMP}, 2);\n    p = p.add(c as usize);").unwrap();
     }
     writeln!(s, "    p\n}}").unwrap();
 }
@@ -1011,12 +1012,19 @@ impl shake::Sponge for SimSponge<'_> {
     }
     fn squeeze(&mut self) {}
     fn take(&mut self, n: usize) -> usize {
+        // The generated code's semantics (shufb, compresslt16) on the model, with its constants
         assert_eq!(n, self.out.len());
-        let bytes: Vec<u8> = self.region[K_STATE as usize..K_STATE as usize + 8].iter().flat_map(|slot| slot.iter().flat_map(|w| w.to_le_bytes())).collect();
-        for off in sample_offsets() {
-            let v = u16::from_be_bytes([bytes[off], bytes[off + 1]]) as u32;
-            if v < 5 * Q {
-                self.out.push(v);
+        let words = |r: &[[u32; 8]; 256], pair: u8| -> Vec<u16> { r[pair as usize..pair as usize + 2].iter().flatten().flat_map(|w| [*w as u16, (*w >> 16) as u16]).collect() };
+        let bytes = |r: &[[u32; 8]; 256], pair: u8| -> Vec<u8> { r[pair as usize..pair as usize + 2].iter().flatten().flat_map(|w| w.to_le_bytes()).collect() };
+        for y in 0..4u8 {
+            let (data, idx) = (bytes(&self.region, K_STATE + 2 * y), bytes(&self.region, K_BSWAP));
+            let shuffled: Vec<u8> = (0..64).map(|i| if idx[i] & 0x80 != 0 { 0 } else { data[(i & !15) + (idx[i] & 15) as usize] }).collect();
+            let th = words(&self.region, if y < 3 { K_TH_FULL } else { K_TH_LAST });
+            for i in 0..32 {
+                let v = u16::from_le_bytes([shuffled[2 * i], shuffled[2 * i + 1]]);
+                if v < th[i] {
+                    self.out.push(v as u32);
+                }
             }
         }
         self.out.len()

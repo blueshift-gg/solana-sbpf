@@ -284,6 +284,30 @@ fn op_cases() -> Vec<(&'static str, Body)> {
             a.vadd(3, 3, 5); // narrow op on a slot of a pair
         }
     })));
+    cases.push(("shufb_permt2d", Box::new(|a| {
+        use solana_sbpf::simd::{VPERMT2D, VSHUFB};
+        a.vop_full(VSHUFB, false, 1, 2, 3, 0, 0, 0);
+        a.vop_full(VSHUFB, false, 4, 4, 4, 0, 0, 0);
+        a.wide(VSHUFB, 6, 8, 10, 0, 0);
+        a.vop_full(VPERMT2D, false, 12, 13, 14, 0, 0, 0);
+        a.vop_full(VPERMT2D, false, 15, 15, 12, 0, 0, 0); // index aliases the table
+        a.wide(VPERMT2D, 0, 2, 4, 0, 0);
+        a.wide(VPERMT2D, 2, 2, 6, 0, 0);
+    })));
+    for wide in [false, true] {
+        cases.push(("compresslt16", Box::new(move |a| {
+            use solana_sbpf::simd::VCOMPRESSLT16;
+            a.vsrl(4, 4, 1); // thresholds of about half the range
+            a.vsrl(5, 5, 1);
+            a.vop_full(VCOMPRESSLT16, wide, 0, 2, 4, 6, 0, 0);
+            a.vins64(15, 6, 0);
+            a.vop_full(VCOMPRESSLT16, wide, 8, 8, 4, 7, 0, 0); // destination aliases the data
+            a.vins64(15, 7, 1);
+            a.vop_full(VCOMPRESSLT16, wide, 10, 12, 10, 3, 0, 0); // destination aliases the thresholds
+            a.vins64(15, 3, 2);
+            a.vadd(1, 1, 0); // the result used by a cached op
+        })));
+    }
     cases.push(("wide_bcast", Box::new(|a| {
         a.lddw(3, 0x8765_4321_0fed_cba9);
         a.wide(solana_sbpf::simd::VBCAST32, 2, 0, 0, 3, 0);
@@ -545,7 +569,7 @@ fn wide_ops_reference() {
     use solana_sbpf::simd::{self, intrinsics::NAMES_512, VecInsn};
     let input = random_input(41);
     for subop in 0..simd::SUBOP_COUNT {
-        if NAMES_512[subop as usize].is_none() || matches!(subop, simd::VMOVMSK8 | simd::VBCAST32 | simd::VBCAST64 | simd::VTRANSPOSE64) {
+        if NAMES_512[subop as usize].is_none() || matches!(subop, simd::VMOVMSK8 | simd::VBCAST32 | simd::VBCAST64 | simd::VTRANSPOSE64 | simd::VPERMT2D | simd::VCOMPRESSLT16) {
             continue;
         }
         let off = match subop {
@@ -607,6 +631,33 @@ fn wide_ops_reference() {
     let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.wide(simd::VROLV64, 0, 2, 4, 0, 0)), &input, Engine::Interpreter, SimdJitStrategy::Direct);
     for i in 0..8 {
         assert_eq!(q(&out, i), q(&input, 8 + i).rotate_left((q(&input, 16 + i) % 64) as u32));
+    }
+    // compresslt16 (both widths), shufb and permt2d against the model
+    let w16 = |buf: &[u8], i: usize| u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]);
+    for wide in [false, true] {
+        let n = if wide { 32 } else { 16 };
+        let body = move |a: &mut Asm| {
+            a.vop_full(simd::VCOMPRESSLT16, wide, 0, 2, 4, 6, 0, 0);
+            a.vins64(15, 6, 0);
+        };
+        let (out, _) = run_op(&op_program(VecMode::Slot, &body), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+        let kept: Vec<u16> = (0..n).filter(|&i| w16(&input, 32 + i) < w16(&input, 64 + i)).map(|i| w16(&input, 32 + i)).collect();
+        for i in 0..n {
+            assert_eq!(w16(&out, i), kept.get(i).copied().unwrap_or(0), "compresslt16 wide={wide} lane {i}");
+        }
+        assert_eq!(u64::from_le_bytes(out[15 * 32..15 * 32 + 8].try_into().unwrap()), kept.len() as u64);
+    }
+    let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.vop_full(simd::VSHUFB, false, 0, 1, 2, 0, 0, 0)), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+    for i in 0..32 {
+        let idx = input[64 + i];
+        assert_eq!(out[i], if idx & 0x80 != 0 { 0 } else { input[32 + (i & !15) + (idx & 15) as usize] });
+    }
+    let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.wide(simd::VPERMT2D, 0, 4, 2, 0, 0)), &input, Engine::Interpreter, SimdJitStrategy::Direct);
+    let lane32 = |buf: &[u8], i: usize| u32::from_le_bytes(buf[4 * i..4 * i + 4].try_into().unwrap());
+    for i in 0..16 {
+        let idx = (lane32(&input, 32 + i) & 31) as usize;
+        let expected = if idx < 16 { lane32(&input, idx) } else { lane32(&input, 16 + idx - 16) };
+        assert_eq!(lane32(&out, i), expected, "vpermt2d512 lane {i}");
     }
     // vpermi2d256 against the model
     let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.vpermi2d(0, 4, 5, false)), &input, Engine::Interpreter, SimdJitStrategy::Direct);

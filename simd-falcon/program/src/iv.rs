@@ -58,6 +58,8 @@ define_syscall!(fn sol_avx512_rolv64x8(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_transpose8x8q(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_blendw512(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_ror32x16(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_shufb512(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_compresslt16x32(ops: u64) -> u64);
 
 /// `n` consecutive slots from `src` (one translation)
 #[inline(always)]
@@ -205,4 +207,15 @@ pub fn blendw512(d: u8, a: u8, b: u8, mask: u8) {
 #[inline(always)]
 pub fn ror512(d: u8, a: u8, n: u8) {
     unsafe { sol_avx512_ror32x16(ops3(d, a, n)) };
+}
+/// Byte shuffle within each 128 bit lane of the pairs (`idx` bytes, bit 7 zeroes)
+#[inline(always)]
+pub fn shufb512(d: u8, a: u8, idx: u8) {
+    unsafe { sol_avx512_shufb512(ops3(d, a, idx)) };
+}
+/// The u16 of `a` below the u16 of `b` (unsigned), in order, packed into the low end of `d` (rest
+/// zero); returns their number
+#[inline(always)]
+pub fn compresslt16x32(d: u8, a: u8, b: u8) -> u64 {
+    unsafe { sol_avx512_compresslt16x32(ops3(d, a, b)) }
 }

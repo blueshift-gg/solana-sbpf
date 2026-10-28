@@ -17,8 +17,9 @@ Blueshift's example program, with Firedancer's verifier structure (`fd_falcon.c`
   64 bit lanes, one state row per slot pair. Theta with `ternlog512` / `permd512` / `rolv64x8`, rho
   with `rolv64x8`, pi as one lane permutation per row (which yields the column layout), chi in place
   with `ternlog512`, and `transpose8x8q` back to rows: 30 vector ops per round. The rate goes in and
-  out with one `load256` / `store256` of 8 slots; the squeezed samples are taken by generated straight
-  line code (constant offsets, `be16`, about 5 instructions per sample).
+  in with one `load256` of 8 slots. Rejection sampling stays in vector registers: per rate row a
+  `shufb512` byte swaps the big-endian samples, `compresslt16x32` keeps those below 5q in order and
+  returns their number, and one store appends them to the candidates (unused lanes have threshold 0).
 * **NTT, pointwise product, norm:** Cooley-Tukey forward / Gentleman-Sande inverse NTT over
   Z/12289 like Firedancer, written the way current AVX2 NTTs (Kyber, Dilithium) are: 16 signed
   16 bit coefficients per slot, Montgomery products from 16 bit multiplies (4 ops), lazy reduction
@@ -43,11 +44,12 @@ tampered messages and signatures rejected, CUs identical between interpreter and
 
 | | Blueshift (scalar sBPF) | Vector intrinsics |
 |---|---|---|
-| CUs, median (min, max) | 182,764 (172,264, 254,225) | **28,916** (26,987, 42,187), 6.3x fewer |
-| Program size | 99 KiB | 89 KiB |
+| CUs, median (min, max) | 182,764 (172,264, 254,225) | **26,332** (24,420, 39,190), 6.9x fewer |
+| Program size | 99 KiB | 86 KiB |
 
-Where the CUs go (135 byte message, 30,758 CUs): Keccak-f 14.4k (10 permutations of 1,441),
-decompression 7.2k, the NTT / product / norm 4.5k, taking samples about 3k, the rest 1.5k.
+Where the CUs went before vectorized sampling (135 byte message, 30,758 CUs): Keccak-f 14.4k
+(10 permutations of 1,441), decompression 7.2k, the NTT / product / norm 4.5k, taking samples,
+absorbing and buffers 4.4k, the rest 0.2k.
 
 | Change | CUs (135 byte message) |
 |---|---|
@@ -61,6 +63,7 @@ decompression 7.2k, the NTT / product / norm 4.5k, taking samples about 3k, the 
 | Keccak on 64 bit lanes, 512 bit ops (30 ops per round) | 35,038 |
 | NTT / product / norms on 512 bit slot pairs | 32,394 |
 | Decoder without a call in its loop, constant offset stores | 30,758 |
+| Rejection sampling with `shufb512` + `compresslt16x32` | 27,859 |
 
 ## Reproduce
 

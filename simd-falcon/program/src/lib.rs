@@ -35,18 +35,17 @@ type Rows<const R: usize> = [[u32; 8]; R];
 #[repr(align(32))]
 struct Lanes([u64; 32]);
 
-/// The Keccak state lives in the vector file (see build.rs), the absorb input and the squeezed
-/// rate go through these buffers: rate rows 0..4 as slot pairs, lane x of row y at u64 8 y + x
+/// The Keccak state lives in the vector file (see build.rs), the absorb input goes through a buffer
+/// (rate rows 0..4 as slot pairs, lane x of row y at u64 8 y + x), the samples are compressed out
+/// of the state into the candidates
 struct VectorSponge<'a> {
     /// Absorb buffer, slots K_IN..K_IN + 8
     input: Lanes,
-    /// Squeezed rate, slots K_STATE..K_STATE + 8
-    output: Lanes,
     /// hash_to_point candidates (u16 < 5q)
     candidates: &'a mut Candidates,
 }
 
-/// 512 candidates and the up to 68 values a block may write past them
+/// 512 candidates and the up to 32 values a block may write past them (rounded up)
 #[repr(align(32))]
 struct Candidates([u16; N + 68]);
 
@@ -66,14 +65,12 @@ impl shake::Sponge for VectorSponge<'_> {
         generated::keccak_f();
     }
     #[inline(always)]
-    fn squeeze(&mut self) {
-        iv::store(self.output.0.as_mut_ptr().cast(), generated::K_STATE, 8);
-    }
+    fn squeeze(&mut self) {}
     #[inline(always)]
     fn take(&mut self, n: usize) -> usize {
         unsafe {
             let start = self.candidates.0.as_mut_ptr();
-            generated::take_candidates(self.output.0.as_ptr().cast(), start.add(n)).offset_from(start) as usize
+            generated::take_candidates(start.add(n)).offset_from(start) as usize
         }
     }
 }
@@ -89,7 +86,7 @@ fn verify(sig: &[u8; SIG_LEN], message: &[u8]) -> bool {
     // and then s2 share one buffer.
     let mut buffer = Candidates([0; N + 68]);
     generated::keccak_init();
-    let mut sponge = VectorSponge { input: Lanes([0; 32]), output: Lanes([0; 32]), candidates: &mut buffer };
+    let mut sponge = VectorSponge { input: Lanes([0; 32]), candidates: &mut buffer };
     shake::hash_to_point(&mut sponge, nonce, message);
     iv::load(generated::C_SLOT, 32, buffer.0.as_ptr().cast());
     if !codec::decompress_signature(comp, buffer.0.as_mut_ptr()) {

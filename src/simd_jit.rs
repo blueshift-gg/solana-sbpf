@@ -112,6 +112,8 @@ pub struct SimdJitState {
     pinned: [bool; CACHE_REGS],
     /// AVX-512 lowering (512 bit operations in ZMM registers, AVX-512VL single instructions)
     pub(super) avx512: bool,
+    /// AVX512_VBMI2 (vpcompressw) in addition
+    vbmi2: bool,
     pairs: [PairState; ebpf::VECTOR_SLOTS / 2],
     zregs: [Option<u8>; ZREGS],
     zlast_use: [u64; ZREGS],
@@ -141,6 +143,7 @@ impl SimdJitState {
             clock: 0,
             pinned: [false; CACHE_REGS],
             avx512: false,
+            vbmi2: false,
             pairs: [PairState::default(); ebpf::VECTOR_SLOTS / 2],
             zregs: [None; ZREGS],
             zlast_use: [0; ZREGS],
@@ -183,6 +186,7 @@ impl SimdJitState {
                 && std::arch::is_x86_feature_detected!("avx512f")
                 && std::arch::is_x86_feature_detected!("avx512bw")
                 && std::arch::is_x86_feature_detected!("avx512vl"));
+        state.vbmi2 = state.avx512 && (config.simd_force_avx512 || std::arch::is_x86_feature_detected!("avx512vbmi2"));
         // callx may only enter instructions outside runs of vector code (see simd::SimdAnalysis),
         // so block local state is sound even in programs which contain callx
         state.static_flow = true;
@@ -787,7 +791,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         let op = *op;
         self.simd.stats.vector_instructions += 1;
-        if self.simd.avx512 && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64) {
+        let native_compress = self.simd.vbmi2 || op.subop != VCOMPRESSLT16;
+        if self.simd.avx512 && native_compress && !matches!(op.subop, VLOAD | VSTORE | VTRANSPOSE8 | VTRANSPOSE64) {
             // A slot is cached at one width only
             let (slots, count) = Self::simd_operand_slots(&op);
             for &slot in &slots[..count] {
@@ -815,7 +820,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             VLOAD if self.emit_simd_static_load(&op) => {}
             VLOAD | VSTORE => self.emit_simd_transfer(&op),
             VTRANSPOSE8 | VTRANSPOSE64 => self.emit_simd_fixed(&op),
-            VPERMI2D => self.emit_simd_cross(&op),
+            VPERMI2D | VPERMT2D => self.emit_simd_cross(&op),
+            VCOMPRESSLT16 => self.emit_simd_compress_scalar(&op),
             VPERMD if op.wide => self.emit_simd_cross(&op),
             VMOVMSK8 if op.wide => self.emit_simd_movmsk_wide(&op),
             _ if op.wide => {
@@ -1012,9 +1018,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.simd_rebind(op.vd, out[0]);
                 self.simd_rebind(op.vd + 1, out[1]);
             }
-            (VPERMI2D, false) => {
+            (VPERMI2D | VPERMT2D, false) => {
                 // out = idx bit 3 ? b[idx & 7] : a[idx & 7]
-                let (a, b, idx) = (ensure(self, op.va), ensure(self, op.vb), ensure(self, op.vd));
+                let (ta, ti) = if op.subop == VPERMI2D { (op.va, op.vd) } else { (op.vd, op.va) };
+                let (a, b, idx) = (ensure(self, ta), ensure(self, op.vb), ensure(self, ti));
                 let (out, m) = (temp(self), temp(self));
                 self.emit_vex(V::permd(out, idx, VexRm::Reg(a)));
                 self.emit_vex(V::permd(s, idx, VexRm::Reg(b)));
@@ -1024,9 +1031,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             }
             _ => {
                 // 512 bit: bit 3 of the index picks the half, bit 4 the table
-                let (a0, a1) = (ensure(self, op.va), ensure(self, op.va + 1));
+                let (ta, ti) = if op.subop == VPERMI2D { (op.va, op.vd) } else { (op.vd, op.va) };
+                let (a0, a1) = (ensure(self, ta), ensure(self, ta + 1));
                 let (b0, b1) = (ensure(self, op.vb), ensure(self, op.vb + 1));
-                let idx = [ensure(self, op.vd), ensure(self, op.vd + 1)];
+                let idx = [ensure(self, ti), ensure(self, ti + 1)];
                 let out = [temp(self), temp(self)];
                 let (m, t) = (temp(self), temp(self));
                 for h in 0..2 {
@@ -1152,6 +1160,33 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
                 let rd = self.simd_destination(op.vd);
                 self.emit_evex(E::permi2d(1, rd, ra, b));
+            }
+            VSHUFB => {
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let rd = self.simd_destination(op.vd);
+                self.emit_vex(V::pshufb(rd, ra, b));
+            }
+            VPERMT2D => {
+                // AVX-512 only (without it, emit_simd_cross)
+                let ri = self.simd_ensure_reg(op.va);
+                self.simd_pin(ri);
+                let rd = self.simd_ensure_reg(op.vd);
+                self.simd_pin(rd);
+                let b = if op.vb == op.va { VexRm::Reg(ri) } else { self.simd_source(op.vb) };
+                let rd = self.simd_destination(op.vd);
+                self.emit_evex(E::permt2d(1, rd, ri, b));
+            }
+            VCOMPRESSLT16 => {
+                // AVX-512 with VBMI2 only (otherwise emit_simd_compress_scalar)
+                let ra = self.simd_ensure_reg(op.va);
+                self.simd_pin(ra);
+                let b = if op.vb == op.va { VexRm::Reg(ra) } else { self.simd_source(op.vb) };
+                let rd = self.simd_destination(op.vd);
+                self.emit_evex(E::pcmpuw(1, KMASK, ra, b, 1));
+                self.emit_evex(E::pcompressw(1, rd, ra, KMASK));
+                self.emit_simd_mask_count(REGISTER_MAP[op.dst as usize]);
             }
             VROLV64 if self.simd.avx512 => {
                 let ra = self.simd_ensure_reg(op.va);
@@ -1395,7 +1430,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_vex(V::kmovq_to_gpr(REGISTER_MAP[op.dst as usize], KMASK));
             }
             VADD32 | VXOR | VAND | VOR | VSUB32 | VMULLO32 | VMINU32 | VSLLV32 | VSRLV32 | VANDN | VROLV32 | VROLV64
-            | VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDD | VBLENDW => {
+            | VADD16 | VSUB16 | VMULLO16 | VMULHI16 | VMINU16 | VMADD16 | VBLENDD | VBLENDW | VSHUFB => {
                 if matches!(op.subop, VBLENDD | VBLENDW) {
                     let (anchor, size) = if op.subop == VBLENDD { (ANCHOR_SIMD_BLENDD_MASKS, 2) } else { (ANCHOR_SIMD_BLENDW_MASKS, 4) };
                     let entry = unsafe { self.anchors[anchor].add(size * op.off as usize) };
@@ -1424,6 +1459,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     VROLV32 => E::alu38(2, 0x15, zd, za, b),
                     VROLV64 => E::alu_q(2, 2, 0x15, zd, za, b),
                     VMINU16 => E::alu38(2, 0x3a, zd, za, b),
+                    VSHUFB => E::pshufb(2, zd, za, b),
                     VBLENDD => E::pblendmd(zd, za, b, KMASK),
                     _ => E::pblendmw(zd, za, b, KMASK),
                 };
@@ -1437,6 +1473,24 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
                 let zd = self.simd_zdestination(pd);
                 self.emit_evex(if op.subop == VTERNLOG { E::pternlogd(2, zd, za, b, op.off as u8) } else { E::permi2d(2, zd, za, b) });
+            }
+            VPERMT2D => {
+                let zidx = self.simd_zensure(pa);
+                self.simd_zpin(zidx);
+                let zd = self.simd_zensure(pd);
+                self.simd_zpin(zd);
+                let b = if pb == pa { VexRm::Reg(zidx) } else { self.simd_zsource(pb) };
+                let zd = self.simd_zdestination(pd);
+                self.emit_evex(E::permt2d(2, zd, zidx, b));
+            }
+            VCOMPRESSLT16 => {
+                let za = self.simd_zensure(pa);
+                self.simd_zpin(za);
+                let b = if pb == pa { VexRm::Reg(za) } else { self.simd_zsource(pb) };
+                let zd = self.simd_zdestination(pd);
+                self.emit_evex(E::pcmpuw(2, KMASK, za, b, 1));
+                self.emit_evex(E::pcompressw(2, zd, za, KMASK));
+                self.emit_simd_mask_count(REGISTER_MAP[op.dst as usize]);
             }
             VPERMD => {
                 let zidx = self.simd_zensure(pb);
@@ -1475,5 +1529,74 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             _ => unreachable!(),
         }
         self.simd.zpinned = [false; ZREGS];
+    }
+
+    /// `dst = popcnt(k1)` (the number of lanes a compress kept)
+    fn emit_simd_mask_count(&mut self, dst: X86Register) {
+        self.emit_vex(V::kmovd_to_gpr(dst, KMASK));
+        // popcnt r32, r32 (no helper for it in the emitter)
+        let d = dst as u8;
+        self.emit::<u8>(0xf3);
+        if d >= 8 {
+            self.emit::<u8>(0x45);
+        }
+        self.emit::<u8>(0x0f);
+        self.emit::<u8>(0xb8);
+        self.emit::<u8>(0xc0 | (d & 7) << 3 | (d & 7));
+        self.simd.stats.native_instructions += 2;
+    }
+
+    /// compresslt16 without AVX512_VBMI2: a branchless scalar loop over the u16 lanes in the vector
+    /// file (both lanes read, a[i] stored at the count, `count += a[i] < b[i]`), then the remaining
+    /// lanes are zeroed. The store goes to index count <= i, after lane i is read, so it never
+    /// clobbers a lane not yet read and the operands may alias.
+    fn emit_simd_compress_scalar(&mut self, op: &VecInsn) {
+        let n = 16 * op.halves() as i32;
+        // The operands must be in memory
+        for slot in [op.vd, op.va, op.vb] {
+            for s in slot..slot + op.halves() as u8 {
+                self.simd_drop_slot(s);
+                self.simd_drop_pair(s / 2);
+            }
+        }
+        self.simd_ensure_base();
+        let count = REGISTER_MAP[op.dst as usize];
+        let mut temps = [REGISTER_MAP[1], REGISTER_MAP[2], REGISTER_MAP[3]].iter().copied().filter(|r| *r != count);
+        let (t, z) = (temps.next().unwrap(), temps.next().unwrap());
+        self.emit_ins(X86Instruction::push(t, None));
+        self.emit_ins(X86Instruction::push(z, None));
+        self.emit_ins(X86Instruction::load_immediate(count, 0));
+        let (da, db, dd) = (Self::slot_disp(op.va), Self::slot_disp(op.vb), Self::slot_disp(op.vd));
+        for i in 0..n {
+            // Both lanes are read before the store (which may hit b[i] when count == i)
+            self.emit_ins(X86Instruction::load(OperandSize::S16, REGISTER_SCRATCH, t, X86IndirectAccess::Offset(da + 2 * i)));
+            self.emit_ins(X86Instruction::load(OperandSize::S16, REGISTER_SCRATCH, z, X86IndirectAccess::Offset(db + 2 * i)));
+            self.emit_ins(X86Instruction::store(OperandSize::S16, t, REGISTER_SCRATCH, X86IndirectAccess::OffsetIndexShift(dd, count, 1)));
+            // CF = a[i] < b[i]
+            self.emit_ins(X86Instruction::cmp(OperandSize::S32, z, t, None));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 2, count, 0, None)); // adc count, 0
+        }
+        // for (t = count; t < n; t++) d[t] = 0
+        self.emit_ins(X86Instruction::load_immediate(z, 0));
+        self.emit_ins(X86Instruction::mov(OperandSize::S64, count, t));
+        let top = self.offset_in_text_section;
+        self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, t, n as i64, None));
+        // jae rel32 (patched), emitted raw so that no diversification noop separates it from the patch
+        self.emit::<u8>(0x0f);
+        self.emit::<u8>(0x83);
+        self.emit::<i32>(0);
+        let patch = self.offset_in_text_section;
+        self.emit_ins(X86Instruction::store(OperandSize::S16, z, REGISTER_SCRATCH, X86IndirectAccess::OffsetIndexShift(dd, t, 1)));
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, t, 1, None));
+        self.emit::<u8>(0xe9);
+        let back = top as i64 - (self.offset_in_text_section as i64 + 4);
+        self.emit::<i32>(back as i32);
+        let distance = (self.offset_in_text_section - patch) as i32;
+        unsafe {
+            let ptr = self.result.text_section_mut().as_mut_ptr().add(patch - 4);
+            std::ptr::write_unaligned(ptr.cast::<i32>(), distance);
+        }
+        self.emit_ins(X86Instruction::pop(z));
+        self.emit_ins(X86Instruction::pop(t));
     }
 }

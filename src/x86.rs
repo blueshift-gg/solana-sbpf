@@ -1073,6 +1073,10 @@ impl VexInstruction {
     pub const fn kmov_load(k: u8, dwords: bool, src: VexRm) -> Self {
         Self { pp: dwords as u8, map: 1, w: dwords, l: false, opcode: 0x90, reg: k, vvvv: 0, rm: src, imm: None }
     }
+    /// kmovd r32, k
+    pub const fn kmovd_to_gpr(dst: X86Register, k: u8) -> Self {
+        Self { pp: 3, map: 1, w: false, l: false, opcode: 0x93, reg: dst as u8, vvvv: 0, rm: VexRm::Reg(k), imm: None }
+    }
     /// kmovq r64, k
     pub const fn kmovq_to_gpr(dst: X86Register, k: u8) -> Self {
         Self { pp: 3, map: 1, w: true, l: false, opcode: 0x93, reg: dst as u8, vvvv: 0, rm: VexRm::Reg(k), imm: None }
@@ -1102,6 +1106,8 @@ pub struct EvexInstruction {
     pub rm: VexRm,
     /// Opmask register (EVEX.aaa), 0 for none
     pub mask: u8,
+    /// Zeroing instead of merging masking (EVEX.z)
+    pub zero: bool,
     /// Optional trailing 8 bit immediate
     pub imm: Option<u8>,
 }
@@ -1109,7 +1115,7 @@ pub struct EvexInstruction {
 #[cfg(feature = "simd-experiment")]
 impl EvexInstruction {
     const fn op(pp: u8, map: u8, w: bool, vl: u8, opcode: u8, reg: u8, vvvv: u8, rm: VexRm, imm: Option<u8>) -> Self {
-        Self { pp, map, w, vl, opcode, reg, vvvv, rm, mask: 0, imm }
+        Self { pp, map, w, vl, opcode, reg, vvvv, rm, mask: 0, zero: false, imm }
     }
 
     /// vmovdqu32 zmm, m512
@@ -1177,6 +1183,22 @@ impl EvexInstruction {
     pub const fn pbroadcastq_gpr(dst: u8, src: X86Register) -> Self {
         Self::op(1, 2, true, 2, 0x7c, dst, 0, VexRm::Reg(src as u8), None)
     }
+    /// vpermt2d: `dst` (the first table) receives `(dst ++ table2)[index]`
+    pub const fn permt2d(vl: u8, dst: u8, index: u8, table2: VexRm) -> Self {
+        Self::op(1, 2, false, vl, 0x7e, dst, index, table2, None)
+    }
+    /// vpshufb (byte shuffle per 128 bit lane)
+    pub const fn pshufb(vl: u8, dst: u8, src: u8, mask: VexRm) -> Self {
+        Self::op(1, 2, false, vl, 0x00, dst, src, mask, None)
+    }
+    /// vpcmpuw k, src1, src2, predicate (1: less than)
+    pub const fn pcmpuw(vl: u8, k: u8, src1: u8, src2: VexRm, predicate: u8) -> Self {
+        Self::op(1, 3, true, vl, 0x3e, k, src1, src2, Some(predicate))
+    }
+    /// vpcompressw dst {k}{z}, src (AVX512_VBMI2)
+    pub const fn pcompressw(vl: u8, dst: u8, src: u8, k: u8) -> Self {
+        Self { mask: k, zero: true, ..Self::op(1, 2, true, vl, 0x63, src, 0, VexRm::Reg(dst), None) }
+    }
     /// vpmovb2m k, zmm (byte sign bits)
     pub const fn pmovb2m(k: u8, src: u8) -> Self {
         Self::op(2, 2, false, 2, 0x29, k, 0, VexRm::Reg(src), None)
@@ -1199,7 +1221,7 @@ impl EvexInstruction {
         push(0x62, &mut len);
         push(not(self.reg >> 3) << 7 | not(x) << 6 | not(b) << 5 | not(self.reg >> 4) << 4 | self.map, &mut len);
         push((self.w as u8) << 7 | ((!self.vvvv) & 0xf) << 3 | 1 << 2 | self.pp, &mut len);
-        push(self.vl << 5 | not(self.vvvv >> 4) << 3 | self.mask, &mut len);
+        push((self.zero as u8) << 7 | self.vl << 5 | not(self.vvvv >> 4) << 3 | self.mask, &mut len);
         push(self.opcode, &mut len);
         let reg = (self.reg & 7) << 3;
         match self.rm {
@@ -1279,6 +1301,13 @@ mod evex_tests {
             (E::alu_q(2, 2, 0x15, 16, 17, VexRm::Mem(R11, 64)), "62 c2 f5 40 15 43 01"), // vprolvq zmm16, zmm17, [r11 + 64]
             (E::alu_q(1, 2, 0x15, 1, 2, r(3)), "62 f2 ed 28 15 cb"),   // vprolvq ymm1, ymm2, ymm3
             (E::shufi64x2(16, 24, 26, 0x88), "62 83 bd 40 43 c2 88"),  // vshufi64x2 zmm16, zmm24, zmm26, 0x88
+            (E::permt2d(2, 16, 17, r(18)), "62 a2 75 40 7e c2"),       // vpermt2d zmm16, zmm17, zmm18
+            (E::permt2d(1, 3, 4, r(5)), "62 f2 5d 28 7e dd"),          // vpermt2d ymm3, ymm4, ymm5
+            (E::pshufb(2, 16, 17, VexRm::Mem(R11, 128)), "62 c2 75 40 00 43 02"), // vpshufb zmm16, zmm17, [r11 + 128]
+            (E::pcmpuw(2, 1, 16, r(17), 1), "62 b3 fd 40 3e c9 01"),   // vpcmpltuw k1, zmm16, zmm17
+            (E::pcmpuw(1, 1, 3, r(4), 1), "62 f3 e5 28 3e cc 01"),     // vpcmpltuw k1, ymm3, ymm4
+            (E::pcompressw(2, 18, 16, 1), "62 a2 fd c9 63 c2"),        // vpcompressw zmm18 {k1} {z}, zmm16
+            (E::pcompressw(1, 2, 3, 1), "62 f2 fd a9 63 da"),          // vpcompressw ymm2 {k1} {z}, ymm3
         ];
         for (insn, expected) in cases {
             let (bytes, len) = insn.encode();
@@ -1286,6 +1315,8 @@ mod evex_tests {
         }
         let vex: Vec<(V, &str)> = vec![
             (V::kmovq_to_gpr(R8, 1), "c4 61 fb 93 c1"),                // kmovq r8, k1
+            (V::kmovd_to_gpr(RAX, 1), "c5 fb 93 c1"),                  // kmovd eax, k1
+            (V::kmovd_to_gpr(R14, 1), "c5 7b 93 f1"),                  // kmovd r14d, k1
             (V::movq_from_gpr(15, R9), "c4 41 f9 6e f9"),              // vmovq xmm15, r9
             (V::movq_to_gpr(RAX, 3), "c4 e1 f9 7e d8"),                // vmovq rax, xmm3
             (V::pextrq(R10, 15, 1), "c4 43 f9 16 fa 01"),              // vpextrq r10, xmm15, 1
