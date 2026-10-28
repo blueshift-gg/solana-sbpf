@@ -28,7 +28,7 @@ What this experiment would propose, separated from the research scaffolding:
   load / store instead). The operations with reserved numbers (0x27, 0x4f..0x52) were removed.
 * **The composite set, proposed separately with benchmarks.** Not x86 instructions but short native
   sequences priced as one operation, where the CU savings are large: `transpose8x8` (u32, BLAKE3
-  8-way), `transpose4x4q` / `transpose8x8q` (Keccak: 30 instead of ~40 operations per round) and
+  8-way), `transpose4x4q` / `transpose8x8q` (Keccak: 28 instead of ~40 operations per round) and
   `mont16` (Falcon's NTT: -870 operations).
 * **Pricing.** Every operation costs 2 CUs (`mov64` + `call`) at either width. A 512 bit operation
   is two native operations on AVX2-only validators; the proposal should state that explicitly, as

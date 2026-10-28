@@ -16,7 +16,11 @@ Blueshift's example program, with Firedancer's verifier structure (`fd_falcon.c`
 * **SHAKE-256 hash-to-point:** a vectorized Keccak-f[1600] on one state with 512 bit operations on
   64 bit lanes, one state row per slot pair. Theta with `ternlog512` / `permd512` / `rolv64x8`, rho
   with `rolv64x8`, pi as one lane permutation per row (which yields the column layout), chi in place
-  with `ternlog512`, and `transpose8x8q` back to rows: 30 vector ops per round. The rate goes in and
+  with `ternlog512`, and `transpose8x8q` back to rows: 28 vector ops per round. Two of the copies
+  the round needs are free: pi also copies row 4 into the unused lane 5, so the transpose leaves a
+  copy of row 4 in the unused row 5 for the column parity to accumulate on (two `ternlog512`), and
+  pi writes column 0 to a spare pair, so one `xor512` both copies it back for chi and applies
+  iota. The rate goes in and
   in without scalar byte work: a full block is one 4 slot `load256` plus `ins64` for lane 16, spread
   over the rows with `permt2d512` / `permd512` (only the last, padded block goes through a buffer). Rejection sampling stays in vector registers: per rate row a
   `shufb512` byte swaps the big-endian samples, `cmp512` compares them with 5q (unused lanes have
@@ -46,11 +50,11 @@ tampered messages and signatures rejected, CUs identical between interpreter and
 
 | | Blueshift (scalar sBPF) | Vector intrinsics |
 |---|---|---|
-| CUs, median (min, max) | 182,764 (172,264, 254,225) | **24,324** (22,694, 34,832), 7.5x fewer |
+| CUs, median (min, max) | 182,764 (172,264, 254,225) | **23,460** (21,926, 33,296), 7.8x fewer |
 | Program size | 99 KiB | 76 KiB |
 
-Where the CUs go (135 byte message, 25,735 CUs, before sampling moved to `cmp` + `compress`, which adds about 100): Keccak-f 14.4k (10 permutations of 1,441), the
-signature decoder 7.2k, the NTT / product / norms 2.8k, sampling, absorbing and glue 1.2k.
+Where the CUs go (135 byte message, 24,883 CUs): Keccak-f 13.45k (10 permutations of 1,345), the
+signature decoder 7.2k, the NTT / product / norms 2.8k, sampling, absorbing and glue 1.3k.
 
 | Change | CUs (135 byte message) |
 |---|---|
@@ -67,6 +71,7 @@ signature decoder 7.2k, the NTT / product / norms 2.8k, sampling, absorbing and 
 | Rejection sampling with `shufb512` + `compresslt16x32` | 27,859 |
 | `mont16` (one op per Montgomery product), message blocks absorbed from vector loads | 25,735 |
 | Sampling with the core `cmp512` + `compress512` instead of a fused op | 25,843 |
+| Keccak with 28 ops per round (free row 4 and column 0 copies) | 24,883 |
 
 ## Reproduce
 

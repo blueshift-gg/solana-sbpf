@@ -288,6 +288,28 @@ impl Runner {
         vm.execute_program(&self.executable, &mut mode, &mut self.call_frames)
     }
 
+    /// Interpreted run which also returns the pc of every executed instruction (profiling)
+    #[cfg(feature = "tracer")]
+    pub fn run_traced(&mut self) -> ((u64, ProgramResult), Vec<u64>) {
+        self.context.remaining = self.budget;
+        let stack_len = self.stack.len();
+        let mut vm = EbpfVm::new(
+            self.executable.get_loader().clone(),
+            self.executable.get_sbpf_version(),
+            &mut *self.context,
+            stack_len,
+        );
+        unsafe { vm.set_vector_memory(self.vector.host_ptr()) };
+        vm.registers[1] = ebpf::MM_INPUT_START;
+        let r = vm.execute_program(
+            &self.executable,
+            &mut ExecutionMode::Interpreted,
+            &mut self.call_frames,
+        );
+        let pcs = vm.register_trace.iter().map(|t| t[11]).collect();
+        (r, pcs)
+    }
+
     /// Runs without attaching [Self::vector], the VM allocates its own vector file
     pub fn run_detached(&mut self, engine: Engine) -> (u64, ProgramResult) {
         self.context.remaining = self.budget;

@@ -901,14 +901,19 @@ fn emit_fn(s: &mut String, name: &str, ops: &[Op]) {
 // Keccak-f[1600] on the vector intrinsics, 512 bit operations on 64 bit lanes
 //
 // Every row of the state is one slot pair (u64 lane x of pair y = A[x, y]), in 8 pairs so that
-// the 8 x 8 transpose applies; rows 5..8 and lanes 5..8 only ever hold values that never flow into
-// rows / lanes 0..5. A round:
-//   R layout (pair y = row y):    theta (column parity, two lane permutations, one rotation,
-//                                  a three input xor per row), rho (one variable rotation per row)
-//   pi:                           one lane permutation per pair turns the R into the C layout
-//   C layout (pair x = column x): chi in place (three input logic), iota (one xor)
+// the 8 x 8 transpose applies. Row 5 is a copy of row 4 (lanes 0..5): pi also copies row 4 into
+// lane 5 of every column, chi works lane by lane, so the transpose writes the copy back. Rows 6..8
+// and lanes 6..8 (5..8 outside row 5) only ever hold values that never flow into rows / lanes 0..5.
+// A round:
+//   R layout (pair y = row y):    theta (column parity accumulated on the row 4 copy, two lane
+//                                  permutations, one rotation, a three input xor per row), rho
+//                                  (one variable rotation per row)
+//   pi:                           one lane permutation per pair turns the R into the C layout;
+//                                  column 0 goes to a spare pair, one xor copies it back with iota
+//   C layout (pair x = column x): chi in place (three input logic), the row 0 copy already has
+//                                  iota's round constant
 //   transpose:                    back to the R layout
-// 30 operations per round. The rate rows go to and from guest memory with one load / store.
+// 28 operations per round. The rate rows go to and from guest memory with one load / store.
 
 mod shake {
     #![allow(dead_code)]
@@ -916,7 +921,6 @@ mod shake {
 }
 
 const K_STATE: u8 = 0; // 8 pairs
-const K_C: u8 = 16;
 const K_T0: u8 = 18;
 const K_T1: u8 = 20;
 const K_S0: u8 = 22;
@@ -1026,12 +1030,10 @@ fn keccak_table() -> Vec<[u32; 8]> {
         ));
     }
     for big_x in 0..5 {
-        pairs.push(lane_permutation(&|y| {
-            if y < 5 {
-                (big_x + 3 * y) % 5
-            } else {
-                y
-            }
+        pairs.push(lane_permutation(&|y| match y {
+            0..=4 => (big_x + 3 * y) % 5,
+            5 => (big_x + 3 * 4) % 5,
+            _ => y,
         }));
     }
     for rc in keccak_round_constants() {
@@ -1099,12 +1101,13 @@ fn keccak_f_ops() -> Vec<Op> {
     let row = |y: u8| K_STATE + 2 * y;
     let mut ops = Vec::new();
     for round in 0..24u8 {
-        // theta: C = column parities, D[x] = C[x - 1] ^ rotl(C[x + 1], 1), A[x, y] ^= D[x]
-        ops.push(w(Op::Xor(K_C, row(0), row(1))));
-        ops.push(w(Op::Tern(K_C, row(2), row(3), XOR3)));
-        ops.push(w(Op::Xor(K_C, K_C, row(4))));
-        ops.push(Op::PermdW(K_T0, K_C, K_IDX_M1));
-        ops.push(Op::PermdW(K_T1, K_C, K_IDX_P1));
+        // theta: C = column parities (on the row 4 copy), D[x] = C[x - 1] ^ rotl(C[x + 1], 1),
+        // A[x, y] ^= D[x]
+        let c = row(5);
+        ops.push(w(Op::Tern(c, row(0), row(1), XOR3)));
+        ops.push(w(Op::Tern(c, row(2), row(3), XOR3)));
+        ops.push(Op::PermdW(K_T0, c, K_IDX_M1));
+        ops.push(Op::PermdW(K_T1, c, K_IDX_P1));
         ops.push(w(Op::Rolv64(K_T1, K_T1, K_ONE)));
         for y in 0..5 {
             ops.push(w(Op::Tern(row(y), K_T0, K_T1, XOR3)));
@@ -1113,12 +1116,15 @@ fn keccak_f_ops() -> Vec<Op> {
         for y in 0..5 {
             ops.push(w(Op::Rolv64(row(y), row(y), K_RHO + 2 * y)));
         }
-        // pi: pair X lane Y <- lane (X + 3 Y) % 5, now pair x = column x
+        // pi: pair X lane Y <- lane (X + 3 Y) % 5 (lane 5 <- row 4), now pair x = column x.
+        // Column 0 goes to K_S0, chi needs it after overwriting it
         for x in 0..5 {
-            ops.push(Op::PermdW(row(x), row(x), K_PI + 2 * x));
+            let d = if x == 0 { K_S0 } else { row(x) };
+            ops.push(Op::PermdW(d, row(x), K_PI + 2 * x));
         }
-        // chi in place: columns 0 and 1 are needed after they are overwritten
-        ops.push(w(Op::Mov(K_S0, row(0))));
+        // iota on the copy chi overwrites (only lane 0 of the constant is set)
+        ops.push(w(Op::Xor(row(0), K_S0, K_RC + 2 * round)));
+        // chi in place: column 1 is needed after it is overwritten too
         ops.push(w(Op::Mov(K_S1, row(1))));
         for x in 0..5u8 {
             let col = |c: u8| {
@@ -1132,8 +1138,6 @@ fn keccak_f_ops() -> Vec<Op> {
             };
             ops.push(w(Op::Tern(row(x), col(1), col(2), CHI)));
         }
-        // iota
-        ops.push(w(Op::Xor(row(0), row(0), K_RC + 2 * round)));
         // back to the R layout
         ops.push(Op::TransposeQW(K_STATE));
     }
@@ -1312,15 +1316,21 @@ fn keccak_self_test(f: &[Op], absorb: &[Op], absorb_block: &[Op], init: &[Op]) {
             .wrapping_mul(0x0123_4567_89ab_cdef)
             .rotate_left(i as u32 * 7)
     });
-    for i in 0..25 {
-        lane_set(&mut region, K_STATE + 2 * (i / 5) as u8, i % 5, a[i]);
+    // Row 5 holds a copy of row 4
+    for i in 0..30 {
+        lane_set(
+            &mut region,
+            K_STATE + 2 * (i / 5) as u8,
+            i % 5,
+            a[i.min(20 + i % 5)],
+        );
     }
     simulate(f, &mut region, &|_, row| table[row]);
     keccak_f_ref(&mut a);
-    for i in 0..25 {
+    for i in 0..30 {
         assert_eq!(
             lane_get(&region, K_STATE + 2 * (i / 5) as u8, i % 5),
-            a[i],
+            a[i.min(20 + i % 5)],
             "keccak lane {i}"
         );
     }
