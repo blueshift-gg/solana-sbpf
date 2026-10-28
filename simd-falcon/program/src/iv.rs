@@ -59,7 +59,8 @@ define_syscall!(fn sol_avx512_transpose8x8q(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_blendw512(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_ror32x16(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_shufb512(ops: u64) -> u64);
-define_syscall!(fn sol_avx512_compresslt16x32(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_cmp512(ops: u64) -> u64);
+define_syscall!(fn sol_avx512_compress512(ops: u64, mask: u64) -> u64);
 define_syscall!(fn sol_avx2_mont16x16(ops: u64) -> u64);
 define_syscall!(fn sol_avx512_permt2d512(ops: u64) -> u64);
 define_syscall!(fn sol_avx_ins64(ops: u64, value: u64) -> u64);
@@ -217,11 +218,16 @@ pub fn ror512(d: u8, a: u8, n: u8) {
 pub fn shufb512(d: u8, a: u8, idx: u8) {
     unsafe { sol_avx512_shufb512(ops3(d, a, idx)) };
 }
-/// The u16 of `a` below the u16 of `b` (unsigned), in order, packed into the low end of `d` (rest
-/// zero); returns their number
+/// Lane mask of `pred(a, b)` over the pairs; `imm` = predicate | 8 (unsigned) | lane size << 4
 #[inline(always)]
-pub fn compresslt16x32(d: u8, a: u8, b: u8) -> u64 {
-    unsafe { sol_avx512_compresslt16x32(ops3(d, a, b)) }
+pub fn cmp512(a: u8, b: u8, imm: u8) -> u64 {
+    unsafe { sol_avx512_cmp512(a as u64 | (b as u64) << 8 | (imm as u64) << 16) }
+}
+/// The lanes of `a` (of `8 << size` bits) whose mask bit is set, packed into the low lanes of `d`
+/// (rest zero); returns their number
+#[inline(always)]
+pub fn compress512(d: u8, a: u8, size: u8, mask: u64) -> u64 {
+    unsafe { sol_avx512_compress512(d as u64 | (a as u64) << 8 | (size as u64) << 16, mask) }
 }
 /// Montgomery product of i16 lanes: `d = mulhi(a, w) - mulhi(mullo(a, w'), q)`, `w'` in slot `w + 2`,
 /// `q` in slot `q` (slots below 128), 512 bit form if `wide`

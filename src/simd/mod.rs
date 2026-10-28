@@ -127,9 +127,7 @@ pub const VSHUFB: u8 = 0x25;
 /// `v[vd][i] = (v[vd] ++ v[vb])[v[va][i] & (2 L - 1)]` for `L` u32 lanes per operand: two table
 /// permutation, the first table is overwritten (vpermt2d)
 pub const VPERMT2D: u8 = 0x26;
-/// The u16 lanes `i` of `v[va]` with `v[va][i] < v[vb][i]` (unsigned), in order, packed into the
-/// low lanes of `v[vd]` (the others zero); `r[dst]` = their number (vpcmpuw + vpcompressw)
-pub const VCOMPRESSLT16: u8 = 0x27;
+// 0x27 is reserved (a removed fused compare + compress)
 /// `v[vd].u64[i] = v[va].u64[i] + v[vb].u64[i]` (wrapping)
 pub const VADD64: u8 = 0x28;
 /// `v[vd].u64[i] = v[va].u64[i] - v[vb].u64[i]` (wrapping)
@@ -219,20 +217,80 @@ pub const VMULTISHIFT: u8 = 0x4c;
 pub const VGF2P8AFFINE: u8 = 0x4d;
 /// Per byte product in GF(2^8) modulo x^8 + x^4 + x^3 + x + 1 (gf2p8mulb)
 pub const VGF2P8MUL: u8 = 0x4e;
-/// One AES round per 128 bit lane on the state `v[va]` with the round key `v[vb]` (aesenc,
-/// aesenclast, aesdec, aesdeclast)
-pub const VAESENC: u8 = 0x4f;
-#[allow(missing_docs)]
-pub const VAESENCLAST: u8 = 0x50;
-#[allow(missing_docs)]
-pub const VAESDEC: u8 = 0x51;
-#[allow(missing_docs)]
-pub const VAESDECLAST: u8 = 0x52;
+// 0x4f..=0x52 are reserved (removed AES rounds)
 /// Per 128 bit lane, the carry-less product of u64 `off & 1` of `v[va]` and u64 `(off >> 4) & 1` of
 /// `v[vb]` (pclmulqdq)
 pub const VCLMUL: u8 = 0x53;
+/// Per lane minimum / maximum; `off` = lane size (log2 bytes) | 4 if unsigned (vpmin* / vpmax*)
+pub const VMIN: u8 = 0x54;
+#[allow(missing_docs)]
+pub const VMAX: u8 = 0x55;
+/// Per lane absolute value (the minimum stays), lanes of `8 << off` bits (vpabs*)
+pub const VABS: u8 = 0x56;
+/// Saturating add / subtract; `off` = lane size (0: 8, 1: 16 bit) | 4 if unsigned (vpadds*,
+/// vpaddus*, vpsubs*, vpsubus*)
+pub const VADDS: u8 = 0x57;
+#[allow(missing_docs)]
+pub const VSUBS: u8 = 0x58;
+/// Unsigned rounding average `(a + b + 1) >> 1`, lanes of `8 << off` bits (`off` 0 / 1) (vpavg*)
+pub const VAVG: u8 = 0x59;
+/// Wrapping u8 add / subtract
+pub const VADD8: u8 = 0x5a;
+#[allow(missing_docs)]
+pub const VSUB8: u8 = 0x5b;
+/// High half of unsigned 16 x 16 bit products (vpmulhuw)
+pub const VMULHU16: u8 = 0x5c;
+/// `(a * b + 0x4000) >> 15` on i16 (vpmulhrsw)
+pub const VMULHRS16: u8 = 0x5d;
+/// `(a.u64[i] as i32 as i64) * (b.u64[i] as i32 as i64)` (vpmuldq)
+pub const VMULS32: u8 = 0x5e;
+/// u8 x i8 products summed in pairs into i16 with signed saturation (vpmaddubsw)
+pub const VMADDUBS16: u8 = 0x5f;
+/// The lanes of `v[va]` truncated into the low part of `v[vd]` (the rest zero); `off` = source lane
+/// size | destination lane size << 2, destination smaller (vpmov{wb,db,qb,dw,qw,qd})
+pub const VTRUNC: u8 = 0x60;
+/// u64 lanes permuted by the immediate within each 256 bit half (vpermq imm)
+pub const VPERMQ: u8 = 0x61;
+/// `v[vd].u16[i] = v[va].u16[v[vb].u16[i] & (n - 1)]` over all `n` u16 lanes (vpermw)
+pub const VPERMW: u8 = 0x62;
+/// Per 128 bit lane, bytes `off..off + 16` of (b lane ++ a lane), zeros beyond (vpalignr)
+pub const VALIGNR: u8 = 0x63;
+/// Per 128 bit lane, the low (high) four u16 permuted by the immediate (vpshuflw / vpshufhw)
+pub const VSHUFLW: u8 = 0x64;
+#[allow(missing_docs)]
+pub const VSHUFHW: u8 = 0x65;
+/// `v[vd][i]` = bit mask of the lanes `j < i` equal to lane `i`, lanes of `8 << off` bits (2 / 3)
+/// (vpconflict*)
+pub const VCONFLICT: u8 = 0x66;
+/// `r[dst]` = bit `i` set if `v[va][i] & v[vb][i] != 0` (== 0 if `off & 4`), lanes of
+/// `8 << (off & 3)` bits (vptestm* / vptestnm*)
+pub const VTESTM: u8 = 0x67;
+/// `v[vd].i32[i] += sum of the four u8 x i8 (i16 x i16 pairs for dpwssd) products of lane i`,
+/// wrapping (vpdpbusd / vpdpwssd)
+pub const VDPBUSD: u8 = 0x68;
+#[allow(missing_docs)]
+pub const VDPWSSD: u8 = 0x69;
+/// Sum of absolute u8 differences of each 8 byte group into its u64 lane (vpsadbw)
+pub const VSADBW: u8 = 0x6a;
+/// Funnel shifts by the immediate: `off` = count | lane size << 6 (1..3: 16, 32, 64 bit);
+/// shld `(a << c) | (b >> (w - c))`, shrd `(a >> c) | (b << (w - c))` (vpshld* / vpshrd*)
+pub const VSHLD: u8 = 0x6b;
+#[allow(missing_docs)]
+pub const VSHRD: u8 = 0x6c;
+/// Funnel shifts by the lanes of `v[vb]` (mod w) into the accumulator `v[vd]`: shldv
+/// `(d << c) | (a >> (w - c))`, shrdv `(d >> c) | (a << (w - c))`; `off` = lane size (1..3)
+/// (vpshldv* / vpshrdv*)
+pub const VSHLDV: u8 = 0x6d;
+#[allow(missing_docs)]
+pub const VSHRDV: u8 = 0x6e;
+/// Masked load / store of the lanes of `8 << vb` bits whose bit is set in `r[dst]` (the mask
+/// register) at `r[src] + off`: only the span of the set lanes is translated, unset lanes load as
+/// zero and are not written
+pub const VLOADM: u8 = 0x6f;
+#[allow(missing_docs)]
+pub const VSTOREM: u8 = 0x70;
 /// Number of defined sub-operations
-pub const SUBOP_COUNT: u8 = 0x54;
+pub const SUBOP_COUNT: u8 = 0x71;
 
 /// 512 bit flag in the immediate
 pub const WIDE: u32 = 1 << 24;
@@ -263,27 +321,106 @@ pub struct VecInsn {
     pub off: i16,
 }
 
+/// Sub-operation numbers which are not (or no longer) defined
+pub fn is_reserved(subop: u8) -> bool {
+    matches!(subop, 0x27 | 0x4f..=0x52) || subop >= SUBOP_COUNT
+}
+
 /// Sub-operations which have a 512 bit form
 pub fn has_wide_form(subop: u8) -> bool {
-    !matches!(subop, VLOAD | VSTORE | VTRANSPOSE8 | VINS64 | VEXT64) && subop < SUBOP_COUNT
+    !matches!(subop, VLOAD | VSTORE | VTRANSPOSE8 | VINS64 | VEXT64) && !is_reserved(subop)
+}
+
+/// Masked load / store with one translation of the span of the set lanes (lanes of `1 << size`
+/// bytes, `halves` 256 bit halves)
+#[allow(clippy::too_many_arguments)]
+pub fn transfer_masked(
+    store: bool,
+    slot: u8,
+    size: u32,
+    halves: usize,
+    mask: u64,
+    vm_addr: u64,
+    vector_base: *mut u8,
+    mapping: &mut MemoryMapping,
+) -> Result<(), EbpfError> {
+    if vector_base.is_null() {
+        return Err(EbpfError::UnsupportedInstruction);
+    }
+    let (s, n) = (1usize << size, (ebpf::VECTOR_WIDTH * halves) >> size);
+    let mask = if n == 64 { mask } else { mask & ((1u64 << n) - 1) };
+    let vector = unsafe { vector_base.add(slot as usize * ebpf::VECTOR_WIDTH) };
+    if mask == 0 {
+        if !store {
+            unsafe { std::ptr::write_bytes(vector, 0, n * s) };
+        }
+        return Ok(());
+    }
+    let (first, last) = (mask.trailing_zeros() as usize, 63 - mask.leading_zeros() as usize);
+    let access_type = if store { AccessType::Store } else { AccessType::Load };
+    let span = ((last - first + 1) * s) as u64;
+    let host = match mapping.map_with_access_violation_handler(access_type, vm_addr.wrapping_add((first * s) as u64), span) {
+        StableResult::Ok(host) => host.ptr().cast::<u8>() as usize as *mut u8,
+        StableResult::Err(err) => return Err(err),
+    };
+    for i in 0..n {
+        let lane = unsafe { vector.add(i * s) };
+        if (mask >> i) & 1 != 0 {
+            let mem = unsafe { host.add((i - first) * s) };
+            unsafe {
+                if store {
+                    std::ptr::copy_nonoverlapping(lane, mem, s);
+                } else {
+                    std::ptr::copy_nonoverlapping(mem, lane, s);
+                }
+            }
+        } else if !store {
+            unsafe { std::ptr::write_bytes(lane, 0, s) };
+        }
+    }
+    Ok(())
+}
+
+/// Entry point of the JIT for [transfer_masked]: `spec` = `store | slot << 8 | size << 16 |
+/// halves << 24`
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_transfer_masked(
+    result: *mut ProgramResult,
+    mapping: *mut MemoryMapping,
+    vector_base: *mut u8,
+    vm_addr: u64,
+    spec: u64,
+    mask: u64,
+) {
+    let (store, slot, size, halves) = (spec & 1 != 0, (spec >> 8) as u8, ((spec >> 16) & 0xff) as u32, (spec >> 24) as usize);
+    unsafe {
+        if let Err(err) = transfer_masked(store, slot, size, halves, mask, vm_addr, vector_base, &mut *mapping) {
+            *result = ProgramResult::Err(err);
+        }
+    }
 }
 
 /// Sub-operations which read the scalar source register
 pub fn uses_src(subop: u8) -> bool {
-    matches!(subop, VLOAD | VSTORE | VBCAST32 | VBCAST64 | VINS64 | VBLENDM | VCOMPRESS | VEXPAND)
+    matches!(subop, VLOAD | VSTORE | VBCAST32 | VBCAST64 | VINS64 | VBLENDM | VCOMPRESS | VEXPAND | VLOADM | VSTOREM)
+}
+
+/// Sub-operations which read a mask from the register in the `dst` field (masked load / store)
+pub fn reads_mask_register(subop: u8) -> bool {
+    matches!(subop, VLOADM | VSTOREM)
 }
 
 /// Sub-operations which write the scalar destination register
 pub fn writes_dst(subop: u8) -> bool {
-    matches!(subop, VEXT64 | VMOVMSK8 | VCOMPRESSLT16 | VCMP | VCOMPRESS)
+    matches!(subop, VEXT64 | VMOVMSK8 | VCMP | VCOMPRESS | VTESTM)
 }
 
 /// Operand validation shared by the opcode form and the intrinsic call form
 pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
-    if op.subop >= SUBOP_COUNT || op.src > 10 || op.dst > 9 {
+    if is_reserved(op.subop) || op.src > 10 || op.dst > 9 {
         return None;
     }
-    if (!uses_src(op.subop) && op.src != 0) || (!writes_dst(op.subop) && op.dst != 0) {
+    if (!uses_src(op.subop) && op.src != 0) || (!writes_dst(op.subop) && !reads_mask_register(op.subop) && op.dst != 0) {
         return None;
     }
     let off_ok = match op.subop {
@@ -300,6 +437,17 @@ pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
         VLZCNT => (2..4).contains(&op.off),
         VGF2P8AFFINE => (0..256).contains(&op.off),
         VCLMUL => op.off & !0x11 == 0,
+        VMIN | VMAX | VTESTM => (0..8).contains(&op.off),
+        VABS => (0..4).contains(&op.off),
+        VADDS | VSUBS => (0..8).contains(&op.off) && op.off & 3 < 2,
+        VAVG => (0..2).contains(&op.off),
+        VTRUNC => (0..16).contains(&op.off) && (op.off >> 2) < (op.off & 3),
+        VPERMQ | VSHUFLW | VSHUFHW => (0..256).contains(&op.off),
+        VALIGNR => (0..32).contains(&op.off),
+        VCONFLICT => (2..4).contains(&op.off),
+        VSHLD | VSHRD => (1..4).contains(&(op.off >> 6)) && op.off < 256 && (op.off & 63) < 8 << (op.off >> 6),
+        VSHLDV | VSHRDV => (1..4).contains(&op.off),
+        VLOADM | VSTOREM => true,
         VCMP => (0..64).contains(&op.off),
         VBLENDM | VCOMPRESS | VEXPAND => (0..4).contains(&op.off),
         VMONT16 => (0..ebpf::VECTOR_SLOTS as i16 - op.halves() as i16 + 1).contains(&op.off) && op.vb as usize + 2 + op.halves() <= ebpf::VECTOR_SLOTS,
@@ -311,6 +459,7 @@ pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
     match op.subop {
         VTRANSPOSE8 if op.vd as usize > ebpf::VECTOR_SLOTS - 8 => return None,
         VTRANSPOSE64 if op.vd as usize > ebpf::VECTOR_SLOTS - if op.wide { 16 } else { 4 } => return None,
+        VLOADM | VSTOREM if op.vb > 3 => return None,
         VLOAD | VSTORE => {
             let first = if op.subop == VLOAD { op.vd } else { op.va } as usize;
             if op.vb as usize >= MAX_TRANSFER_SLOTS || first + op.vb as usize >= ebpf::VECTOR_SLOTS {
@@ -319,7 +468,8 @@ pub(crate) fn validate_slot_op(op: &VecInsn) -> Option<()> {
         }
         _ => {}
     }
-    if op.wide && (!has_wide_form(op.subop) || (op.vd | op.va | op.vb) & 1 != 0 || (op.subop == VMONT16 && op.off & 1 != 0)) {
+    let vb_slot = if reads_mask_register(op.subop) { 0 } else { op.vb };
+    if op.wide && (!has_wide_form(op.subop) || (op.vd | op.va | vb_slot) & 1 != 0 || (op.subop == VMONT16 && op.off & 1 != 0)) {
         return None;
     }
     Some(())
@@ -583,47 +733,6 @@ pub fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     r
 }
 
-/// The AES S-box (`inverse`: its inverse), from the multiplicative inverse and the affine map
-pub fn aes_sbox(x: u8, inverse: bool) -> u8 {
-    let affine = |v: u8| v ^ v.rotate_left(1) ^ v.rotate_left(2) ^ v.rotate_left(3) ^ v.rotate_left(4) ^ 0x63;
-    let inv = |v: u8| if v == 0 { 0 } else { (1..=255u8).find(|y| gf_mul(v, *y) == 1).unwrap() };
-    if inverse {
-        (0..=255u8).find(|y| affine(inv(*y)) == x).unwrap()
-    } else {
-        affine(inv(x))
-    }
-}
-
-fn aes_tables() -> &'static ([u8; 256], [u8; 256]) {
-    static TABLES: std::sync::OnceLock<([u8; 256], [u8; 256])> = std::sync::OnceLock::new();
-    TABLES.get_or_init(|| (std::array::from_fn(|i| aes_sbox(i as u8, false)), std::array::from_fn(|i| aes_sbox(i as u8, true))))
-}
-
-/// One AES round on a 16 byte state (column major: byte `r + 4 c` is row `r`, column `c`), as
-/// aesenc / aesenclast / aesdec / aesdeclast
-pub fn aes_round(state: &[u8], key: &[u8], decrypt: bool, last: bool) -> [u8; 16] {
-    let (sbox, inv_sbox) = aes_tables();
-    // (Inv)ShiftRows
-    let shifted: [u8; 16] = std::array::from_fn(|i| {
-        let (r, c) = (i % 4, i / 4);
-        let from = if decrypt { (c + 4 - r) % 4 } else { (c + r) % 4 };
-        state[r + 4 * from]
-    });
-    // (Inv)SubBytes
-    let subbed: [u8; 16] = std::array::from_fn(|i| if decrypt { inv_sbox[shifted[i] as usize] } else { sbox[shifted[i] as usize] });
-    // (Inv)MixColumns
-    let coefficients: [u8; 4] = if decrypt { [14, 11, 13, 9] } else { [2, 3, 1, 1] };
-    let mixed: [u8; 16] = if last {
-        subbed
-    } else {
-        std::array::from_fn(|i| {
-            let (r, c) = (i % 4, i / 4);
-            (0..4).fold(0, |acc, k| acc ^ gf_mul(coefficients[(k + 4 - r) % 4], subbed[k + 4 * c]))
-        })
-    };
-    std::array::from_fn(|i| mixed[i] ^ key[i])
-}
-
 /// Carry-less product of two u64
 pub fn clmul(a: u64, b: u64) -> u128 {
     (0..64).filter(|i| (b >> i) & 1 != 0).fold(0u128, |r, i| r ^ (a as u128) << i)
@@ -708,10 +817,99 @@ fn compute_bytes(op: &VecInsn, a: &[u8], b: &[u8], d: &[u8]) -> Vec<u8> {
             (0..8).fold(0u8, |r, bit| r | ((((matrix[7 - bit] & a[i]).count_ones() as u8) & 1) ^ ((off >> bit) & 1) as u8) << bit)
         }).collect(),
         VGF2P8MUL => (0..n).map(|i| gf_mul(a[i], b[i])).collect(),
-        VAESENC | VAESENCLAST | VAESDEC | VAESDECLAST => (0..n / 16).flat_map(|lane| {
-            let r = 16 * lane..16 * lane + 16;
-            aes_round(&a[r.clone()], &b[r], matches!(op.subop, VAESDEC | VAESDECLAST), matches!(op.subop, VAESENCLAST | VAESDECLAST))
+        VMIN | VMAX => {
+            let size = 1usize << (off & 3);
+            let key = |v: u64| if off & 4 != 0 { v as i128 } else { sext(v, size) as i64 as i128 };
+            lanewise(size, &|x, y| if (key(x) < key(y)) == (op.subop == VMIN) { x } else { y })
+        }
+        VABS => {
+            let size = 1usize << off;
+            lanewise(size, &|x, _| (sext(x, size) as i64).unsigned_abs())
+        }
+        VADDS | VSUBS => {
+            let size = 1usize << (off & 3);
+            let bits = 8 * size as u32;
+            let (lo, hi, key): (i64, i64, &dyn Fn(u64) -> i64) = if off & 4 != 0 {
+                (0, (1 << bits) - 1, &|v| v as i64)
+            } else {
+                (-(1 << (bits - 1)), (1 << (bits - 1)) - 1, &|v| sext(v, size) as i64)
+            };
+            lanewise(size, &|x, y| {
+                let r = if op.subop == VADDS { key(x) + key(y) } else { key(x) - key(y) };
+                r.clamp(lo, hi) as u64
+            })
+        }
+        VAVG => lanewise(1 << off, &|x, y| (x + y + 1) >> 1),
+        VADD8 => lanewise(1, &|x, y| x.wrapping_add(y)),
+        VSUB8 => lanewise(1, &|x, y| x.wrapping_sub(y)),
+        VMULHU16 => lanewise(2, &|x, y| (x * y) >> 16),
+        VMULHRS16 => lanewise(2, &|x, y| ((sext(x, 2) as i64 * sext(y, 2) as i64 + 0x4000) >> 15) as u64),
+        VMULS32 => lanewise(8, &|x, y| (x as i32 as i64).wrapping_mul(y as i32 as i64) as u64),
+        VMADDUBS16 => (0..n / 2).flat_map(|i| {
+            let p = |k: usize| a[2 * i + k] as i32 * b[2 * i + k] as i8 as i32;
+            ((p(0) + p(1)).clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_le_bytes()
         }).collect(),
+        VTRUNC => {
+            let (from, to) = (1usize << (off & 3), 1usize << (off >> 2));
+            let mut out: Vec<u8> = lanes_of(a, from).iter().flat_map(|v| v.to_le_bytes()[..to].to_vec()).collect();
+            out.resize(n, 0);
+            out
+        }
+        VPERMQ => {
+            let q = lanes_of(a, 8);
+            from_lanes(&(0..q.len()).map(|i| q[(i & !3) + ((off as usize >> (2 * (i % 4))) & 3)]).collect::<Vec<_>>(), 8)
+        }
+        VPERMW => {
+            let (x, idx) = (lanes_of(a, 2), lanes_of(b, 2));
+            from_lanes(&idx.iter().map(|j| x[*j as usize % x.len()]).collect::<Vec<_>>(), 2)
+        }
+        VALIGNR => (0..n).map(|i| {
+            let (lane, k) = (i / 16, i % 16 + off as usize);
+            match k { 0..=15 => b[16 * lane + k], 16..=31 => a[16 * lane + k - 16], _ => 0 }
+        }).collect(),
+        VSHUFLW | VSHUFHW => {
+            let w = lanes_of(a, 2);
+            let high = op.subop == VSHUFHW;
+            from_lanes(&(0..w.len()).map(|i| {
+                let (quad, k) = (i / 4, i % 4);
+                if (quad % 2 == 1) == high { w[4 * quad + ((off as usize >> (2 * k)) & 3)] } else { w[i] }
+            }).collect::<Vec<_>>(), 2)
+        }
+        VCONFLICT => {
+            let size = 1usize << off;
+            let x = lanes_of(a, size);
+            from_lanes(&(0..x.len()).map(|i| (0..i).filter(|&j| x[j] == x[i]).fold(0u64, |m, j| m | 1 << j)).collect::<Vec<_>>(), size)
+        }
+        VDPBUSD => (0..n / 4).flat_map(|i| {
+            let acc = u32::from_le_bytes(d[4 * i..4 * i + 4].try_into().unwrap()) as i32;
+            (0..4).fold(acc, |s, k| s.wrapping_add(a[4 * i + k] as i32 * b[4 * i + k] as i8 as i32)).to_le_bytes()
+        }).collect(),
+        VDPWSSD => (0..n / 4).flat_map(|i| {
+            let acc = u32::from_le_bytes(d[4 * i..4 * i + 4].try_into().unwrap()) as i32;
+            let w = |x: &[u8], k: usize| i16::from_le_bytes([x[4 * i + 2 * k], x[4 * i + 2 * k + 1]]) as i32;
+            (0..2).fold(acc, |s, k| s.wrapping_add(w(a, k).wrapping_mul(w(b, k)))).to_le_bytes()
+        }).collect(),
+        VSADBW => (0..n / 8).flat_map(|g| (0..8).map(|k| (a[8 * g + k] as i64 - b[8 * g + k] as i64).unsigned_abs()).sum::<u64>().to_le_bytes()).collect(),
+        VSHLD | VSHRD => {
+            let (size, c) = (1usize << (off >> 6), off & 63);
+            let bits = 8 * size as u32;
+            let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            lanewise(size, &|x, y| {
+                if c == 0 { return x; }
+                if op.subop == VSHLD { (x << c | y >> (bits - c)) & mask } else { (x >> c | y << (bits - c)) & mask }
+            })
+        }
+        VSHLDV | VSHRDV => {
+            let size = 1usize << off;
+            let bits = 8 * size as u64;
+            let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            let (acc, x, cnt) = (lanes_of(d, size), lanes_of(a, size), lanes_of(b, size));
+            from_lanes(&(0..acc.len()).map(|i| {
+                let c = cnt[i] % bits;
+                if c == 0 { return acc[i]; }
+                if op.subop == VSHLDV { (acc[i] << c | x[i] >> (bits - c)) & mask } else { (acc[i] >> c | x[i] << (bits - c)) & mask }
+            }).collect::<Vec<_>>(), size)
+        }
         VCLMUL => (0..n / 16).flat_map(|lane| {
             let q = |x: &[u8], k: u32| u64::from_le_bytes(x[16 * lane + 8 * k as usize..16 * lane + 8 * k as usize + 8].try_into().unwrap());
             clmul(q(a, off & 1), q(b, (off >> 4) & 1)).to_le_bytes()
@@ -784,6 +982,12 @@ pub fn interpret(
     vector_base: *mut u8,
     mapping: &mut MemoryMapping,
 ) -> Result<u64, EbpfError> {
+    if matches!(op.subop, VLOADM | VSTOREM) {
+        let vm_addr = reg[op.src as usize].wrapping_add(op.off as i64 as u64);
+        let slot = if op.subop == VLOADM { op.vd } else { op.va };
+        transfer_masked(op.subop == VSTOREM, slot, op.vb as u32, op.halves(), reg[op.dst as usize], vm_addr, vector_base, mapping)?;
+        return Ok(0);
+    }
     if matches!(op.subop, VLOAD | VSTORE) {
         let vm_addr = reg[op.src as usize].wrapping_add(op.off as i64 as u64);
         let slot = if op.subop == VLOAD { op.vd } else { op.va };
@@ -802,6 +1006,12 @@ pub fn interpret_registers(op: &VecInsn, reg: &[u64], vector_base: *mut u8) -> R
         // Byte level reference of the later operations
         let n = ebpf::VECTOR_WIDTH * op.halves();
         let bytes = |s: u8| -> Vec<u8> { unsafe { std::slice::from_raw_parts(vector_base.add(s as usize * ebpf::VECTOR_WIDTH), n) }.to_vec() };
+        if op.subop == VTESTM {
+            let size = 1usize << (op.off & 3);
+            let (a, b) = (lanes_of(&bytes(op.va), size), lanes_of(&bytes(op.vb), size));
+            let negate = op.off & 4 != 0;
+            return Ok((0..a.len()).filter(|&i| ((a[i] & b[i]) != 0) != negate).fold(0u64, |m, i| m | 1 << i));
+        }
         let out = compute_bytes(op, &bytes(op.va), &bytes(op.vb), &bytes(op.vd));
         unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), vector_base.add(op.vd as usize * ebpf::VECTOR_WIDTH), n) };
         return Ok(0);
@@ -908,16 +1118,6 @@ pub fn interpret_registers(op: &VecInsn, reg: &[u64], vector_base: *mut u8) -> R
             }
             return Ok(0);
         }
-        VCOMPRESSLT16 => {
-            let n = 16 * op.halves();
-            let word = |s: u8, i: usize| unsafe { std::ptr::read_unaligned(slot(s).add(2 * i).cast::<u16>()) };
-            let (a, b): (Vec<u16>, Vec<u16>) = (0..n).map(|i| (word(op.va, i), word(op.vb, i))).unzip();
-            let kept: Vec<u16> = (0..n).filter(|&i| a[i] < b[i]).map(|i| a[i]).collect();
-            for i in 0..n {
-                unsafe { std::ptr::write_unaligned(slot(op.vd).add(2 * i).cast::<u16>(), kept.get(i).copied().unwrap_or(0)) };
-            }
-            return Ok(kept.len() as u64);
-        }
         VMOVMSK8 => {
             let mut mask = 0u64;
             for i in 0..op.halves() * ebpf::VECTOR_WIDTH {
@@ -969,7 +1169,7 @@ pub fn interpret_registers(op: &VecInsn, reg: &[u64], vector_base: *mut u8) -> R
 
 /// Mnemonic of a sub-operation (the intrinsic name without `sol_<isa>_`, prefixed with `v`)
 pub fn mnemonic(subop: u8, wide: bool) -> String {
-    let name = if wide { intrinsics::NAMES_512[subop as usize] } else { Some(intrinsics::NAMES_256[subop as usize]) };
+    let name = intrinsics::name(subop, wide);
     match name {
         Some(name) => format!("v{}", name.splitn(3, '_').nth(2).unwrap()),
         None => "vinvalid".to_string(),
@@ -996,7 +1196,6 @@ pub fn disassemble(insn: &ebpf::Insn) -> String {
         VINS64 => format!("{name} v{vd}, r{}, {}", op.src, op.off),
         VEXT64 => format!("{name} r{}, v{va}, {}", op.dst, op.off),
         VMOVMSK8 => format!("{name} r{}, v{va}", op.dst),
-        VCOMPRESSLT16 => format!("{name} r{}, v{vd}, v{va}, v{vb}", op.dst),
         VCMP => format!("{name} r{}, v{va}, v{vb}, {:#x}", op.dst, op.off),
         VBLENDM => format!("{name} v{vd}, v{va}, v{vb}, r{}, {}", op.src, op.off),
         VCOMPRESS => format!("{name} r{}, v{vd}, v{va}, r{}, {}", op.dst, op.src, op.off),

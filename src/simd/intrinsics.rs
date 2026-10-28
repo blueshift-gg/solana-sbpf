@@ -31,91 +31,120 @@ use crate::{
 /// bit lane moves), `sol_avx2_` (AVX2 integer operations), `sol_avx512_` (AVX-512VL: rotates,
 /// three input logic, two table permutation). Every engine runs every operation, the JIT lowers the
 /// AVX-512 ones to short AVX2 sequences on hosts without AVX-512.
-pub const NAMES_256: [&str; SUBOP_COUNT as usize] = [
-    "sol_avx_load256",
-    "sol_avx_store256",
-    "sol_avx2_add32x8",
-    "sol_avx2_xor256",
-    "sol_avx2_and256",
-    "sol_avx2_or256",
-    "sol_avx512_ror32x8",
-    "sol_avx2_shufd256",
-    "sol_avx2_transpose8x8",
-    "sol_avx2_bcast32x8",
-    "sol_avx_mov256",
-    "sol_avx2_permd256",
-    "sol_avx2_blendd256",
-    "sol_avx2_sub32x8",
-    "sol_avx2_mullo32x8",
-    "sol_avx2_minu32x8",
-    "sol_avx2_srl32x8",
-    "sol_avx2_sll32x8",
-    "sol_avx2_sllv32x8",
-    "sol_avx2_srlv32x8",
-    "sol_avx2_andn256",
-    "sol_avx512_rolv32x8",
-    "sol_avx512_ternlog256",
-    "sol_avx2_add16x16",
-    "sol_avx2_sub16x16",
-    "sol_avx2_mullo16x16",
-    "sol_avx2_mulhi16x16",
-    "sol_avx2_minu16x16",
-    "sol_avx2_madd16x16",
-    "sol_avx2_blendw256",
-    "sol_avx_ins64",
-    "sol_avx_ext64",
-    "sol_avx2_bcast64x4",
-    "sol_avx2_movmsk8x32",
-    "sol_avx512_permi2d256",
-    "sol_avx512_rolv64x4",
-    "sol_avx2_transpose4x4q",
-    "sol_avx2_shufb256",
-    "sol_avx512_permt2d256",
-    "sol_avx512_compresslt16x16",
-    "sol_avx2_add64x4",
-    "sol_avx2_sub64x4",
-    "sol_avx2_sll64x4",
-    "sol_avx2_srl64x4",
-    "sol_avx512_sra64x4",
-    "sol_avx2_sllv64x4",
-    "sol_avx2_srlv64x4",
-    "sol_avx2_mulu32x4",
-    "sol_avx512_mullo64x4",
-    "sol_avx512_madd52lo64x4",
-    "sol_avx512_madd52hi64x4",
-    "sol_avx512_cmp256",
-    "sol_avx512_blendm256",
-    "sol_avx512_compress256",
-    "sol_avx512_expand256",
-    "sol_avx2_mont16x16",
-    "sol_avx2_sll16x16",
-    "sol_avx2_srl16x16",
-    "sol_avx2_sra16x16",
-    "sol_avx2_sra32x8",
-    "sol_avx512_sllv16x16",
-    "sol_avx512_srlv16x16",
-    "sol_avx512_srav16x16",
-    "sol_avx2_srav32x8",
-    "sol_avx512_srav64x4",
-    "sol_avx512_ror64x4",
-    "sol_avx2_unpacklo256",
-    "sol_avx2_unpackhi256",
-    "sol_avx2_packss256",
-    "sol_avx2_packus256",
-    "sol_avx2_zext256",
-    "sol_avx2_sext256",
-    "sol_avx512_popcnt256",
-    "sol_avx512_lzcnt256",
-    "sol_avx512_permb256",
-    "sol_avx512_permi2b256",
-    "sol_avx512_multishift256",
-    "sol_avx512_gf2p8affine256",
-    "sol_avx512_gf2p8mul256",
-    "sol_avx512_aesenc256",
-    "sol_avx512_aesenclast256",
-    "sol_avx512_aesdec256",
-    "sol_avx512_aesdeclast256",
-    "sol_avx512_clmul256",
+pub const NAMES_256: [Option<&str>; SUBOP_COUNT as usize] = [
+    Some("sol_avx_load256"),
+    Some("sol_avx_store256"),
+    Some("sol_avx2_add32x8"),
+    Some("sol_avx2_xor256"),
+    Some("sol_avx2_and256"),
+    Some("sol_avx2_or256"),
+    Some("sol_avx512_ror32x8"),
+    Some("sol_avx2_shufd256"),
+    Some("sol_avx2_transpose8x8"),
+    Some("sol_avx2_bcast32x8"),
+    Some("sol_avx_mov256"),
+    Some("sol_avx2_permd256"),
+    Some("sol_avx2_blendd256"),
+    Some("sol_avx2_sub32x8"),
+    Some("sol_avx2_mullo32x8"),
+    Some("sol_avx2_minu32x8"),
+    Some("sol_avx2_srl32x8"),
+    Some("sol_avx2_sll32x8"),
+    Some("sol_avx2_sllv32x8"),
+    Some("sol_avx2_srlv32x8"),
+    Some("sol_avx2_andn256"),
+    Some("sol_avx512_rolv32x8"),
+    Some("sol_avx512_ternlog256"),
+    Some("sol_avx2_add16x16"),
+    Some("sol_avx2_sub16x16"),
+    Some("sol_avx2_mullo16x16"),
+    Some("sol_avx2_mulhi16x16"),
+    Some("sol_avx2_minu16x16"),
+    Some("sol_avx2_madd16x16"),
+    Some("sol_avx2_blendw256"),
+    Some("sol_avx_ins64"),
+    Some("sol_avx_ext64"),
+    Some("sol_avx2_bcast64x4"),
+    Some("sol_avx2_movmsk8x32"),
+    Some("sol_avx512_permi2d256"),
+    Some("sol_avx512_rolv64x4"),
+    Some("sol_avx2_transpose4x4q"),
+    Some("sol_avx2_shufb256"),
+    Some("sol_avx512_permt2d256"),
+    None,
+    Some("sol_avx2_add64x4"),
+    Some("sol_avx2_sub64x4"),
+    Some("sol_avx2_sll64x4"),
+    Some("sol_avx2_srl64x4"),
+    Some("sol_avx512_sra64x4"),
+    Some("sol_avx2_sllv64x4"),
+    Some("sol_avx2_srlv64x4"),
+    Some("sol_avx2_mulu32x4"),
+    Some("sol_avx512_mullo64x4"),
+    Some("sol_avx512_madd52lo64x4"),
+    Some("sol_avx512_madd52hi64x4"),
+    Some("sol_avx512_cmp256"),
+    Some("sol_avx512_blendm256"),
+    Some("sol_avx512_compress256"),
+    Some("sol_avx512_expand256"),
+    Some("sol_avx2_mont16x16"),
+    Some("sol_avx2_sll16x16"),
+    Some("sol_avx2_srl16x16"),
+    Some("sol_avx2_sra16x16"),
+    Some("sol_avx2_sra32x8"),
+    Some("sol_avx512_sllv16x16"),
+    Some("sol_avx512_srlv16x16"),
+    Some("sol_avx512_srav16x16"),
+    Some("sol_avx2_srav32x8"),
+    Some("sol_avx512_srav64x4"),
+    Some("sol_avx512_ror64x4"),
+    Some("sol_avx2_unpacklo256"),
+    Some("sol_avx2_unpackhi256"),
+    Some("sol_avx2_packss256"),
+    Some("sol_avx2_packus256"),
+    Some("sol_avx2_zext256"),
+    Some("sol_avx2_sext256"),
+    Some("sol_avx512_popcnt256"),
+    Some("sol_avx512_lzcnt256"),
+    Some("sol_avx512_permb256"),
+    Some("sol_avx512_permi2b256"),
+    Some("sol_avx512_multishift256"),
+    Some("sol_avx512_gf2p8affine256"),
+    Some("sol_avx512_gf2p8mul256"),
+    None,
+    None,
+    None,
+    None,
+    Some("sol_avx512_clmul256"),
+    Some("sol_avx2_min256"),
+    Some("sol_avx2_max256"),
+    Some("sol_avx2_abs256"),
+    Some("sol_avx2_adds256"),
+    Some("sol_avx2_subs256"),
+    Some("sol_avx2_avg256"),
+    Some("sol_avx2_add8x32"),
+    Some("sol_avx2_sub8x32"),
+    Some("sol_avx2_mulhu16x16"),
+    Some("sol_avx2_mulhrs16x16"),
+    Some("sol_avx2_muls32x4"),
+    Some("sol_avx2_maddubs16x16"),
+    Some("sol_avx512_trunc256"),
+    Some("sol_avx2_permq256"),
+    Some("sol_avx512_permw256"),
+    Some("sol_avx2_alignr256"),
+    Some("sol_avx2_shuflw256"),
+    Some("sol_avx2_shufhw256"),
+    Some("sol_avx512_conflict256"),
+    Some("sol_avx512_testm256"),
+    Some("sol_avx512_dpbusd256"),
+    Some("sol_avx512_dpwssd256"),
+    Some("sol_avx2_sadbw256"),
+    Some("sol_avx512_shld256"),
+    Some("sol_avx512_shrd256"),
+    Some("sol_avx512_shldv256"),
+    Some("sol_avx512_shrdv256"),
+    Some("sol_avx512_loadm256"),
+    Some("sol_avx512_storem256"),
 ];
 
 /// Function names of the 512 bit forms (slot pairs, AVX-512F/BW), indexed by sub-operation
@@ -159,7 +188,7 @@ pub const NAMES_512: [Option<&str>; SUBOP_COUNT as usize] = [
     Some("sol_avx512_transpose8x8q"),
     Some("sol_avx512_shufb512"),
     Some("sol_avx512_permt2d512"),
-    Some("sol_avx512_compresslt16x32"),
+    None,
     Some("sol_avx512_add64x8"),
     Some("sol_avx512_sub64x8"),
     Some("sol_avx512_sll64x8"),
@@ -199,24 +228,55 @@ pub const NAMES_512: [Option<&str>; SUBOP_COUNT as usize] = [
     Some("sol_avx512_multishift512"),
     Some("sol_avx512_gf2p8affine512"),
     Some("sol_avx512_gf2p8mul512"),
-    Some("sol_avx512_aesenc512"),
-    Some("sol_avx512_aesenclast512"),
-    Some("sol_avx512_aesdec512"),
-    Some("sol_avx512_aesdeclast512"),
+    None,
+    None,
+    None,
+    None,
     Some("sol_avx512_clmul512"),
+    Some("sol_avx512_min512"),
+    Some("sol_avx512_max512"),
+    Some("sol_avx512_abs512"),
+    Some("sol_avx512_adds512"),
+    Some("sol_avx512_subs512"),
+    Some("sol_avx512_avg512"),
+    Some("sol_avx512_add8x64"),
+    Some("sol_avx512_sub8x64"),
+    Some("sol_avx512_mulhu16x32"),
+    Some("sol_avx512_mulhrs16x32"),
+    Some("sol_avx512_muls32x8"),
+    Some("sol_avx512_maddubs16x32"),
+    Some("sol_avx512_trunc512"),
+    Some("sol_avx512_permq512"),
+    Some("sol_avx512_permw512"),
+    Some("sol_avx512_alignr512"),
+    Some("sol_avx512_shuflw512"),
+    Some("sol_avx512_shufhw512"),
+    Some("sol_avx512_conflict512"),
+    Some("sol_avx512_testm512"),
+    Some("sol_avx512_dpbusd512"),
+    Some("sol_avx512_dpwssd512"),
+    Some("sol_avx512_sadbw512"),
+    Some("sol_avx512_shld512"),
+    Some("sol_avx512_shrd512"),
+    Some("sol_avx512_shldv512"),
+    Some("sol_avx512_shrdv512"),
+    Some("sol_avx512_loadm512"),
+    Some("sol_avx512_storem512"),
 ];
 
 /// Register holding the packed operands
 pub const OPERAND_REG: u8 = 1;
 /// Register holding the scalar operand
 pub const SCALAR_REG: u8 = 2;
+/// Register holding the mask of masked load / store
+pub const MASK_REG: u8 = 3;
 
 /// Function name of a sub-operation
 pub fn name(subop: u8, wide: bool) -> Option<&'static str> {
     if wide {
         NAMES_512.get(subop as usize).copied().flatten()
     } else {
-        NAMES_256.get(subop as usize).copied()
+        NAMES_256.get(subop as usize).copied().flatten()
     }
 }
 
@@ -254,6 +314,9 @@ pub fn hashes() -> Vec<(u32, u8, bool)> {
 /// cmp                    bits 0..7 va   bits 8..15 vb   bits 16..23 imm8 (predicate, signedness, lane size)
 /// blendm                 bits 0..7 vd   bits 8..15 va   bits 16..23 vb   bits 24..25 lane size (mask in r2)
 /// compress / expand      bits 0..7 vd   bits 8..15 va   bits 16..17 lane size (mask in r2)
+/// loadm / storem         bits 0..7 slot   bits 8..23 offset   bits 24..25 lane size (address r2, mask r3)
+/// testm                  bits 0..7 va   bits 8..15 vb   bits 16..23 imm8
+/// min / max / adds / subs / avg / alignr / shld / shrd / shldv / shrdv: 7 bit slots + imm8 as blendd
 /// mov                    bits 0..7 vd   bits 8..15 va
 /// blendd / blendw /      bits 0..6 vd   bits 7..13 va   bits 14..20 vb   bits 21..28 imm8 (slots < 128)
 /// ternlog
@@ -271,11 +334,14 @@ pub fn pack(op: &VecInsn) -> u64 {
         VEXT64 => va | imm << 8,
         VMOVMSK8 => va,
         VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 | VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64
-        | VPOPCNT | VLZCNT | VZEXT | VSEXT => vd | va << 8 | (imm & 0xff) << 16,
-        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL => {
+        | VPOPCNT | VLZCNT | VZEXT | VSEXT | VABS | VTRUNC | VPERMQ | VSHUFLW | VSHUFHW | VCONFLICT => vd | va << 8 | (imm & 0xff) << 16,
+        VCMP | VTESTM => va | vb << 8 | (imm & 0xff) << 16,
+        VLOADM => vd | imm << 8 | vb << 24,
+        VSTOREM => va | imm << 8 | vb << 24,
+        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL | VMIN | VMAX | VADDS | VSUBS | VAVG | VALIGNR | VSHLD
+        | VSHRD | VSHLDV | VSHRDV => {
             (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21
         }
-        VCMP => va | vb << 8 | (imm & 0xff) << 16,
         VBLENDM => vd | va << 8 | vb << 16 | (imm & 3) << 24,
         VCOMPRESS | VEXPAND => vd | va << 8 | (imm & 3) << 16,
         VBLENDD | VBLENDW | VTERNLOG => (vd & 0x7f) | (va & 0x7f) << 7 | (vb & 0x7f) << 14 | (imm & 0xff) << 21,
@@ -287,7 +353,7 @@ pub fn pack(op: &VecInsn) -> u64 {
 
 /// Decodes the packed operands, `None` if they are malformed (including any non canonical bits)
 pub fn unpack(subop: u8, wide: bool, packed: u64) -> Option<VecInsn> {
-    if subop >= SUBOP_COUNT || packed >> 29 != 0 {
+    if is_reserved(subop) || packed >> 29 != 0 {
         return None;
     }
     let byte = |shift: u32| ((packed >> shift) & 0xff) as u8;
@@ -300,12 +366,15 @@ pub fn unpack(subop: u8, wide: bool, packed: u64) -> Option<VecInsn> {
         VEXT64 => (va, off) = (byte(0), byte(8) as i16),
         VMOVMSK8 => va = byte(0),
         VROR32 | VSHUFD | VSRL32 | VSLL32 | VSLL64 | VSRL64 | VSRA64 | VSLL16 | VSRL16 | VSRA16 | VSRA32 | VROR64
-        | VPOPCNT | VLZCNT | VZEXT | VSEXT => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
-        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL => {
+        | VPOPCNT | VLZCNT | VZEXT | VSEXT | VABS | VTRUNC | VPERMQ | VSHUFLW | VSHUFHW | VCONFLICT => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
+        VCMP | VTESTM => (va, vb, off) = (byte(0), byte(8), byte(16) as i16),
+        VLOADM => (vd, off, vb) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16, byte(24)),
+        VSTOREM => (va, off, vb) = (byte(0), ((packed >> 8) & 0xffff) as u16 as i16, byte(24)),
+        VUNPCKLO | VUNPCKHI | VPACKSS | VPACKUS | VGF2P8AFFINE | VCLMUL | VMIN | VMAX | VADDS | VSUBS | VAVG | VALIGNR | VSHLD
+        | VSHRD | VSHLDV | VSHRDV => {
             let field = |shift: u32| ((packed >> shift) & 0x7f) as u8;
             (vd, va, vb, off) = (field(0), field(7), field(14), byte(21) as i16);
         }
-        VCMP => (va, vb, off) = (byte(0), byte(8), byte(16) as i16),
         VBLENDM => (vd, va, vb, off) = (byte(0), byte(8), byte(16), byte(24) as i16),
         VCOMPRESS | VEXPAND => (vd, va, off) = (byte(0), byte(8), byte(16) as i16),
         VBLENDD | VBLENDW | VTERNLOG => {
@@ -320,7 +389,9 @@ pub fn unpack(subop: u8, wide: bool, packed: u64) -> Option<VecInsn> {
         _ => (vd, va, vb) = (byte(0), byte(8), byte(16)),
     }
     let src = if uses_src(subop) { SCALAR_REG } else { 0 };
-    let op = VecInsn { subop, vd, va, vb, wide, dst: 0, src, off };
+    // Masked load / store take the mask in r3
+    let dst = if reads_mask_register(subop) { MASK_REG } else { 0 };
+    let op = VecInsn { subop, vd, va, vb, wide, dst, src, off };
     // The opcode form's validation (operand ranges), applied without its 6 bit slot encoding
     validate_slot_op(&op)?;
     (pack(&op) == packed).then_some(op)
@@ -387,10 +458,12 @@ pub fn register<C: ContextObject>(loader: &mut BuiltinProgram<C>) -> Result<(), 
         };
     }
     register!(false: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
-        56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83);
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+        56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 83,
+        84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112);
     register!(true: 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
-        56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83);
+        32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+        56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 83,
+        84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112);
     Ok(())
 }

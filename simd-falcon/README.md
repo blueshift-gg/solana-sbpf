@@ -19,8 +19,9 @@ Blueshift's example program, with Firedancer's verifier structure (`fd_falcon.c`
   with `ternlog512`, and `transpose8x8q` back to rows: 30 vector ops per round. The rate goes in and
   in without scalar byte work: a full block is one 4 slot `load256` plus `ins64` for lane 16, spread
   over the rows with `permt2d512` / `permd512` (only the last, padded block goes through a buffer). Rejection sampling stays in vector registers: per rate row a
-  `shufb512` byte swaps the big-endian samples, `compresslt16x32` keeps those below 5q in order and
-  returns their number, and one store appends them to the candidates (unused lanes have threshold 0).
+  `shufb512` byte swaps the big-endian samples, `cmp512` compares them with 5q (unused lanes have
+  threshold 0), `compress512` keeps the accepted ones in order and returns their number, and one
+  store appends them to the candidates.
 * **NTT, pointwise product, norm:** Cooley-Tukey forward / Gentleman-Sande inverse NTT over
   Z/12289 like Firedancer, written the way current AVX2 NTTs (Kyber, Dilithium) are: 16 signed
   16 bit coefficients per slot, Montgomery products as one `mont16` op (4 AVX2 instructions), lazy reduction
@@ -45,10 +46,10 @@ tampered messages and signatures rejected, CUs identical between interpreter and
 
 | | Blueshift (scalar sBPF) | Vector intrinsics |
 |---|---|---|
-| CUs, median (min, max) | 182,764 (172,264, 254,225) | **24,228** (22,598, 34,724), 7.5x fewer |
+| CUs, median (min, max) | 182,764 (172,264, 254,225) | **24,324** (22,694, 34,832), 7.5x fewer |
 | Program size | 99 KiB | 76 KiB |
 
-Where the CUs go (135 byte message, 25,735 CUs): Keccak-f 14.4k (10 permutations of 1,441), the
+Where the CUs go (135 byte message, 25,735 CUs, before sampling moved to `cmp` + `compress`, which adds about 100): Keccak-f 14.4k (10 permutations of 1,441), the
 signature decoder 7.2k, the NTT / product / norms 2.8k, sampling, absorbing and glue 1.2k.
 
 | Change | CUs (135 byte message) |
@@ -65,6 +66,7 @@ signature decoder 7.2k, the NTT / product / norms 2.8k, sampling, absorbing and 
 | Decoder without a call in its loop, constant offset stores | 30,758 |
 | Rejection sampling with `shufb512` + `compresslt16x32` | 27,859 |
 | `mont16` (one op per Montgomery product), message blocks absorbed from vector loads | 25,735 |
+| Sampling with the core `cmp512` + `compress512` instead of a fused op | 25,843 |
 
 ## Reproduce
 

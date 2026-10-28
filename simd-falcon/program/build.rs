@@ -1007,13 +1007,15 @@ fn keccak_f_ops() -> Vec<Op> {
 
 fn emit_take(s: &mut String) {
     writeln!(s, "/// Appends the accepted samples of the squeezed block (rate rows 0..4 of the state) at `p`:").unwrap();
-    writeln!(s, "/// per row, byte swap the big-endian u16, keep those below 5q in order (compress), store the").unwrap();
+    writeln!(s, "/// per row, byte swap the big-endian u16, compare them with 5q, compress the kept ones, store the").unwrap();
     writeln!(s, "/// pair at `p` and advance by their number. May write up to 32 values past the last accepted.").unwrap();
     writeln!(s, "#[inline(always)]\npub unsafe fn take_candidates(mut p: *mut u16) -> *mut u16 {{\n    use crate::iv::*;").unwrap();
     for y in 0..4u8 {
         let th = if y < 3 { K_TH_FULL } else { K_TH_LAST };
         writeln!(s, "    shufb512({K_SMP}, {}, {K_BSWAP});", K_STATE + 2 * y).unwrap();
-        writeln!(s, "    let c = compresslt16x32({K_SMP}, {K_SMP}, {th});").unwrap();
+        // u16 lanes below the threshold (unsigned): the mask, then the kept lanes packed
+        writeln!(s, "    let m = cmp512({K_SMP}, {th}, 0x19);").unwrap();
+        writeln!(s, "    let c = compress512({K_SMP}, {K_SMP}, 1, m);").unwrap();
         writeln!(s, "    store(p.cast(), {K_SMP}, 2);\n    p = p.add(c as usize);").unwrap();
     }
     writeln!(s, "    p\n}}").unwrap();
@@ -1079,7 +1081,7 @@ impl shake::Sponge for SimSponge<'_> {
     }
     fn squeeze(&mut self) {}
     fn take(&mut self, n: usize) -> usize {
-        // The generated code's semantics (shufb, compresslt16) on the model, with its constants
+        // The generated code's semantics (shufb, cmp, compress) on the model, with its constants
         assert_eq!(n, self.out.len());
         let words = |r: &[[u32; 8]; 256], pair: u8| -> Vec<u16> { r[pair as usize..pair as usize + 2].iter().flatten().flat_map(|w| [*w as u16, (*w >> 16) as u16]).collect() };
         let bytes = |r: &[[u32; 8]; 256], pair: u8| -> Vec<u8> { r[pair as usize..pair as usize + 2].iter().flatten().flat_map(|w| w.to_le_bytes()).collect() };

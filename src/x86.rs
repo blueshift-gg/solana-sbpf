@@ -1413,6 +1413,31 @@ mod evex_tests {
             (E::op(1, 2, false, 2, 0xdc, 16, 17, r(18), None), "62 a2 75 40 dc c2"),    // vaesenc zmm16, zmm17, zmm18
             (E::op(1, 2, false, 2, 0xdf, 16, 17, r(18), None), "62 a2 75 40 df c2"),    // vaesdeclast zmm16, zmm17, zmm18
             (E::op(1, 3, false, 2, 0x44, 16, 17, r(18), Some(0x11)), "62 a3 75 40 44 c2 11"), // vpclmulqdq zmm16, zmm17, zmm18, 0x11
+            (E::op(1, 2, true, 2, 0x39, 16, 17, r(18), None), "62 a2 f5 40 39 c2"),     // vpminsq zmm16, zmm17, zmm18
+            (E::op(1, 2, true, 2, 0x3f, 16, 17, r(18), None), "62 a2 f5 40 3f c2"),     // vpmaxuq zmm16, zmm17, zmm18
+            (E::op(1, 1, false, 2, 0xea, 16, 17, r(18), None), "62 a1 75 40 ea c2"),    // vpminsw zmm16, zmm17, zmm18
+            (E::op(1, 2, true, 2, 0x1f, 16, 0, r(17), None), "62 a2 fd 48 1f c1"),      // vpabsq zmm16, zmm17
+            (E::op(1, 1, false, 2, 0xdc, 16, 17, r(18), None), "62 a1 75 40 dc c2"),    // vpaddusb zmm16, zmm17, zmm18
+            (E::op(1, 2, true, 2, 0x28, 16, 17, r(18), None), "62 a2 f5 40 28 c2"),     // vpmuldq zmm16, zmm17, zmm18
+            (E::op(1, 2, false, 2, 0x0b, 16, 17, r(18), None), "62 a2 75 40 0b c2"),    // vpmulhrsw zmm16, zmm17, zmm18
+            (E::op(2, 2, false, 2, 0x30, 17, 0, r(16), None), "62 a2 7e 48 30 c8"),     // vpmovwb ymm16, zmm17
+            (E::op(2, 2, false, 2, 0x35, 17, 0, r(16), None), "62 a2 7e 48 35 c8"),     // vpmovqd ymm16, zmm17
+            (E::op(2, 2, false, 1, 0x32, 3, 0, r(4), None), "62 f2 7e 28 32 dc"),       // vpmovqb xmm4, ymm3
+            (E::op(1, 3, true, 2, 0x00, 16, 0, r(17), Some(0x1b)), "62 a3 fd 48 00 c1 1b"), // vpermq zmm16, zmm17, 0x1b
+            (E::op(1, 2, true, 2, 0x8d, 16, 17, r(18), None), "62 a2 f5 40 8d c2"),     // vpermw zmm16, zmm17, zmm18
+            (E::op(1, 3, false, 2, 0x0f, 16, 17, r(18), Some(5)), "62 a3 75 40 0f c2 05"), // vpalignr zmm16, zmm17, zmm18, 5
+            (E::op(3, 1, false, 2, 0x70, 16, 0, r(17), Some(0x1b)), "62 a1 7f 48 70 c1 1b"), // vpshuflw zmm16, zmm17, 0x1b
+            (E::op(2, 1, false, 2, 0x70, 16, 0, r(17), Some(0x1b)), "62 a1 7e 48 70 c1 1b"), // vpshufhw zmm16, zmm17, 0x1b
+            (E::op(1, 2, true, 2, 0xc4, 16, 0, r(17), None), "62 a2 fd 48 c4 c1"),      // vpconflictq zmm16, zmm17
+            (E::op(1, 2, false, 2, 0x26, 1, 16, r(17), None), "62 b2 7d 40 26 c9"),     // vptestmb k1, zmm16, zmm17
+            (E::op(2, 2, true, 2, 0x27, 1, 16, r(17), None), "62 b2 fe 40 27 c9"),      // vptestnmq k1, zmm16, zmm17
+            (E::op(1, 2, false, 2, 0x50, 16, 17, r(18), None), "62 a2 75 40 50 c2"),    // vpdpbusd zmm16, zmm17, zmm18
+            (E::op(1, 2, false, 2, 0x52, 16, 17, r(18), None), "62 a2 75 40 52 c2"),    // vpdpwssd zmm16, zmm17, zmm18
+            (E::op(1, 1, false, 2, 0xf6, 16, 17, r(18), None), "62 a1 75 40 f6 c2"),    // vpsadbw zmm16, zmm17, zmm18
+            (E::op(1, 3, true, 2, 0x71, 16, 17, r(18), Some(9)), "62 a3 f5 40 71 c2 09"), // vpshldq zmm16, zmm17, zmm18, 9
+            (E::op(1, 3, true, 2, 0x72, 16, 17, r(18), Some(3)), "62 a3 f5 40 72 c2 03"), // vpshrdw zmm16, zmm17, zmm18, 3
+            (E::op(1, 2, false, 2, 0x71, 16, 17, r(18), None), "62 a2 75 40 71 c2"),    // vpshldvd zmm16, zmm17, zmm18
+            (E::op(1, 2, true, 2, 0x73, 16, 17, r(18), None), "62 a2 f5 40 73 c2"),     // vpshrdvq zmm16, zmm17, zmm18
         ];
         for (insn, expected) in cases {
             let (bytes, len) = insn.encode();
@@ -1446,6 +1471,12 @@ mod evex_tests {
             (V::ymm(1, 1, 0xf6, 1, 2, VexRm::Reg(3), None), "c5 ed f6 cb"),     // vpsadbw ymm1, ymm2, ymm3
             (V::ymm(1, 2, 0xdc, 1, 2, VexRm::Reg(3), None), "c4 e2 6d dc cb"),  // vaesenc ymm1, ymm2, ymm3
             (V::ymm(1, 3, 0x44, 1, 2, VexRm::Reg(3), Some(0x10)), "c4 e3 6d 44 cb 10"), // vpclmulqdq ymm1, ymm2, ymm3, 0x10
+            (V::ymm(1, 2, 0x38, 1, 2, VexRm::Reg(3), None), "c4 e2 6d 38 cb"),  // vpminsb ymm1, ymm2, ymm3
+            (V::ymm(1, 2, 0x1e, 1, 0, VexRm::Reg(2), None), "c4 e2 7d 1e ca"),  // vpabsd ymm1, ymm2
+            (V::ymm(3, 1, 0x70, 1, 0, VexRm::Reg(2), Some(0x1b)), "c5 ff 70 ca 1b"), // vpshuflw ymm1, ymm2, 0x1b
+            (V::ymm(2, 1, 0x70, 1, 0, VexRm::Reg(2), Some(0x1b)), "c5 fe 70 ca 1b"), // vpshufhw ymm1, ymm2, 0x1b
+            (V::ymm(1, 3, 0x0f, 1, 2, VexRm::Reg(3), Some(7)), "c4 e3 6d 0f cb 07"), // vpalignr ymm1, ymm2, ymm3, 7
+            (V { l: false, ..V::alu(0x61, 1, 2, VexRm::Reg(15)) }, "c4 c1 69 61 cf"), // vpunpcklwd xmm1, xmm2, xmm15
             (V::movq_from_gpr(15, R9), "c4 41 f9 6e f9"),              // vmovq xmm15, r9
             (V::movq_to_gpr(RAX, 3), "c4 e1 f9 7e d8"),                // vmovq rax, xmm3
             (V::pextrq(R10, 15, 1), "c4 43 f9 16 fa 01"),              // vpextrq r10, xmm15, 1

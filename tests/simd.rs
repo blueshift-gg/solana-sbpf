@@ -295,20 +295,6 @@ fn op_cases() -> Vec<(&'static str, Body)> {
         a.wide(VPERMT2D, 2, 2, 6, 0, 0);
     })));
     for wide in [false, true] {
-        cases.push(("compresslt16", Box::new(move |a| {
-            use solana_sbpf::simd::VCOMPRESSLT16;
-            a.vsrl(4, 4, 1); // thresholds of about half the range
-            a.vsrl(5, 5, 1);
-            a.vop_full(VCOMPRESSLT16, wide, 0, 2, 4, 6, 0, 0);
-            a.vins64(15, 6, 0);
-            a.vop_full(VCOMPRESSLT16, wide, 8, 8, 4, 7, 0, 0); // destination aliases the data
-            a.vins64(15, 7, 1);
-            a.vop_full(VCOMPRESSLT16, wide, 10, 12, 10, 3, 0, 0); // destination aliases the thresholds
-            a.vins64(15, 3, 2);
-            a.vadd(1, 1, 0); // the result used by a cached op
-        })));
-    }
-    for wide in [false, true] {
         // Rosetta 2 shifts by the low bits of a 64 bit count in vpsllvq / vpsrlvq instead of giving 0
         // for counts above 63, so there the variable counts stay in range
         let in_range = solana_sbpf::simd::harness::running_under_rosetta();
@@ -384,14 +370,32 @@ fn op_cases() -> Vec<(&'static str, Body)> {
                 a.vop_full(subop, wide, 6, 6, 0, 0, 0, off);
             }
             for (subop, off) in [(VSLLV16, 0i16), (VSRLV16, 0), (VSRAV16, 0), (VSRAV32, 0), (VUNPCKLO, 1), (VUNPCKHI, 3), (VPACKSS, 0),
-                (VPACKUS, 1), (VPERMB, 0), (VMULTISHIFT, 0), (VGF2P8AFFINE, 0x63), (VGF2P8MUL, 0), (VAESENC, 0), (VAESENCLAST, 0),
-                (VAESDEC, 0), (VAESDECLAST, 0), (VCLMUL, 0x11), (VPERMI2B, 0)] {
+                (VPACKUS, 1), (VPERMB, 0), (VMULTISHIFT, 0), (VGF2P8AFFINE, 0x63), (VGF2P8MUL, 0), (VCLMUL, 0x11), (VPERMI2B, 0)] {
                 a.vop_full(subop, wide, d, x, y, 0, 0, off);
                 a.vop_full(subop, wide, 8, 8, y, 0, 0, off);
             }
             if !solana_sbpf::simd::harness::running_under_rosetta() {
                 a.vop_full(VSRAV64, wide, 10, x, y, 0, 0, 0);
             }
+        })));
+    }
+    for wide in [false, true] {
+        cases.push(("core_ops", Box::new(move |a| {
+            use solana_sbpf::simd::*;
+            let (d, x, y) = if wide { (0, 2, 4) } else { (0, 1, 2) };
+            for (subop, off) in [(VMIN, 0i16), (VMIN, 7), (VMAX, 3), (VMAX, 5), (VADDS, 0), (VADDS, 5), (VSUBS, 1), (VSUBS, 4), (VAVG, 1),
+                (VADD8, 0), (VSUB8, 0), (VMULHU16, 0), (VMULHRS16, 0), (VMULS32, 0), (VMADDUBS16, 0), (VSADBW, 0), (VALIGNR, 9),
+                (VPERMW, 0), (VDPBUSD, 0), (VDPWSSD, 0), (VSHLD, 5 | 2 << 6), (VSHRD, 9 | 3 << 6), (VSHLDV, 2), (VSHRDV, 3), (VSHLDV, 1)] {
+                a.vop_full(subop, wide, d, x, y, 0, 0, off);
+                a.vop_full(subop, wide, 8, 8, y, 0, 0, off);
+            }
+            for (subop, off) in [(VABS, 0i16), (VABS, 3), (VTRUNC, 1), (VTRUNC, 3 | 2 << 2), (VPERMQ, 0x1b), (VSHUFLW, 0x39), (VSHUFHW, 0x93),
+                (VCONFLICT, 2), (VCONFLICT, 3)] {
+                a.vop_full(subop, wide, d, x, 0, 0, 0, off);
+                a.vop_full(subop, wide, 10, 10, 0, 0, 0, off);
+            }
+            a.vop_full(VTESTM, wide, 0, x, y, 3, 0, 2);
+            a.vins64(15, 3, 0);
         })));
     }
     cases.push(("wide_bcast", Box::new(|a| {
@@ -655,7 +659,7 @@ fn wide_ops_reference() {
     use solana_sbpf::simd::{self, intrinsics::NAMES_512, VecInsn};
     let input = random_input(41);
     for subop in 0..simd::SUBOP_COUNT {
-        if NAMES_512[subop as usize].is_none() || subop >= simd::VSLL16 || matches!(subop, simd::VMOVMSK8 | simd::VBCAST32 | simd::VBCAST64 | simd::VTRANSPOSE64 | simd::VPERMT2D | simd::VCOMPRESSLT16 | simd::VMONT16 | simd::VCMP | simd::VBLENDM | simd::VCOMPRESS | simd::VEXPAND) {
+        if NAMES_512[subop as usize].is_none() || subop >= simd::VSLL16 || matches!(subop, simd::VMOVMSK8 | simd::VBCAST32 | simd::VBCAST64 | simd::VTRANSPOSE64 | simd::VPERMT2D | simd::VMONT16 | simd::VCMP | simd::VBLENDM | simd::VCOMPRESS | simd::VEXPAND) {
             continue;
         }
         let off = match subop {
@@ -718,21 +722,7 @@ fn wide_ops_reference() {
     for i in 0..8 {
         assert_eq!(q(&out, i), q(&input, 8 + i).rotate_left((q(&input, 16 + i) % 64) as u32));
     }
-    // compresslt16 (both widths), shufb and permt2d against the model
-    let w16 = |buf: &[u8], i: usize| u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]);
-    for wide in [false, true] {
-        let n = if wide { 32 } else { 16 };
-        let body = move |a: &mut Asm| {
-            a.vop_full(simd::VCOMPRESSLT16, wide, 0, 2, 4, 6, 0, 0);
-            a.vins64(15, 6, 0);
-        };
-        let (out, _) = run_op(&op_program(VecMode::Slot, &body), &input, Engine::Interpreter, SimdJitStrategy::Direct);
-        let kept: Vec<u16> = (0..n).filter(|&i| w16(&input, 32 + i) < w16(&input, 64 + i)).map(|i| w16(&input, 32 + i)).collect();
-        for i in 0..n {
-            assert_eq!(w16(&out, i), kept.get(i).copied().unwrap_or(0), "compresslt16 wide={wide} lane {i}");
-        }
-        assert_eq!(u64::from_le_bytes(out[15 * 32..15 * 32 + 8].try_into().unwrap()), kept.len() as u64);
-    }
+    // shufb and permt2d against the model
     let (out, _) = run_op(&op_program(VecMode::Slot, &|a| a.vop_full(simd::VSHUFB, false, 0, 1, 2, 0, 0, 0)), &input, Engine::Interpreter, SimdJitStrategy::Direct);
     for i in 0..32 {
         let idx = input[64 + i];
@@ -1487,7 +1477,7 @@ fn tiers_agree() {
     }
 }
 
-/// Without AVX-512, only 8 / 16 bit and 512 bit compress / expand take the host call
+/// Without AVX-512, only 8 / 16 bit and 512 bit expand take the host call
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn avx2_templates_cover_the_avx512_operations() {
@@ -1507,7 +1497,8 @@ fn avx2_templates_cover_the_avx512_operations() {
         a.vop_full(VCOMPRESS, false, 0, 2, 0, 5, 3, size);
         a.vop_full(VEXPAND, false, 0, 2, 0, 0, 3, size);
     }
-    a.vop_full(VCOMPRESS, false, 0, 2, 0, 5, 3, 1); // 16 bit: host call
+    a.vop_full(VCOMPRESS, false, 0, 2, 0, 5, 3, 1); // 16 bit: scalar loop
+    a.vop_full(VCOMPRESS, true, 0, 2, 0, 5, 3, 0); // 512 bit: scalar loop
     a.vop_full(VEXPAND, true, 0, 2, 0, 0, 3, 2); // 512 bit: host call
     a.exit();
     let mut c = config(SimdJitStrategy::RegisterCached);
@@ -1515,7 +1506,7 @@ fn avx2_templates_cover_the_avx512_operations() {
     let runner = Runner::new(&a.finish(), &random_input(1), 0x2000, c).unwrap();
     runner.jit_compile().unwrap();
     let stats = runner.executable.get_compiled_program().unwrap().simd_stats;
-    assert_eq!(stats.intrinsic_slow_paths, 2, "{stats:?}");
+    assert_eq!(stats.intrinsic_slow_paths, 1, "{stats:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1941,88 +1932,15 @@ fn exhaustive_masks_and_compress() {
     }
 }
 
-/// AES rounds: the FIPS-197 C.1 example (AES-128) encrypted with aesenc / aesenclast and decrypted
-/// with aesdec / aesdeclast (equivalent inverse cipher) in every 128 bit lane; random rounds and
-/// carry-less products through every lowering
+/// Carry-less products of every u64 pair selection through every lowering
 #[test]
-fn aes_and_clmul() {
+fn clmul_products() {
     use solana_sbpf::simd::*;
-    // Test side AES helpers (S-box by its definition)
-    fn mul(a: u8, b: u8) -> u8 { model_gf_mul(a, b) }
-    let inv = |x: u8| if x == 0 { 0 } else { (1..=255u8).find(|y| mul(x, *y) == 1).unwrap() };
-    let sbox: Vec<u8> = (0..=255u8).map(|x| { let v = inv(x); v ^ v.rotate_left(1) ^ v.rotate_left(2) ^ v.rotate_left(3) ^ v.rotate_left(4) ^ 0x63 }).collect();
-    let key: Vec<u8> = (0..16).collect();
-    let pt: Vec<u8> = (0..16).map(|i| (i * 0x11) as u8).collect();
-    let ct = [0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a];
-    let mut rk: Vec<Vec<u8>> = vec![key.clone()];
-    let mut rcon = 1u8;
-    for _ in 0..10 {
-        let p = rk.last().unwrap().clone();
-        let mut t = [sbox[p[13] as usize] ^ rcon, sbox[p[14] as usize], sbox[p[15] as usize], sbox[p[12] as usize]];
-        rcon = mul(rcon, 2);
-        let mut k = vec![0u8; 16];
-        for w in 0..4 {
-            for b in 0..4 {
-                k[4 * w + b] = p[4 * w + b] ^ t[b];
-                t[b] = k[4 * w + b];
-            }
-        }
-        rk.push(k);
-    }
-    let inv_mix = |c: &[u8]| -> Vec<u8> {
-        (0..16).map(|i| { let (r, col) = (i % 4, i / 4); (0..4).fold(0, |acc, k| acc ^ mul([14, 11, 13, 9][(k + 4 - r) % 4], c[k + 4 * col])) }).collect()
-    };
     for wide in [false, true] {
-        let lanes = 2 * (1 + wide as usize);
-        let rep = |x: &[u8]| x.repeat(lanes);
         let h = 1 + wide as u8;
-        let mut a = Asm::new(VecMode::Call);
-        a.mov64(6, 1);
-        a.vload_n(0, h, 6, 0); // state
-        for (round, k) in rk.iter().enumerate() {
-            a.vload_n(2 * h, h, 6, 32 * h as i16 * (1 + round as i16));
-            let subop = match round { 0 => VXOR, 10 => VAESENCLAST, _ => VAESENC };
-            a.vop_full(subop, wide, 0, 0, 2 * h, 0, 0, 0);
-            let _ = k;
-        }
-        // Decryption of the result: state ^ rk10, aesdec with InvMixColumns(rk9..rk1), aesdeclast rk0
-        let dk_base = 32 * h as i16 * 12;
-        for round in 0..11i16 {
-            a.vload_n(2 * h, h, 6, dk_base + 32 * h as i16 * round);
-            let subop = match round { 0 => VXOR, 10 => VAESDECLAST, _ => VAESDEC };
-            a.vop_full(subop, wide, 4 * h, if round == 0 { 0 } else { 4 * h }, 2 * h, 0, 0, 0);
-        }
-        a.lddw(7, ebpf::MM_HEAP_START);
-        a.vstore_n(7, 0, 0, h);
-        a.vstore_n(7, 64 * h as i16, 4 * h, h);
-        a.mov64_imm(0, 0);
-        a.exit();
-        let mut input = rep(&pt);
-        for k in &rk {
-            input.extend(rep(k));
-        }
-        input.extend(rep(&rk[10]));
-        for r in (1..10).rev() {
-            input.extend(rep(&inv_mix(&rk[r])));
-        }
-        input.extend(rep(&rk[0]));
-        let program = a.finish();
-        for (engine, strategy) in engines() {
-            let mut runner = Runner::new(&program, &input, 0x2000, config(strategy)).unwrap();
-            if engine == Engine::Jit {
-                runner.jit_compile().unwrap();
-            }
-            let (_, result) = runner.run(engine);
-            assert!(result.is_ok());
-            assert_eq!(runner.heap()[..32 * h as usize], rep(&ct)[..], "AES-128 encryption {engine:?} {strategy:?}");
-            assert_eq!(runner.heap()[64 * h as usize..96 * h as usize], rep(&pt)[..], "AES-128 decryption {engine:?} {strategy:?}");
-        }
-        // Random rounds and products through every lowering
+        // Random products through every lowering
         let n = 32 * h as usize;
         let recs = records(64, n, &|i, n| { let mut r = rng(i as u64 + 3); (rand_bytes(&mut r, n), rand_bytes(&mut r, n), vec![0; n], 0) });
-        for subop in [VAESENC, VAESENCLAST, VAESDEC, VAESDECLAST] {
-            stream_op(subop, wide, 0, &recs);
-        }
         for imm in [0x00i16, 0x01, 0x10, 0x11] {
             let out = stream_op(VCLMUL, wide, imm, &recs);
             for (rec, o) in recs.iter().zip(&out) {
@@ -2036,3 +1954,251 @@ fn aes_and_clmul() {
         }
     }
 }
+
+/// The core set completion: min / max / abs, saturating and averaging arithmetic, 8 bit add / sub,
+/// the remaining multiplies, truncation, immediate permutes, conflict, testm, dot products, sadbw
+/// and funnel shifts, against independent models through every lowering
+#[test]
+fn exhaustive_core_completion() {
+    use solana_sbpf::simd::*;
+    for wide in [false, true] {
+        let n = 32 * (1 + wide as usize);
+        let edge = |seed: u64, size: usize, count: usize| records(count, n, &|i, n| {
+            let mut r = rng(seed * 7919 + i as u64);
+            (edge_lanes(&mut r, n, size), edge_lanes(&mut r, n, size), edge_lanes(&mut r, n, size), r())
+        });
+        let pairs8 = records(65536 / n, n, &|i, n| {
+            let a: Vec<u8> = (0..n).map(|k| ((i * n + k) >> 8) as u8).collect();
+            let b: Vec<u8> = (0..n).map(|k| (i * n + k) as u8).collect();
+            (a, b, vec![0; n], 0)
+        });
+        let check = |subop: u8, off: i16, recs: &[Vec<u8>], size: usize, f: &dyn Fn(u64, u64, u64) -> u64| {
+            let out = stream_op(subop, wide, off, recs);
+            for (rec, o) in recs.iter().zip(&out) {
+                let (a, b, d, y) = (lanes(&rec[..n], size), lanes(&rec[n..2 * n], size), lanes(&rec[2 * n..3 * n], size), lanes(&o[..n], size));
+                for k in 0..a.len() {
+                    assert_eq!(y[k], f(a[k], b[k], d[k]), "{} off {off:#x} a {:#x} b {:#x}", mnemonic(subop, wide), a[k], b[k]);
+                }
+            }
+        };
+        for size in 0..4usize {
+            let bits = 8 * size as u32;
+            let mask = |v: i128| (v as u64) & if size == 3 { u64::MAX } else { (1u64 << (8 << size)) - 1 };
+            let recs = if size == 0 { pairs8.clone() } else { edge(size as u64, 1 << size, 48) };
+            for unsigned in [false, true] {
+                let key = |v: u64| if unsigned { v as i128 } else { sext(v, 1 << size) as i128 };
+                let off = size as i16 | (unsigned as i16) << 2;
+                check(VMIN, off, &recs, 1 << size, &|x, y, _| if key(x) <= key(y) { x } else { y });
+                check(VMAX, off, &recs, 1 << size, &|x, y, _| if key(x) >= key(y) { x } else { y });
+            }
+            check(VABS, size as i16, &recs, 1 << size, &|x, _, _| mask((sext(x, 1 << size) as i128).abs()));
+            let _ = bits;
+        }
+        for size in 0..2usize {
+            let recs = if size == 0 { pairs8.clone() } else { edge(10 + size as u64, 2, 64) };
+            let s = 1 << size;
+            for unsigned in [false, true] {
+                let off = size as i16 | (unsigned as i16) << 2;
+                let bits = 8 * s as u32;
+                let (lo, hi) = if unsigned { (0i64, (1i64 << bits) - 1) } else { (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1) };
+                let key = |v: u64| if unsigned { v as i64 } else { sext(v, s) };
+                let m = |v: i64| (v as u64) & ((1u64 << bits) - 1);
+                check(VADDS, off, &recs, s, &|x, y, _| m((key(x) + key(y)).clamp(lo, hi)));
+                check(VSUBS, off, &recs, s, &|x, y, _| m((key(x) - key(y)).clamp(lo, hi)));
+            }
+            check(VAVG, size as i16, &recs, s, &|x, y, _| (x + y + 1) >> 1);
+        }
+        check(VADD8, 0, &pairs8, 1, &|x, y, _| (x + y) & 0xff);
+        check(VSUB8, 0, &pairs8, 1, &|x, y, _| x.wrapping_sub(y) & 0xff);
+        let w = edge(20, 2, 64);
+        check(VMULHU16, 0, &w, 2, &|x, y, _| (x * y) >> 16);
+        check(VMULHRS16, 0, &w, 2, &|x, y, _| (((sext(x, 2) * sext(y, 2) + 0x4000) >> 15) as u64) & 0xffff);
+        check(VMULS32, 0, &edge(21, 8, 64), 8, &|x, y, _| (x as i32 as i64).wrapping_mul(y as i32 as i64) as u64);
+        check(VSADBW, 0, &pairs8, 8, &|x, y, _| (0..8).map(|k| (((x >> (8 * k)) & 0xff) as i64 - ((y >> (8 * k)) & 0xff) as i64).unsigned_abs()).sum());
+        // maddubs: pairs of u8 x i8 summed with saturation, edge bytes
+        let out = stream_op(VMADDUBS16, wide, 0, &pairs8);
+        for (rec, o) in pairs8.iter().zip(&out) {
+            for i in 0..n / 2 {
+                let p = |k: usize| rec[2 * i + k] as i32 * rec[n + 2 * i + k] as i8 as i32;
+                assert_eq!(i16::from_le_bytes([o[2 * i], o[2 * i + 1]]) as i32, (p(0) + p(1)).clamp(-32768, 32767), "maddubs");
+            }
+        }
+        // dot products
+        let recs = edge(22, 1, 64);
+        let out = stream_op(VDPBUSD, wide, 0, &recs);
+        for (rec, o) in recs.iter().zip(&out) {
+            for i in 0..n / 4 {
+                let acc = i32::from_le_bytes(rec[2 * n + 4 * i..2 * n + 4 * i + 4].try_into().unwrap());
+                let e = (0..4).fold(acc, |s, k| s.wrapping_add(rec[4 * i + k] as i32 * rec[n + 4 * i + k] as i8 as i32));
+                assert_eq!(i32::from_le_bytes(o[4 * i..4 * i + 4].try_into().unwrap()), e, "dpbusd");
+            }
+        }
+        let recs = edge(23, 2, 64);
+        let out = stream_op(VDPWSSD, wide, 0, &recs);
+        for (rec, o) in recs.iter().zip(&out) {
+            for i in 0..n / 4 {
+                let acc = i32::from_le_bytes(rec[2 * n + 4 * i..2 * n + 4 * i + 4].try_into().unwrap());
+                let h = |x: usize| i16::from_le_bytes([rec[x], rec[x + 1]]) as i32;
+                let e = (0..2).fold(acc, |s, k| s.wrapping_add(h(4 * i + 2 * k).wrapping_mul(h(n + 4 * i + 2 * k))));
+                assert_eq!(i32::from_le_bytes(o[4 * i..4 * i + 4].try_into().unwrap()), e, "dpwssd");
+            }
+        }
+        // truncation: all six pairs
+        for (from, to) in [(1usize, 0usize), (2, 0), (3, 0), (2, 1), (3, 1), (3, 2)] {
+            let recs = edge(30 + (from * 4 + to) as u64, 1 << from, 16);
+            let out = stream_op(VTRUNC, wide, (from | to << 2) as i16, &recs);
+            for (rec, o) in recs.iter().zip(&out) {
+                let mut e: Vec<u8> = lanes(&rec[..n], 1 << from).iter().flat_map(|v| v.to_le_bytes()[..1 << to].to_vec()).collect();
+                e.resize(n, 0);
+                assert_eq!(o[..n], e[..], "trunc {from}->{to}");
+            }
+        }
+        // permq / shuflw / shufhw: every immediate; alignr: every byte shift
+        let recs = edge(41, 2, 4);
+        for imm in 0..256i16 {
+            for subop in [VPERMQ, VSHUFLW, VSHUFHW] {
+                let out = stream_op(subop, wide, imm, &recs);
+                for (rec, o) in recs.iter().zip(&out) {
+                    let size = if subop == VPERMQ { 8 } else { 2 };
+                    let (x, y) = (lanes(&rec[..n], size), lanes(&o[..n], size));
+                    let e: Vec<u64> = (0..x.len()).map(|i| match subop {
+                        VPERMQ => x[(i & !3) + ((imm as usize >> (2 * (i % 4))) & 3)],
+                        _ => {
+                            let (quad, k) = (i / 4, i % 4);
+                            if (quad % 2 == 1) == (subop == VSHUFHW) { x[4 * quad + ((imm as usize >> (2 * k)) & 3)] } else { x[i] }
+                        }
+                    }).collect();
+                    assert_eq!(y, e, "{} imm {imm:#x}", mnemonic(subop, wide));
+                }
+            }
+        }
+        for imm in 0..32i16 {
+            let out = stream_op(VALIGNR, wide, imm, &recs);
+            for (rec, o) in recs.iter().zip(&out) {
+                for i in 0..n {
+                    let (lane, k) = (i / 16, i % 16 + imm as usize);
+                    let e = match k { 0..=15 => rec[n + 16 * lane + k], 16..=31 => rec[16 * lane + k - 16], _ => 0 };
+                    assert_eq!(o[i], e, "alignr {imm}");
+                }
+            }
+        }
+        // permw: every index value
+        let recs = records(65536 * 2 / n / 16, n, &|i, n| {
+            let mut r = rng(i as u64 + 50);
+            (rand_bytes(&mut r, n), (0..n / 2).flat_map(|k| ((i * n / 2 + k) as u16).to_le_bytes()).collect(), vec![0; n], 0)
+        });
+        let out = stream_op(VPERMW, wide, 0, &recs);
+        for (rec, o) in recs.iter().zip(&out) {
+            let (x, idx, y) = (lanes(&rec[..n], 2), lanes(&rec[n..2 * n], 2), lanes(&o[..n], 2));
+            for k in 0..y.len() {
+                assert_eq!(y[k], x[idx[k] as usize % x.len()], "permw");
+            }
+        }
+        // conflict: many duplicates
+        for size in [2usize, 3] {
+            let recs = records(64, n, &|i, n| {
+                let mut r = rng(i as u64 + 60);
+                (lanes(&rand_bytes(&mut r, n), 1).iter().flat_map(|v| ((v % 4) as u64).to_le_bytes()[..1 << size].to_vec()).take(n).collect::<Vec<u8>>().iter().copied().chain(std::iter::repeat(0)).take(n).collect(), vec![0; n], vec![0; n], 0)
+            });
+            let out = stream_op(VCONFLICT, wide, size as i16, &recs);
+            for (rec, o) in recs.iter().zip(&out) {
+                let (x, y) = (lanes(&rec[..n], 1 << size), lanes(&o[..n], 1 << size));
+                for i in 0..x.len() {
+                    assert_eq!(y[i], (0..i).filter(|&j| x[j] == x[i]).fold(0u64, |m, j| m | 1 << j), "conflict");
+                }
+            }
+        }
+        // testm / testnm
+        for size in 0..4usize {
+            let recs = edge(70 + size as u64, 1 << size, 32);
+            for negate in [false, true] {
+                let out = stream_op(VTESTM, wide, size as i16 | (negate as i16) << 2, &recs);
+                for (rec, o) in recs.iter().zip(&out) {
+                    let (a, b) = (lanes(&rec[..n], 1 << size), lanes(&rec[n..2 * n], 1 << size));
+                    let mask = (0..a.len()).filter(|&k| ((a[k] & b[k]) != 0) != negate).fold(0u64, |m, k| m | 1 << k);
+                    assert_eq!(u64::from_le_bytes(o[n..n + 8].try_into().unwrap()), mask, "testm size {size} negate {negate}");
+                }
+            }
+        }
+        // funnel shifts: every count by immediate, counts 0..=70 and huge by lane
+        for size in 1..4usize {
+            let s = 1 << size;
+            let bits = 8 * s as u64;
+            let m = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            let recs = edge(80 + size as u64, s, 8);
+            for c in 0..bits {
+                let off = c as i16 | (size as i16) << 6;
+                check(VSHLD, off, &recs, s, &|x, y, _| if c == 0 { x } else { (x << c | y >> (bits - c)) & m });
+                check(VSHRD, off, &recs, s, &|x, y, _| if c == 0 { x } else { (x >> c | y << (bits - c)) & m });
+            }
+            let recs = records(48, n, &|i, n| {
+                let mut r = rng(i as u64 + 90 * size as u64);
+                let counts: Vec<u8> = (0..n / s).flat_map(|k| {
+                    let c = if (i + k) % 4 == 3 { r() } else { ((i * 3 + k) % 71) as u64 };
+                    c.to_le_bytes()[..s].to_vec()
+                }).collect();
+                (edge_lanes(&mut r, n, s), counts, edge_lanes(&mut r, n, s), 0)
+            });
+            check(VSHLDV, size as i16, &recs, s, &|x, c, d| { let c = c % bits; if c == 0 { d } else { (d << c | x >> (bits - c)) & m } });
+            check(VSHRDV, size as i16, &recs, s, &|x, c, d| { let c = c % bits; if c == 0 { d } else { (d >> c | x << (bits - c)) & m } });
+        }
+    }
+}
+
+/// Masked loads and stores: only the span of the set lanes is translated (unset lanes past the end
+/// of a region don't fault, set ones do), unset lanes load as zero and are not stored
+#[test]
+fn masked_load_store() {
+    use solana_sbpf::simd::*;
+    let input: Vec<u8> = (0..256).map(|i| i as u8 ^ 0x5a).collect();
+    for mode in [VecMode::Slot, VecMode::Call] {
+        for wide in [false, true] {
+            for size in 0..4u8 {
+                let n = 32 * (1 + wide as usize);
+                let lanes_n = n >> size;
+                let full = if lanes_n == 64 { u64::MAX } else { (1u64 << lanes_n) - 1 };
+                for mask in [0u64, 1, 0b1011_0010, full, full & 0x5555_5555_5555_5555, 1 << (lanes_n - 1)] {
+                    let mut a = Asm::new(mode);
+                    a.lddw(3, mask);
+                    a.lddw(6, ebpf::MM_HEAP_START);
+                    // Fill the heap destination with a pattern first
+                    a.mov64_imm(7, -1);
+                    for k in 0..(n / 8) as i16 {
+                        a.stxdw(6, 8 * k, 7);
+                    }
+                    a.mov64(2, 1);
+                    a.vop_full(VLOADM, wide, 0, 0, size, 3, 2, 3);
+                    a.mov64(2, 6);
+                    a.vop_full(VSTOREM, wide, 0, 0, size, 3, 2, 0);
+                    a.vstore_n(6, 128, 0, 1 + wide as u8);
+                    a.mov64_imm(0, 0);
+                    a.exit();
+                    let (result, heap, _, _) = run_all(&a.finish(), &input);
+                    assert_eq!(result, "Ok(0)", "{mode:?} wide {wide} size {size} mask {mask:#x}");
+                    let s = 1usize << size;
+                    for k in 0..lanes_n {
+                        let set = (mask >> k) & 1 != 0;
+                        let loaded = if set { input[3 + k * s..3 + (k + 1) * s].to_vec() } else { vec![0; s] };
+                        assert_eq!(heap[128 + k * s..128 + (k + 1) * s], loaded[..], "loaded lane {k}");
+                        let stored = if set { loaded } else { vec![0xff; s] };
+                        assert_eq!(heap[k * s..(k + 1) * s], stored[..], "stored lane {k}");
+                    }
+                }
+            }
+        }
+    }
+    // Unset lanes past the end of the heap: no fault; a set lane there: fault
+    for (mask, faults) in [(0x0fu64, false), (0x1f, true)] {
+        let mut a = Asm::new(VecMode::Call);
+        a.lddw(3, mask);
+        // u32 lanes: lanes 0..4 inside the heap, 4..8 past its end
+        a.lddw(2, ebpf::MM_HEAP_START + 0x2000 - 4 * 4);
+        a.vop_full(VLOADM, false, 0, 0, 2, 3, 2, 0);
+        a.vop_full(VSTOREM, false, 0, 0, 2, 3, 2, 0);
+        a.mov64_imm(0, 0);
+        a.exit();
+        let (result, ..) = run_all(&a.finish(), &input);
+        assert_eq!(result.contains("AccessViolation"), faults, "{result}");
+    }
+}
+

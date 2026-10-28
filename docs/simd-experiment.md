@@ -9,6 +9,30 @@ Can compiler/JIT-visible vector operations, backed by virtual wide registers, gi
 efficient native SIMD, as a general-purpose alternative to a syscall that interprets arithmetic
 (`sol_math`)? BLAKE3 is the workload.
 
+## Proposal shape
+
+What this experiment would propose, separated from the research scaffolding:
+
+* **Vehicle: static syscall intrinsics only** (SIMD-0645 style, see below). The custom opcode
+  `VOP = 0xe7` is research scaffolding for comparing lowerings and needs an ISA change; the
+  intrinsics express everything without one.
+* **The core set: AVX instructions as intrinsics.** The integer subset of AVX2 and AVX-512 (F, BW,
+  VL, DQ, CD, IFMA, VBMI, VBMI2, VNNI, BITALG, VPOPCNTDQ) plus GFNI and VPCLMULQDQ, each operation
+  with a 256 bit and (except moves / lane extraction) a 512 bit form on slot pairs. Excluded on
+  purpose: floating point (sBPF has none, and float results raise determinism questions), AES
+  (nothing on-chain is confidential, little verification demand, a wide surface of conventions to
+  get wrong), gather / scatter (needs a separate bounded design), per operation merge masking
+  (`blendm` instead) and the private vector file's lack of memory forms (bulk and masked
+  load / store instead). The operations with reserved numbers (0x27, 0x4f..0x52) were removed.
+* **The composite set, proposed separately with benchmarks.** Not x86 instructions but short native
+  sequences priced as one operation, where the CU savings are large: `transpose8x8` (u32, BLAKE3
+  8-way), `transpose4x4q` / `transpose8x8q` (Keccak: 30 instead of ~40 operations per round) and
+  `mont16` (Falcon's NTT: -870 operations).
+* **Pricing.** Every operation costs 2 CUs (`mov64` + `call`) at either width. A 512 bit operation
+  is two native operations on AVX2-only validators; the proposal should state that explicitly, as
+  well as the operations which are slow there (host calls or long templates: `madd52`, VBMI,
+  `conflict`, `lzcnt`, GFNI, `dpbusd`).
+
 ## Implementation strategy (and why not `CALL_IMM` builtins)
 
 `BuiltinFunctionDefinition::codegen(jit: &mut JitCompiler<C>)` lets a builtin emit inline code. But
@@ -103,14 +127,33 @@ is the 256 bit operation on both halves unless noted. The intrinsic name (next s
 | 0x49 | `sol_avx512_lzcnt256` | `sol_avx512_lzcnt512` | per lane leading zeros (32 / 64 bit) | `vplzcnt*` (CD), reference call without |
 | 0x4a..0x4c | `sol_avx512_permb256`, `permi2b256`, `multishift256` | `..512` | byte permutations, bit field extraction | `vpermb`, `vpermi2b`, `vpmultishiftqb` (VBMI), reference call without |
 | 0x4d, 0x4e | `sol_avx512_gf2p8affine256`, `gf2p8mul256` | `..512` | GF(2) affine map / GF(2^8) product per byte | `vgf2p8affineqb`, `vgf2p8mulb` (GFNI), reference call without |
-| 0x4f..0x52 | `sol_avx512_aesenc256`, `aesenclast256`, `aesdec256`, `aesdeclast256` | `..512` | one AES round per 128 bit lane | `vaes*` (VAES, also the 256 bit VEX forms without AVX-512), reference call without |
+| 0x4f..0x52 | *reserved* (removed AES rounds) | | | |
 | 0x53 | `sol_avx512_clmul256` | `sol_avx512_clmul512` | carry-less 64 x 64 -> 128 per 128 bit lane | `vpclmulqdq` (VPCLMULQDQ, VEX forms too), reference call without |
-| 0x27 | `sol_avx512_compresslt16x16` | `sol_avx512_compresslt16x32` | u16 lanes of `a` below those of `b`, in order, packed into `d` (rest 0); count in `dst` / r0 | branchless scalar loop over the vector file / `vpcmpuw` + `vpcompressw` (VBMI2) + `kmovd` + `popcnt` |
+| 0x54, 0x55 | `sol_avx2_min256`, `max256` | `..512` | per lane min / max; `off` = lane size \| 4 unsigned | `vpmin*` / `vpmax*`; u64 lanes: compare + `vpblendvb` without AVX-512 |
+| 0x56 | `sol_avx2_abs256` | `sol_avx512_abs512` | per lane absolute value | `vpabs*`; u64: sign mask xor / sub without AVX-512 |
+| 0x57, 0x58 | `sol_avx2_adds256`, `subs256` | `..512` | saturating add / sub, 8 / 16 bit, signed or unsigned | `vpadds*`, `vpaddus*`, `vpsubs*`, `vpsubus*` |
+| 0x59 | `sol_avx2_avg256` | `sol_avx512_avg512` | unsigned rounding average, 8 / 16 bit | `vpavgb` / `vpavgw` |
+| 0x5a, 0x5b | `sol_avx2_add8x32`, `sub8x32` | `..8x64` | wrapping u8 add / sub | `vpaddb`, `vpsubb` |
+| 0x5c, 0x5d | `sol_avx2_mulhu16x16`, `mulhrs16x16` | `..16x32` | unsigned high product, rounded scaled product | `vpmulhuw`, `vpmulhrsw` |
+| 0x5e | `sol_avx2_muls32x4` | `sol_avx512_muls32x8` | `i32 x i32 -> i64` of the low halves | `vpmuldq` |
+| 0x5f | `sol_avx2_maddubs16x16` | `sol_avx512_maddubs16x32` | u8 x i8 pairs summed with saturation | `vpmaddubsw` |
+| 0x60 | `sol_avx512_trunc256` | `sol_avx512_trunc512` | truncate the lanes into the low part (six size pairs) | `vpmov{wb,db,qb,dw,qw,qd}`; `vpshufb` + 128 bit unpack without AVX-512 (512 bit: reference call) |
+| 0x61 | `sol_avx2_permq256` | `sol_avx512_permq512` | u64 permutation by imm per 256 bit half | `vpermq` |
+| 0x62 | `sol_avx512_permw256` | `sol_avx512_permw512` | cross lane u16 permutation | `vpermw` (BW), reference call without |
+| 0x63 | `sol_avx2_alignr256` | `sol_avx512_alignr512` | byte align per 128 bit lane | `vpalignr` |
+| 0x64, 0x65 | `sol_avx2_shuflw256`, `shufhw256` | `..512` | low / high u16 shuffle per 128 bit lane | `vpshuflw` / `vpshufhw` |
+| 0x66 | `sol_avx512_conflict256` | `sol_avx512_conflict512` | per lane mask of earlier equal lanes (32 / 64 bit) | `vpconflict*` (CD), reference call without |
+| 0x67 | `sol_avx512_testm256` | `sol_avx512_testm512` | lane mask of `a & b != 0` (`== 0`) in `dst` / r0 | `vptestm*` / `vptestnm*` + `kmovq`; and + compare + movemask without AVX-512 |
+| 0x68, 0x69 | `sol_avx512_dpbusd256`, `dpwssd256` | `..512` | u8 x i8 / i16 x i16 dot products accumulated into i32 | `vpdpbusd` / `vpdpwssd` (VNNI); `vpmaddwd` + `vpaddd` for dpwssd without |
+| 0x6a | `sol_avx2_sadbw256` | `sol_avx512_sadbw512` | sum of absolute byte differences per u64 | `vpsadbw` |
+| 0x6b, 0x6c | `sol_avx512_shld256`, `shrd256` | `..512` | funnel shift by imm, 16 / 32 / 64 bit | `vpshld*` / `vpshrd*` (VBMI2); two shifts + or without |
+| 0x6d, 0x6e | `sol_avx512_shldv256`, `shrdv256` | `..512` | funnel shift by lane into the accumulator | `vpshldv*` / `vpshrdv*` (VBMI2); 5 instructions for 32 / 64 bit without |
+| 0x6f, 0x70 | `sol_avx512_loadm256`, `storem256` | `..512` | masked load / store, lane size in `vb`, mask in the `dst` register / r3 | one call: translation of the span of the set lanes + copy |
+| 0x27 | *reserved* (removed fused compare + compress, now `cmp` + `compress`) | | | |
 
 The BLAKE3 work needed the first 13; the rest came with the Falcon verifier (16 bit NTT arithmetic,
-Keccak on 64 bit lanes, vectorized rejection sampling) and the private vector file (lane moves).
-`compresslt16` needs AVX512_VBMI2 for its native form (Ice Lake, Zen 4 and later); on other hosts the
-JIT emits a branchless loop of 5 scalar instructions per lane.
+Keccak on 64 bit lanes, vectorized rejection sampling), the private vector file (lane moves) and the
+completion of the core set (below).
 
 Masks are scalar bitmasks (bit `i` = lane `i`) passed in `src` / r2 and returned in `dst` / r0, so mask
 logic is ordinary scalar ALU code and there is no mask register file in the VM.
@@ -126,22 +169,30 @@ IFMA and VBMI2 are detected separately):
    `vpacksswb` + `vpermq` for 16 bit lanes), `blendm` (mask expanded to a vector, `vpblendvb`), u32 /
    u64 `compress` / `expand` (`vpermd` with indices from a table indexed by the mask, no BMI2 since
    `pext` is microcoded on Zen 1 / 2). 512 bit forms run as two halves.
-3. A host call to the reference implementation (`intrinsic_slow_paths` in the statistics): 8 / 16
-   bit and 512 bit `compress` / `expand` without AVX-512 (VBMI2).
+3. A branchless scalar loop over the vector file for `compress` without a native or table based
+   lowering (8 / 16 bit lanes, 512 bit forms).
+4. A host call to the reference implementation (`intrinsic_slow_paths` in the statistics) for the
+   operations whose AVX-512 extension is missing and which have no cheap AVX2 equivalent (`expand` of
+   8 / 16 bit lanes, `permw`, `conflict`, `lzcnt`, VBMI, GFNI, `dpbusd`, 16 bit variable shifts and
+   funnel shifts, 512 bit `trunc` / `testm`).
 
 Every tier must give the reference results bit for bit (integer operations only, semantics fixed
 per operation, never per host), and CUs never depend on the tier. `Config::simd_force_reference`
-runs every operation through tier 3 and `Config::simd_avx512 = false` restricts the JIT to AVX2,
+runs every operation through tier 4 and `Config::simd_avx512 = false` restricts the JIT to AVX2,
 so the `tiers_agree` test compares all tiers of a host on random and edge value inputs (0, 1, -1,
 the extremes of every lane width, shift counts around 31 / 32 / 63 / 64).
 
-The `exhaustive_*` and `aes_and_clmul` tests run each operation over a stream of records in one loop
+The `exhaustive_*`, `clmul_products` and `masked_load_store` tests run each operation over a stream of records in one loop
 and check the interpreter against an independent model and every tier against the interpreter:
 every byte pair (`gf2p8mul`), every byte / index / control value (`gf2p8affine`, `permb`,
 `permi2b`, `multishift`, `popcnt` of bytes), every u16 (`popcnt`, the 16 -> 8 packs, the
 widenings), every immediate shift count, variable counts 0..=70 and huge ones, every leading zero
 count, every mask of u32 / u64 `compress` / `expand` / `blendm` (both widths), every `cmp` lane size x
-predicate x signedness, and the FIPS-197 AES-128 example (encryption and decryption) in every lane.
+predicate x signedness, every byte pair for the 8 bit min / max / abs / saturating / average / add /
+sub / sadbw / maddubs operations, every immediate of `permq` / `shuflw` / `shufhw` / `alignr` / funnel
+shifts, every u16 index of `permw`, and masked loads / stores at region ends. These tests found a
+reference interpreter bug (signed `min` / `max` compared sign extended lanes as unsigned): the JIT
+was right.
 
 Rosetta 2 gets `vpsllvq` / `vpsrlvq` wrong for counts above 63 whose low bits are small (it shifts by
 the low bits instead of returning 0); the tests keep those counts in range when running under it.
@@ -157,7 +208,7 @@ mov64 r1, <packed operands>       ; compile time constant
 call  sol_avx2_add32x8            ; CALL_IMM, src = 0, imm = murmur32("sol_avx2_add32x8")
 ```
 
-* **Encoding:** one static call identifier per operation and width (163 of them, the names in the
+* **Encoding:** one static call identifier per operation and width (211 of them, the names in the
   table above). `dst`, `src` and `off` of the `CALL_IMM` stay zero, so the bytecode is plain eBPF.
   The names say which ISA level each operation maps to: `sol_avx_` (moves), `sol_avx2_` (AVX2
   integer operations) and `sol_avx512_` (AVX-512 operations, and every 512 bit form). Every
